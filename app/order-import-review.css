@@ -1,0 +1,9 @@
+.product-lines input.import-review {
+  border: 2px solid #d79216 !important;
+  background: #fff6dc !important;
+  color: #704c05 !important;
+}
+
+.product-lines input.import-review:focus {
+  box-shadow: 0 0 0 3px rgba(215, 146, 22, 0.2) !important;
+}

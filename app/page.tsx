@@ -20,6 +20,7 @@ import "./transporters.css";
 import "./image-studio.css";
 import "./image-studio-fit.css";
 import "./dispatch-plan.css";
+import "./order-import-review.css";
 import { supabase } from "./lib/supabase";
 import type { Session } from "@supabase/supabase-js";
 import {
@@ -53,7 +54,7 @@ import {
   Warehouse,
   X,
 } from "lucide-react";
-type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number };
+type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; review?: { product?: boolean; quantity?: boolean; price?: boolean } };
 type QuoteProduct = ProductLine & { discount: number };
 type CatalogueItem = { id: number; name: string; sku: string; unitPrice: number; category: string; image: string; description: string; cartonQty: string; innerQty?: string; outerQty?: string; subCategory?: string; brand?: string; unit?: string; packSize?: string; moq?: number; purchasePrice?: number; wholesalePrice?: number; distributorPrice?: number; gst?: number; barcode?: string; weight?: string; dimensions?: string; supplier?: string; countryOfOrigin?: string; availableQuantity?: number; openingStock?: number; purchasedStock?: number; orderedStock?: number; damagedStock?: number; reservedStock?: number };
 type ClientSpecialRate = { sku: string; rate: number };
@@ -411,7 +412,12 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         // A second pass across the three numeric cells recovers values when a
         // vertical grid border interferes with a single-cell OCR pass.
         const rowNumbers = (await readCell(tableLeft + cellWidth, top, cellWidth * 3, height, true)).match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
-        const skuMatch = skuText.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, "")) || rowNumbers[0] || 0;
+        // Grid borders can hide the first or final character of a SKU. Take a
+        // few nearby crops, retaining the longest valid code; catalogue
+        // matching below still refuses ambiguous codes.
+        const skuCandidates = [skuText];
+        for (const shift of [-3, 3]) skuCandidates.push(await readCell(tableLeft, Math.max(0, top + shift), cellWidth, height));
+        const skuMatch = skuCandidates.map((text) => text.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i)?.[0]).filter(Boolean).sort((a, b) => skuKey(b || "").length - skuKey(a || "").length)[0]?.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, "")) || rowNumbers[0] || 0;
         if (skuMatch && quantity) {
           blanks = 0; const value = Number(valueText.replace(/[^\d.]/g, "")) || rowNumbers[2] || 0; const printedPrice = Number(priceText.replace(/[^\d.]/g, "")) || rowNumbers[1] || 0;
           gridProducts.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: value && quantity ? value / quantity : printedPrice });
@@ -1849,7 +1855,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
     const catalogueProduct = catalogue.find((product) => key === "sku" ? skuKey(product.sku) === skuKey(String(value)) : `${catalogueName(product)} · ${product.sku}`.toLowerCase() === String(value).trim().toLowerCase() || catalogueName(product).trim().toLowerCase() === String(value).trim().toLowerCase());
     const selectedSku = catalogueProduct?.sku || (key === "sku" ? String(value) : updated.sku);
     const rate = specialRate(f.client, selectedSku) ?? catalogueProduct?.unitPrice;
-    return { ...updated, sku: selectedSku, product: catalogueProduct ? `${catalogueName(catalogueProduct)} · ${catalogueProduct.sku}` : updated.product, unitPrice: rate ?? updated.unitPrice };
+    return { ...updated, sku: selectedSku, product: catalogueProduct ? `${catalogueName(catalogueProduct)} · ${catalogueProduct.sku}` : updated.product, unitPrice: rate ?? updated.unitPrice, review: catalogueProduct ? { ...updated.review, product: false } : updated.review };
   }));
   const selectClient = (name: string) => { const client = clients.find((item) => item.name === name); setF({ ...f, client: name, city: client?.city || "", avatar: client?.avatar || initials(name) }); setProducts((current) => current.map((item) => ({ ...item, unitPrice: specialRate(name, item.sku) ?? item.unitPrice }))); };
   useEffect(() => {
@@ -1884,6 +1890,17 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
     skuInputs.forEach((input) => { input.style.display = "none"; input.required = false; });
     return () => { productInputs.forEach((input) => input.removeAttribute("list")); skuInputs.forEach((input) => { input.style.display = ""; input.required = true; }); list.remove(); };
   }, [catalogue, f.client]);
+  useEffect(() => {
+    const applyReview = (selector: string, reviewKey: "product" | "quantity" | "price", message: string) => Array.from(document.querySelectorAll<HTMLInputElement>(selector)).forEach((input, index) => {
+      const needsReview = Boolean(products[index]?.review?.[reviewKey]);
+      input.classList.toggle("import-review", needsReview);
+      input.setAttribute("aria-invalid", String(needsReview));
+      input.title = needsReview ? message : "";
+    });
+    applyReview('input[aria-label="Product name"]', "product", "Please verify this product: the SKU was repaired from OCR or could not be matched exactly.");
+    applyReview('input[aria-label="Quantity"]', "quantity", "Please verify this quantity: it was unclear in the uploaded image.");
+    applyReview('input[aria-label="Unit price"]', "price", "Please verify this price: it was unclear in the uploaded image.");
+  }, [products]);
   const scanDocument = async (file: File, append = false) => {
     setPreview((file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) ? "" : URL.createObjectURL(file)); setScanState("scanning"); setScanNote("Reading document and finding product lines…");
     try {
@@ -1903,13 +1920,27 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
         const transporterName = matchedTransporter?.name || internalSheet.transporter || "";
         setF((current) => ({ ...current, client: clientName || current.client, city: matchedClient?.city || current.city, eta: internalSheet.eta || current.eta, transporter: transporterName || current.transporter || "", avatar: matchedClient?.avatar || initials(clientName || current.client) }));
         const importedLines = internalSheet.products.map((line) => {
-          const exactMatch = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));
-          const partialMatches = exactMatch ? [] : catalogue.filter((item) => skuKey(item.sku).startsWith(skuKey(line.sku)) || skuKey(line.sku).startsWith(skuKey(item.sku)));
-          const catalogueMatch = exactMatch || (partialMatches.length === 1 ? partialMatches[0] : undefined);
+          const scannedSku = skuKey(line.sku);
+          const exactMatch = catalogue.find((item) => skuKey(item.sku) === scannedSku);
+          // A missing first letter (AB-956 read as B-956) is a common OCR
+          // error. Repair it only when exactly one catalogue SKU fits. Never
+          // choose between several possible SKUs.
+          const repairedMatches = exactMatch ? [] : catalogue.filter((item) => {
+            const knownSku = skuKey(item.sku);
+            return knownSku.startsWith(scannedSku) || scannedSku.startsWith(knownSku) || (scannedSku.length >= 3 && knownSku.endsWith(scannedSku));
+          });
+          const catalogueMatch = exactMatch || (repairedMatches.length === 1 ? repairedMatches[0] : undefined);
+          const inferredProduct = Boolean(!exactMatch && catalogueMatch);
           // Pricing is never taken from the catalogue for an uploaded order.
           // If sheet OCR cannot read a price, it stays visibly blank/zero for
           // review instead of silently using a different catalogue rate.
-          return { product: catalogueMatch ? `${catalogueName(catalogueMatch)} · ${catalogueMatch.sku}` : line.product || `Product ${line.sku}`, sku: catalogueMatch?.sku || line.sku, quantity: line.quantity, unitPrice: line.unitPrice || 0 };
+          return {
+            product: catalogueMatch ? `${catalogueName(catalogueMatch)} · ${catalogueMatch.sku}` : line.product || `Review SKU: ${line.sku}`,
+            sku: catalogueMatch?.sku || line.sku,
+            quantity: line.quantity || 0,
+            unitPrice: line.unitPrice || 0,
+            review: { product: inferredProduct || !catalogueMatch, quantity: !line.quantity, price: !line.unitPrice }
+          };
         });
         setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), ...importedLines] : importedLines);
         setScanState("ready"); setScanNote(`GeeBee internal order sheet recognised: ${internalSheet.products.length} product line${internalSheet.products.length === 1 ? "" : "s"} added${clientName ? ` for ${clientName}` : ""}${transporterName ? ` with transporter ${transporterName}` : ""}.${createdClient ? " A new incomplete client profile was created—please complete it in Clients." : ""} Please review, then save the new order.${internalSheet.note ? ` Note: ${internalSheet.note}` : ""}`);

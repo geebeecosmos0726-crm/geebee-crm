@@ -378,7 +378,7 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
     for (let row = 0; row < source.height; row += 1) {
       let dark = 0; let samples = 0;
       for (let column = Math.max(0, Math.floor(tableLeft)); column < Math.min(source.width, Math.ceil(tableRight)); column += 2) {
-        const at = (row * source.width + column) * 4; const red = pixels?.[at] || 255; const green = pixels?.[at + 1] || 255; const blue = pixels?.[at + 2] || 255;
+        const at = (row * source.width + column) * 4; const red = pixels?.[at] ?? 255; const green = pixels?.[at + 1] ?? 255; const blue = pixels?.[at + 2] ?? 255;
         if (red < 85 && green < 85 && blue < 85) dark += 1;
         samples += 1;
       }

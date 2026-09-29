@@ -369,6 +369,57 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         if (yellowPixels > strongestYellow && right > left) { strongestYellow = yellowPixels; gridLeft = Math.max(0, left - step); gridRight = Math.min(source.width, right + step); }
       }
     }
+    // Find the actual horizontal grid lines. This is the reliable anchor for
+    // GeeBee's spreadsheet screenshots: it works regardless of image height,
+    // zoom, or how many products appear on a page.
+    const tableLeft = strongestYellow >= 16 ? gridLeft : 0;
+    const tableRight = strongestYellow >= 16 ? gridRight : source.width;
+    const darkLineRows: number[] = [];
+    for (let row = 0; row < source.height; row += 1) {
+      let dark = 0; let samples = 0;
+      for (let column = Math.max(0, Math.floor(tableLeft)); column < Math.min(source.width, Math.ceil(tableRight)); column += 2) {
+        const at = (row * source.width + column) * 4; const red = pixels?.[at] || 255; const green = pixels?.[at + 1] || 255; const blue = pixels?.[at + 2] || 255;
+        if (red < 85 && green < 85 && blue < 85) dark += 1;
+        samples += 1;
+      }
+      if (samples && dark / samples > .52) darkLineRows.push(row);
+    }
+    const gridLines = darkLineRows.reduce<number[]>((centers, row) => {
+      const last = centers.at(-1); if (last === undefined || row - last > 2) centers.push(row); else centers[centers.length - 1] = Math.round((last + row) / 2);
+      return centers;
+    }, []);
+    const gridStart = strongestYellow >= 16 ? Math.max(0, gridLines.findIndex((line) => line >= headerBottom - 3)) : 0;
+    let gridClient = ""; let gridEta = "";
+    if (strongestYellow >= 16) {
+      const headerScale = (tableRight - tableLeft) / 485;
+      const headerTop = headerBottom - Math.round(20 * headerScale);
+      const dateRead = await readCell(tableLeft + (tableRight - tableLeft) * .2, Math.max(0, headerTop - 43 * headerScale), (tableRight - tableLeft) * .8, 28 * headerScale);
+      gridClient = await readCell(tableLeft + (tableRight - tableLeft) * .085, Math.max(0, headerTop - 22 * headerScale), (tableRight - tableLeft) * .8, 27 * headerScale);
+      const dateText = dateRead.match(/([0-3]?\d[.\/-][01]?\d[.\/-](?:20)?\d{2})/)?.[1];
+      if (dateText) { const [day, month, year] = dateText.split(/[.\/-]/); gridEta = `${year.length === 2 ? `20${year}` : year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`; }
+    }
+    if (gridLines.length >= gridStart + 3) {
+      const cellWidth = (tableRight - tableLeft) / 5;
+      const gridProducts: ProductLine[] = []; let transporter = ""; let blanks = 0;
+      for (let row = gridStart; row < gridLines.length - 1; row += 1) {
+        const top = gridLines[row] + 1; const height = gridLines[row + 1] - gridLines[row] - 2;
+        if (height < 12) continue;
+        const skuText = await readCell(tableLeft, top, cellWidth, height);
+        const quantityText = await readCell(tableLeft + cellWidth, top, cellWidth, height, true);
+        const priceText = await readCell(tableLeft + cellWidth * 2, top, cellWidth, height, true);
+        const valueText = await readCell(tableLeft + cellWidth * 3, top, cellWidth, height, true);
+        const skuMatch = skuText.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, ""));
+        if (skuMatch && quantity) {
+          blanks = 0; const value = Number(valueText.replace(/[^\d.]/g, "")); const printedPrice = Number(priceText.replace(/[^\d.]/g, ""));
+          gridProducts.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: value && quantity ? value / quantity : printedPrice });
+          continue;
+        }
+        const rowText = await readCell(tableLeft, top, cellWidth * 3, height);
+        if (/\btransport\b/i.test(rowText)) transporter = rowText.replace(/\btotal\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim();
+        if (gridProducts.length) { blanks += 1; if (blanks >= 2) break; }
+      }
+      if (gridProducts.length) return { client: gridClient.replace(/^['’]/, "").trim(), eta: gridEta, products: gridProducts, note: "GeeBee grid order sheet", transporter: transporter || undefined };
+    }
     // A continuation screenshot has no yellow ITEM header, but it still has
     // the same five equal-width columns. Read those cells directly rather
     // than using first-page offsets or loose full-page OCR.
@@ -1795,7 +1846,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
     const catalogueProduct = catalogue.find((product) => key === "sku" ? skuKey(product.sku) === skuKey(String(value)) : `${catalogueName(product)} · ${product.sku}`.toLowerCase() === String(value).trim().toLowerCase() || catalogueName(product).trim().toLowerCase() === String(value).trim().toLowerCase());
     const selectedSku = catalogueProduct?.sku || (key === "sku" ? String(value) : updated.sku);
     const rate = specialRate(f.client, selectedSku) ?? catalogueProduct?.unitPrice;
-    return { ...updated, sku: selectedSku, product: catalogueProduct?.name || updated.product, unitPrice: rate ?? updated.unitPrice };
+    return { ...updated, sku: selectedSku, product: catalogueProduct ? `${catalogueName(catalogueProduct)} · ${catalogueProduct.sku}` : updated.product, unitPrice: rate ?? updated.unitPrice };
   }));
   const selectClient = (name: string) => { const client = clients.find((item) => item.name === name); setF({ ...f, client: name, city: client?.city || "", avatar: client?.avatar || initials(name) }); setProducts((current) => current.map((item) => ({ ...item, unitPrice: specialRate(name, item.sku) ?? item.unitPrice }))); };
   useEffect(() => {
@@ -1854,7 +1905,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
           const catalogueMatch = exactMatch || (partialMatches.length === 1 ? partialMatches[0] : undefined);
           // A readable sheet price always wins. Catalogue price is only a
           // safety fallback when the source image contains no numeric price.
-          return { product: catalogueMatch?.name || line.product || `Product ${line.sku}`, sku: catalogueMatch?.sku || line.sku, quantity: line.quantity, unitPrice: line.unitPrice || catalogueMatch?.unitPrice || 0 };
+          return { product: catalogueMatch ? `${catalogueName(catalogueMatch)} · ${catalogueMatch.sku}` : line.product || `Product ${line.sku}`, sku: catalogueMatch?.sku || line.sku, quantity: line.quantity, unitPrice: line.unitPrice || catalogueMatch?.unitPrice || 0 };
         });
         setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), ...importedLines] : importedLines);
         setScanState("ready"); setScanNote(`GeeBee internal order sheet recognised: ${internalSheet.products.length} product line${internalSheet.products.length === 1 ? "" : "s"} added${clientName ? ` for ${clientName}` : ""}${transporterName ? ` with transporter ${transporterName}` : ""}.${createdClient ? " A new incomplete client profile was created—please complete it in Clients." : ""} Please review, then save the new order.${internalSheet.note ? ` Note: ${internalSheet.note}` : ""}`);

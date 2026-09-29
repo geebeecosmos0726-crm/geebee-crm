@@ -315,21 +315,24 @@ const nextOrderNumber = () => `GB-${Date.now().toString().slice(-8)}`;
 const parseInternalOrderSheet = (raw: string): InternalOrderSheet | null => {
   const lines = raw.replace(/\r/g, "").split("\n").map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
   const headerAt = lines.findIndex((line) => /\bitem\b/i.test(line) && /\b(?:quantity|qty)\b/i.test(line) && /\bprice\b/i.test(line));
-  if (headerAt < 0) return null;
+  // A continuation image often begins straight with product rows, without the
+  // blue/yellow header. It is still a valid page of the same internal order.
+  const rowsStart = headerAt < 0 ? 0 : headerAt + 1;
   const dateText = lines.slice(0, headerAt).join(" ").match(/date\s*[-: ]*([0-3]?\d[.\/-][01]?\d[.\/-](?:20)?\d{2})/i)?.[1];
   let eta = "";
   if (dateText) { const [day, month, year] = dateText.split(/[.\/-]/); eta = `${year.length === 2 ? `20${year}` : year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`; }
-  const client = lines.slice(0, headerAt).filter((line) => !/\bdate\b/i.test(line)).filter((line) => !/^[A-Z]$/.test(line)).at(-1) || "";
+  const client = headerAt < 0 ? "" : lines.slice(0, headerAt).filter((line) => !/\bdate\b/i.test(line)).filter((line) => !/^[A-Z]$/.test(line)).at(-1) || "";
   const products: ProductLine[] = [];
   const trailing: string[] = [];
-  for (const line of lines.slice(headerAt + 1)) {
+  for (const line of lines.slice(rowsStart)) {
     if (/\btotal\b/i.test(line)) { const beforeTotal = line.replace(/\btotal\b.*$/i, "").trim(); if (beforeTotal && !/^\d[\d,.]*$/.test(beforeTotal)) trailing.push(beforeTotal); break; }
     const match = line.match(/^([A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8}))\s+([\d,]+)\s+([\d,.]+)(?:\s+[\d,.]+)?(?:\s+(.*))?$/i);
     if (!match) continue;
     products.push({ product: "", sku: match[1].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity: Number(match[2].replaceAll(",", "")) || 0, unitPrice: Number(match[3].replaceAll(",", "")) || 0 });
     if (match[4]) trailing.push(match[4]);
   }
-  return products.length ? { client, eta, products, note: trailing.join(" · ") } : null;
+  const transporter = lines.find((line) => /\btransport\b/i.test(line))?.replace(/\btotal\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim();
+  return products.length ? { client, eta, products, note: trailing.join(" · "), transporter: transporter || undefined } : null;
 };
 const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderSheet | null> => {
   if (!file.type.startsWith("image/")) return null;
@@ -366,6 +369,9 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         if (yellowPixels > strongestYellow && right > left) { strongestYellow = yellowPixels; gridLeft = Math.max(0, left - step); gridRight = Math.min(source.width, right + step); }
       }
     }
+    // A continuation screenshot has no yellow ITEM header. Let normal OCR
+    // parse its rows rather than applying the first-page grid coordinates.
+    if (strongestYellow < 16 || !headerBottom) return null;
     const gridWidth = gridRight - gridLeft;
     const columnWidth = gridWidth / 5;
     // Screen captures often include a different amount of empty spreadsheet
@@ -379,7 +385,7 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
     const dateText = dateRead.match(/([0-3]?\d[.\/-][01]?\d[.\/-](?:20)?\d{2})/)?.[1];
     let eta = ""; if (dateText) { const [day, month, year] = dateText.split(/[.\/-]/); eta = `${year.length === 2 ? `20${year}` : year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`; }
     const products: ProductLine[] = []; let blankRows = 0;
-    for (let row = 0; row < 10; row += 1) {
+    for (let row = 0; row < 100; row += 1) {
       const top = rowStart + row * 21 * y;
       // A little vertical overlap makes this resilient to WhatsApp/iPhone
       // screenshots whose grid line is one or two pixels higher or lower.
@@ -407,7 +413,7 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
     // The row immediately after the product lines has the transporter merged
     // across the left-hand cells, followed by TOTAL on the right.
     const transporterRead = products.length ? await readCell(gridLeft, rowStart + products.length * 21 * y - 2 * y, columnWidth * 3, 24 * y) : "";
-    const transporter = transporterRead.replace(/\b(?:total|remarks?)\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim();
+    const transporter = /\btransport\b/i.test(transporterRead) ? transporterRead.replace(/\b(?:total|remarks?)\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim() : "";
     return products.length ? { client: client.replace(/^['’]/, "").trim(), eta, products, note: "GeeBee internal order sheet", transporter: transporter || undefined } : null;
   } finally { await worker.terminate(); URL.revokeObjectURL(source.src); }
 };
@@ -1823,6 +1829,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
       const sku = text.match(/(?:sku|item\s*code|code)\s*[:#-]?\s*([A-Z]{1,4}[- ]?\d{2,8})/i)?.[1]?.replace(" ", "-") || "";
       const quantity = Number(text.match(/(?:qty|quantity)\s*[:x-]?\s*(\d+)/i)?.[1] || 0);
       const unitPrice = Number(text.match(/(?:unit\s*price|rate|price)\s*[:₹Rs.-]?\s*([\d,]+)/i)?.[1]?.replaceAll(",", "") || 0);
+      if (!sku || !quantity) throw new Error("This image did not contain a readable order row. Please use a sharp screenshot of the item, quantity and price columns.");
       const name = text.match(/(?:product|description|item)\s*[:#-]?\s*([A-Za-z][A-Za-z0-9 /&.-]{2,50})/i)?.[1]?.trim() || file.name.replace(/\.[^.]+$/, "").replaceAll(/[-_]/g, " ");
       const catalogueMatch = catalogue.find((item) => item.sku.replaceAll("-", "").toLowerCase() === sku.replaceAll("-", "").toLowerCase());
       const importedLine = { product: catalogueMatch?.name || name, sku: catalogueMatch?.sku || sku, quantity, unitPrice: specialRate(matchedClient?.name || f.client, catalogueMatch?.sku || sku) ?? catalogueMatch?.unitPrice ?? unitPrice };

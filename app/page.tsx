@@ -348,34 +348,6 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
     const context = canvas.getContext("2d"); if (!context) return ""; context.fillStyle = "white"; context.fillRect(0, 0, canvas.width, canvas.height); context.drawImage(source, x, y, width, height, 0, 0, canvas.width, canvas.height);
     const { data } = await worker.recognize(canvas); return data.text.replace(/\s+/g, " ").trim();
   };
-  // A final digit can sit against a spreadsheet border (for example 90 being
-  // read as 9). Read the PRICE cell through several slightly inset crops. A
-  // value is accepted only when the readings agree or one reading wins; an
-  // unresolved disagreement is deliberately left blank and highlighted.
-  const readPrintedPrice = async (x: number, y: number, width: number, height: number) => {
-    const reach = Math.max(2, Math.min(7, Math.round(width * .05)));
-    // Include a few pixels beyond the vertical borders as well as moving up
-    // and down. This specifically protects a final 0 sitting against a grid
-    // line; the adjacent VALUE digits are far enough away to stay excluded.
-    const crops = [[Math.max(0, x - reach), y, width + reach * 2, height], [x, y, width + reach, height], [Math.max(0, x - reach), Math.max(0, y - 2), width + reach * 2, height + 4], [x, Math.max(0, y - 2), width + reach, height + 4]];
-    const values: number[] = [];
-    for (const [cropX, cropY, cropWidth, cropHeight] of crops) {
-      const text = await readCell(cropX, cropY, cropWidth, cropHeight, true);
-      const value = Number(text.replace(/[^\d.]/g, ""));
-      if (value > 0) values.push(value);
-    }
-    const counts = new Map<number, number>(); values.forEach((value) => counts.set(value, (counts.get(value) || 0) + 1));
-    const ranked = [...counts.entries()].sort(([leftValue, leftCount], [rightValue, rightCount]) => rightCount - leftCount || String(rightValue).length - String(leftValue).length);
-    let [candidate, count] = ranked[0] || [0, 0]; const disagreement = counts.size > 1;
-    // If one crop sees 9 and another sees 90, retain 90 (the full reading)
-    // but flag it. Do not make the same assumption for 18 / 180 etc.
-    const recoveredTrailingZero = values.find((value) => Number.isInteger(value) && value >= 10 && value < 100 && values.some((shortValue) => Number.isInteger(shortValue) && shortValue > 0 && shortValue < 10 && value === shortValue * 10));
-    if (recoveredTrailingZero) { candidate = recoveredTrailingZero; count = counts.get(candidate) || 0; }
-    // A lone integer digit could be 9 or a clipped 90. Do not save it as a
-    // rate automatically; decimals such as 3.25 remain valid.
-    const unsafeSingleDigit = Number.isInteger(candidate) && candidate > 0 && candidate < 10;
-    return { value: !unsafeSingleDigit && (count >= 2 || counts.size === 1 || Boolean(recoveredTrailingZero)) ? candidate : 0, review: disagreement || !candidate || count < 2 || unsafeSingleDigit };
-  };
   try {
     const x = source.width / 591; let y = source.height / 1253;
     // Do not rely on the screenshot being exported at exactly the same height.
@@ -435,7 +407,6 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         if (height < 12) continue;
         const skuText = await readCell(tableLeft, top, cellWidth, height);
         const quantityText = await readCell(tableLeft + cellWidth, top, cellWidth, height, true);
-        const priceRead = await readPrintedPrice(tableLeft + cellWidth * 2, top, cellWidth, height);
         // Read only the two source fields the CRM needs: quantity and price.
         // Line value and the order total are calculated by the CRM itself.
         // A second pass across the two numeric cells recovers values when a
@@ -449,7 +420,7 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         const skuMatch = skuCandidates.map((text) => text.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i)?.[0]).filter(Boolean).sort((a, b) => skuKey(b || "").length - skuKey(a || "").length)[0]?.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, "")) || rowNumbers[0] || 0;
         if (skuMatch && quantity) {
           blanks = 0;
-          gridProducts.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: priceRead.value, review: { price: priceRead.review } });
+          gridProducts.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: 0 });
           continue;
         }
         const rowText = await readCell(tableLeft, top, cellWidth * 3, height);
@@ -469,11 +440,10 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         const top = row * continuationRow;
         const skuText = await readCell(0, top + 1, continuationWidth, continuationRow - 2);
         const quantityText = await readCell(continuationWidth, top + 1, continuationWidth, continuationRow - 2, true);
-        const priceRead = await readPrintedPrice(continuationWidth * 2, top + 1, continuationWidth, continuationRow - 2);
         const match = skuText.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, ""));
         if (!match || !quantity) { blanks += 1; if (blanks >= 3) break; continue; }
         blanks = 0;
-        continuationProducts.push({ product: "", sku: match[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: priceRead.value, review: { price: priceRead.review } });
+        continuationProducts.push({ product: "", sku: match[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: 0 });
       }
       const transportTop = continuationProducts.length * continuationRow;
       const transportRead = continuationProducts.length ? await readCell(0, transportTop, continuationWidth * 3, continuationRow - 1) : "";
@@ -499,7 +469,6 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
       // screenshots whose grid line is one or two pixels higher or lower.
       let sku = await readCell(gridLeft, top - 2 * y, columnWidth, 24 * y);
       let quantityText = await readCell(gridLeft + columnWidth, top - 2 * y, columnWidth, 24 * y, true);
-      const priceRead = await readPrintedPrice(gridLeft + columnWidth * 2, top - 2 * y, columnWidth, 24 * y);
       let skuMatch = sku.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); let quantity = Number(quantityText.replace(/[^\d]/g, ""));
       // The final handwritten/phone-screenshot row commonly sits closest to a
       // gridline. Retry only an unreadable row with two nearby crops rather
@@ -524,7 +493,7 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
       }
       if (!skuMatch || !quantity) { blankRows += 1; if (blankRows >= 4) break; continue; }
       blankRows = 0;
-      products.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: priceRead.value, review: { price: priceRead.review } });
+      products.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: 0 });
     }
     // The row immediately after the product lines has the transporter merged
     // across the left-hand cells, followed by TOTAL on the right.
@@ -1957,15 +1926,16 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
           });
           const catalogueMatch = exactMatch || (repairedMatches.length === 1 ? repairedMatches[0] : undefined);
           const inferredProduct = Boolean(!exactMatch && catalogueMatch);
-          // Pricing is never taken from the catalogue for an uploaded order.
-          // If sheet OCR cannot read a price, it stays visibly blank/zero for
-          // review instead of silently using a different catalogue rate.
+          // Uploaded sheets provide SKU and quantity only. Pricing always
+          // comes from the approved catalogue, with an agreed client-specific
+          // rate taking priority when one exists.
+          const unitPrice = catalogueMatch ? specialRate(clientName || f.client, catalogueMatch.sku) ?? catalogueMatch.unitPrice : 0;
           return {
             product: catalogueMatch ? `${catalogueName(catalogueMatch)} · ${catalogueMatch.sku}` : line.product || `Review SKU: ${line.sku}`,
             sku: catalogueMatch?.sku || line.sku,
             quantity: line.quantity || 0,
-            unitPrice: line.unitPrice || 0,
-            review: { product: inferredProduct || !catalogueMatch || line.review?.product, quantity: !line.quantity || line.review?.quantity, price: !line.unitPrice || line.review?.price }
+            unitPrice,
+            review: { product: inferredProduct || !catalogueMatch || line.review?.product, quantity: !line.quantity || line.review?.quantity, price: !catalogueMatch }
           };
         });
         setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), ...importedLines] : importedLines);
@@ -1977,11 +1947,10 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
       if (matchedClient) selectClient(matchedClient.name);
       const sku = text.match(/(?:sku|item\s*code|code)\s*[:#-]?\s*([A-Z]{1,4}[- ]?\d{2,8})/i)?.[1]?.replace(" ", "-") || "";
       const quantity = Number(text.match(/(?:qty|quantity)\s*[:x-]?\s*(\d+)/i)?.[1] || 0);
-      const unitPrice = Number(text.match(/(?:unit\s*price|rate|price)\s*[:₹Rs.-]?\s*([\d,]+)/i)?.[1]?.replaceAll(",", "") || 0);
       if (!sku || !quantity) throw new Error("This image did not contain a readable order row. Please use a sharp screenshot of the item, quantity and price columns.");
       const name = text.match(/(?:product|description|item)\s*[:#-]?\s*([A-Za-z][A-Za-z0-9 /&.-]{2,50})/i)?.[1]?.trim() || file.name.replace(/\.[^.]+$/, "").replaceAll(/[-_]/g, " ");
       const catalogueMatch = catalogue.find((item) => item.sku.replaceAll("-", "").toLowerCase() === sku.replaceAll("-", "").toLowerCase());
-      const importedLine = { product: catalogueMatch?.name || name, sku: catalogueMatch?.sku || sku, quantity, unitPrice: specialRate(matchedClient?.name || f.client, catalogueMatch?.sku || sku) ?? catalogueMatch?.unitPrice ?? unitPrice };
+      const importedLine = { product: catalogueMatch?.name || name, sku: catalogueMatch?.sku || sku, quantity, unitPrice: catalogueMatch ? specialRate(matchedClient?.name || f.client, catalogueMatch.sku) ?? catalogueMatch.unitPrice : 0, review: { product: !catalogueMatch, price: !catalogueMatch } };
       setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), importedLine] : [importedLine]);
       setScanState("ready"); setScanNote(catalogueMatch ? `Matched ${catalogueMatch.sku} from your catalogue. Please confirm quantity.` : "Details were extracted. Please check the fields below before saving.");
     } catch { setScanState("error"); setScanNote("We could not read this image. You can still enter the order manually."); }

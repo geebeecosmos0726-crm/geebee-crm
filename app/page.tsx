@@ -353,8 +353,11 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
   // value is accepted only when the readings agree or one reading wins; an
   // unresolved disagreement is deliberately left blank and highlighted.
   const readPrintedPrice = async (x: number, y: number, width: number, height: number) => {
-    const inset = Math.max(1, Math.min(5, Math.round(width * .035)));
-    const crops = [[x, y, width, height], [x + inset, y, width - inset * 2, height], [x, Math.max(0, y - 2), width, height + 4], [x + inset, Math.max(0, y - 2), width - inset * 2, height + 4]];
+    const reach = Math.max(2, Math.min(7, Math.round(width * .05)));
+    // Include a few pixels beyond the vertical borders as well as moving up
+    // and down. This specifically protects a final 0 sitting against a grid
+    // line; the adjacent VALUE digits are far enough away to stay excluded.
+    const crops = [[Math.max(0, x - reach), y, width + reach * 2, height], [x, y, width + reach, height], [Math.max(0, x - reach), Math.max(0, y - 2), width + reach * 2, height + 4], [x, Math.max(0, y - 2), width + reach, height + 4]];
     const values: number[] = [];
     for (const [cropX, cropY, cropWidth, cropHeight] of crops) {
       const text = await readCell(cropX, cropY, cropWidth, cropHeight, true);
@@ -363,8 +366,15 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
     }
     const counts = new Map<number, number>(); values.forEach((value) => counts.set(value, (counts.get(value) || 0) + 1));
     const ranked = [...counts.entries()].sort(([leftValue, leftCount], [rightValue, rightCount]) => rightCount - leftCount || String(rightValue).length - String(leftValue).length);
-    const [candidate, count] = ranked[0] || [0, 0]; const disagreement = counts.size > 1;
-    return { value: count >= 2 || counts.size === 1 ? candidate : 0, review: disagreement || !candidate || count < 2 };
+    let [candidate, count] = ranked[0] || [0, 0]; const disagreement = counts.size > 1;
+    // If one crop sees 9 and another sees 90, retain 90 (the full reading)
+    // but flag it. Do not make the same assumption for 18 / 180 etc.
+    const recoveredTrailingZero = values.find((value) => Number.isInteger(value) && value >= 10 && value < 100 && values.some((shortValue) => Number.isInteger(shortValue) && shortValue > 0 && shortValue < 10 && value === shortValue * 10));
+    if (recoveredTrailingZero) { candidate = recoveredTrailingZero; count = counts.get(candidate) || 0; }
+    // A lone integer digit could be 9 or a clipped 90. Do not save it as a
+    // rate automatically; decimals such as 3.25 remain valid.
+    const unsafeSingleDigit = Number.isInteger(candidate) && candidate > 0 && candidate < 10;
+    return { value: !unsafeSingleDigit && (count >= 2 || counts.size === 1 || Boolean(recoveredTrailingZero)) ? candidate : 0, review: disagreement || !candidate || count < 2 || unsafeSingleDigit };
   };
   try {
     const x = source.width / 591; let y = source.height / 1253;

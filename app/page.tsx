@@ -19,6 +19,7 @@ import "./recovery.css";
 import "./transporters.css";
 import "./image-studio.css";
 import "./image-studio-fit.css";
+import "./dispatch-plan.css";
 import { supabase } from "./lib/supabase";
 import type { Session } from "@supabase/supabase-js";
 import {
@@ -642,7 +643,7 @@ export default function Home() {
     const advanceId = `ADV-${primaryId}`;
     const primaryOrder = orders.find((item) => item.id === primaryId);
     const advanceOrder = orders.find((item) => item.id === advanceId);
-    const dispatchedLines = isAdvance ? [] : linesFor(primaryOrder || order);
+    const dispatchedLines = isAdvance || primaryOrder?.status !== "Dispatch plan" ? [] : linesFor(primaryOrder || order);
     const reservedLines = isAdvance ? linesFor(order) : advanceOrder ? linesFor(advanceOrder) : [];
     setCatalogue((current) => current.map((product) => {
       const dispatched = dispatchedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
@@ -673,7 +674,10 @@ export default function Home() {
       if (orders.some((item) => item.id === advanceId)) advanceIds.add(advanceId);
     });
     const removedIds = new Set([...primaryIds, ...advanceIds]);
-    const dispatchedLines = [...primaryIds].flatMap((id) => linesFor(orders.find((item) => item.id === id) || {} as Order));
+    const dispatchedLines = [...primaryIds].flatMap((id) => {
+      const order = orders.find((item) => item.id === id);
+      return order?.status === "Dispatch plan" ? linesFor(order) : [];
+    });
     const reservedLines = [...advanceIds].flatMap((id) => linesFor(orders.find((item) => item.id === id) || {} as Order));
     setCatalogue((current) => current.map((product) => {
       const dispatched = dispatchedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
@@ -697,6 +701,38 @@ export default function Home() {
     logActivity("Reset demo inventory", "Catalogue", `${result.updated || 0} products set to 10,000 available units`);
     flash(`Demo inventory reset: ${result.updated || 0} products now have 10,000 available units.`);
   };
+  const pushToDispatchPlan = (order: Order) => {
+    if (order.status === "Dispatch plan" || order.status === "Cancelled" || isBackorderRecord(order)) return;
+    const requestedLines = linesFor(order);
+    if (!requestedLines.length) { flash("This order has no product lines to dispatch."); return; }
+    if (!window.confirm(`Move ${order.id} to Dispatch Plan? Available quantities will be allocated now; any shortage will be created as a backorder.`)) return;
+    const shortages: ProductLine[] = [];
+    const dispatchLines: ProductLine[] = [];
+    const remainingStock = new Map(catalogue.map((product) => [skuKey(product.sku), availableStock(product)]));
+    requestedLines.forEach((line) => {
+      const key = skuKey(line.sku); const available = remainingStock.get(key) || 0;
+      const dispatchNow = Math.max(0, Math.min(line.quantity, available)); const short = Math.max(0, line.quantity - dispatchNow);
+      remainingStock.set(key, Math.max(0, available - dispatchNow));
+      if (dispatchNow) dispatchLines.push({ ...line, quantity: dispatchNow });
+      if (short) shortages.push({ ...line, quantity: short });
+    });
+    setCatalogue((current) => current.map((product) => {
+      const dispatched = dispatchLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      const short = shortages.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      return !dispatched && !short ? product : { ...product, availableQuantity: Math.max(0, availableStock(product) - dispatched), reservedStock: (product.reservedStock || 0) + short };
+    }));
+    const firstDispatch = dispatchLines[0] || requestedLines[0];
+    const dispatchOrder: Order = { ...order, product: firstDispatch.product, sku: firstDispatch.sku, quantity: firstDispatch.quantity, unitPrice: firstDispatch.unitPrice, products: dispatchLines, status: "Dispatch plan", backorders: shortages };
+    const advanceOrder = shortages.length ? { ...order, id: `ADV-${order.id}`, product: shortages[0].product, sku: shortages[0].sku, quantity: shortages[0].quantity, unitPrice: shortages[0].unitPrice, products: shortages, status: "Advance order", payment: "Partial" } : null;
+    setOrders((current) => [...current.filter((item) => item.id !== order.id && item.id !== `ADV-${order.id}`), dispatchOrder, ...(advanceOrder ? [advanceOrder] : [])]);
+    if (advanceOrder) {
+      const advanceAmount = shortages.reduce((total, line) => total + line.quantity * line.unitPrice, 0);
+      setInvoices((current) => [...current.filter((invoice) => invoice.order !== advanceOrder.id), { id: advanceOrder.id, client: order.client, order: advanceOrder.id, amount: money(advanceAmount), due: "Advance payment", status: "Partial" }]);
+      setTasks((current) => [...current, { id: `TASK-${Date.now()}`, title: `Arrange future dispatch for advance order ${advanceOrder.id}`, time: "10:00", dueDate: new Date().toISOString().slice(0, 10), assignee: "Rahul", type: "Follow-up", status: "Open", relatedTo: advanceOrder.id }]);
+    }
+    logActivity("Moved order to Dispatch Plan", "Dispatch Plan", shortages.length ? `${order.id} · ${shortages.length} shortage line(s) moved to backorder` : order.id);
+    flash(shortages.length ? `${order.id} added to Dispatch Plan; shortage created as advance backorder.` : `${order.id} added to Dispatch Plan and inventory allocated.`);
+  };
   useEffect(() => {
     if (!cloudReady || !session || session.user.email?.toLowerCase() !== "vishu108818@gmail.com") return;
     if (window.localStorage.getItem("geebee-available-stock-10000-v3")) return;
@@ -708,10 +744,10 @@ export default function Home() {
     { label: "Dashboard", icon: LayoutDashboard, items: [{ label: "Dashboard", section: "Overview", module: "Overview" as CrmModule }] },
     { label: "Customers", icon: Users, items: [{ label: "All Customers", section: "Clients", module: "Clients" as CrmModule, count: String(clients.length) }, { label: "New Customers", section: "New Customers", module: "Clients" as CrmModule }, { label: "Customer Groups", section: "Customer Groups", module: "Clients" as CrmModule }, { label: "Customer Activity", section: "Customer Activity", module: "Clients" as CrmModule }] },
     { label: "Leads & Enquiries", icon: Target, items: [{ label: "Leads", section: "Leads", module: "Leads" as CrmModule, count: String(leads.filter((lead) => lead.status !== "Lost" && lead.status !== "Order Created").length) }, { label: "Enquiries", section: "Enquiries", module: "Leads" as CrmModule }, { label: "Follow-ups", section: "Follow-ups", module: "Leads" as CrmModule }, { label: "Lost Leads", section: "Lost Leads", module: "Leads" as CrmModule }] },
-    { label: "Sales", icon: BriefcaseBusiness, items: [{ label: "Quotations", section: "Quotations", module: "Orders" as CrmModule, count: String(quotes.filter((quote) => quote.status !== "Converted").length) }, { label: "Orders", section: "Orders", module: "Orders" as CrmModule, count: String(orders.filter((order) => !isBackorderRecord(order)).length) }, { label: "Backorders", section: "Backorders", module: "Orders" as CrmModule, count: String(orders.filter(isVisibleBackorder).length) }, { label: "Returns", section: "Returns", module: "Orders" as CrmModule }] },
+    { label: "Sales", icon: BriefcaseBusiness, items: [{ label: "Quotations", section: "Quotations", module: "Orders" as CrmModule, count: String(quotes.filter((quote) => quote.status !== "Converted").length) }, { label: "Orders", section: "Orders", module: "Orders" as CrmModule, count: String(orders.filter((order) => !isBackorderRecord(order) && !["Dispatch plan", "Cancelled"].includes(order.status)).length) }, { label: "Backorders", section: "Backorders", module: "Orders" as CrmModule, count: String(orders.filter(isVisibleBackorder).length) }, { label: "Returns", section: "Returns", module: "Orders" as CrmModule }] },
     { label: "Products", icon: Boxes, items: [{ label: "Products / SKUs", section: "Catalogue", module: "Catalogue" as CrmModule, count: String(catalogue.length) }, { label: "Categories", section: "Categories", module: "Catalogue" as CrmModule }, { label: "Price Lists", section: "Price Lists", module: "Catalogue" as CrmModule }, { label: "Stock", section: "Stock", module: "Catalogue" as CrmModule }] },
     { label: "Inventory", icon: Warehouse, items: [{ label: "Stock Overview", section: "Stock Overview" }, { label: "Stock Movements", section: "Stock Movements" }, { label: "Low Stock", section: "Low Stock" }, { label: "Reserved Stock", section: "Reserved Stock" }, { label: "Warehouses", section: "Warehouses" }] },
-    { label: "Operations", icon: Truck, items: [{ label: "Transporters", section: "Transporters", module: "Shipments" as CrmModule, count: String(transporters.length) }, { label: "Picking", section: "Picking" }, { label: "Packing", section: "Packing" }, { label: "Dispatch", section: "Dispatch" }, { label: "Delivery", section: "Delivery" }] },
+    { label: "Operations", icon: Truck, items: [{ label: "Dispatch Plan", section: "Dispatch Plan", module: "Orders" as CrmModule, count: String(orders.filter((order) => order.status === "Dispatch plan").length) }, { label: "Transporters", section: "Transporters", module: "Shipments" as CrmModule, count: String(transporters.length) }, { label: "Picking", section: "Picking" }, { label: "Packing", section: "Packing" }, { label: "Delivery", section: "Delivery" }] },
     { label: "Billing", icon: ReceiptText, items: [{ label: "Invoices", section: "Invoices", module: "Invoices" as CrmModule, count: String(invoices.filter((i) => i.status !== "Paid").length) }, { label: "Payments", section: "Payments", module: "Payments" as CrmModule, count: "2" }, { label: "Outstanding", section: "Outstanding", module: "Payments" as CrmModule }, { label: "Ageing", section: "Ageing", module: "Payments" as CrmModule }] },
     { label: "Imports", icon: ShipWheel, items: [{ label: "Suppliers", section: "Suppliers" }, { label: "Purchase Orders", section: "Purchase Orders" }, { label: "Shipments", section: "Shipments", module: "Shipments" as CrmModule }, { label: "Containers", section: "Containers", module: "Shipments" as CrmModule }, { label: "Landed Cost", section: "Landed Cost", module: "Shipments" as CrmModule }] },
     { label: "Reports", icon: ChartNoAxesCombined, items: [{ label: "Sales", section: "Sales Report" }, { label: "Customers", section: "Customer Report" }, { label: "Products", section: "Product Report" }, { label: "Inventory", section: "Inventory Report" }, { label: "Payments", section: "Payment Report" }, { label: "Sales Team", section: "Sales Team Report" }] },
@@ -723,7 +759,7 @@ export default function Home() {
     ...auditEvents.slice(0, 4).map((event) => ({ title: event.action, detail: `${event.actor_email} · ${event.module}`, time: new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) })),
     ...invoices.filter((invoice) => invoice.status !== "Paid").slice(0, 2).map((invoice) => ({ title: `${invoice.status} invoice ${invoice.id}`, detail: `${invoice.client} · ${invoice.amount} due ${invoice.due}`, time: "Needs attention" })),
   ].slice(0, 6);
-  const liveSections = new Set(["Overview", "Clients", "Leads", "Enquiries", "Follow-ups", "Lost Leads", "Quotations", "Orders", "Backorders", "Invoices", "Catalogue", "Transporters", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report", "Image Studio", "Settings", "Recovery"]);
+  const liveSections = new Set(["Overview", "Clients", "Leads", "Enquiries", "Follow-ups", "Lost Leads", "Quotations", "Orders", "Dispatch Plan", "Backorders", "Invoices", "Catalogue", "Transporters", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report", "Image Studio", "Settings", "Recovery"]);
   if (!authReady) return <div className="auth-screen"><div className="auth-card"><b>Opening secure workspace…</b></div></div>;
   if (!supabase) return <div className="auth-screen"><div className="auth-card"><span className="overline">GEEBEE CRM</span><h1>Cloud connection needed</h1><p>Add the Supabase environment settings to open this private workspace.</p></div></div>;
   if (!session) return <SharedAccessScreen notice={accessNotice} />;
@@ -824,8 +860,9 @@ export default function Home() {
         )}{" "}
         {section === "Image Studio" && <ImageStudio />}{" "}
         {section === "Orders" && (
-          <Orders orders={shown.filter((order) => !isBackorderRecord(order))} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={removeOrders} />
+          <Orders orders={shown.filter((order) => !isBackorderRecord(order) && order.status !== "Dispatch plan")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={removeOrders} pushToDispatch={pushToDispatchPlan} />
         )}{" "}
+        {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={removeOrders} />}{" "}
         {section === "Clients" && (
           <Clients
             clients={clients.filter((c) =>
@@ -869,7 +906,7 @@ export default function Home() {
         {section === "Settings" && <TeamAccess members={members} workspaceOwnerId={workspaceOwnerId} canManage={isAdmin} onChange={setMembers} onAudit={logActivity} auditEvents={auditEvents} />}{" "}
         {section === "Recovery" && <RecoveryPanel canManage={isAdmin} session={session} applyRestore={(data) => { setOrders(data.orders); setClients(data.clients); setInvoices(data.invoices); setCatalogue(data.catalogue); setLeads(data.leads); setQuotes(data.quotes); setTasks(data.tasks); setTransporters(data.transporters || []); logActivity("Applied Google Sheets recovery", "Data recovery", "Recovery snapshot created before restore"); flash("Backup restored. Your previous CRM state is saved as a recovery snapshot."); }} />}{" "}
         {section === "Notifications" && <AutomationPanel />}{" "}
-        {!(["Overview", "Orders", "Clients", "Leads", "Enquiries", "Follow-ups", "Lost Leads", "Quotations", "Backorders", "Invoices", "Catalogue", "Transporters", "Settings", "Recovery", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report"].includes(section)) && (
+        {!(["Overview", "Orders", "Dispatch Plan", "Clients", "Leads", "Enquiries", "Follow-ups", "Lost Leads", "Quotations", "Backorders", "Invoices", "Catalogue", "Transporters", "Settings", "Recovery", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report"].includes(section)) && (
           <section className="panel coming">
             <div className="modal-mark">
               <ClipboardList size={22} />
@@ -894,47 +931,13 @@ export default function Home() {
           }}
           close={() => setModal(null)}
           save={(o) => {
-            let savedOrder = o;
-            let advanceOrder: Order | null = null;
-            if (!editing) {
-              const requestedLines = linesFor(o);
-              const shortages: ProductLine[] = [];
-              const dispatchLines: ProductLine[] = [];
-              const remainingStock = new Map(catalogue.map((product) => [skuKey(product.sku), freeStock(product)]));
-              requestedLines.forEach((line) => {
-                const key = skuKey(line.sku); const available = remainingStock.get(key) || 0;
-                const dispatchNow = Math.max(0, Math.min(line.quantity, available)); const short = Math.max(0, line.quantity - dispatchNow);
-                remainingStock.set(key, Math.max(0, available - dispatchNow));
-                if (dispatchNow) dispatchLines.push({ ...line, quantity: dispatchNow });
-                if (short) shortages.push({ ...line, quantity: short });
-              });
-              setCatalogue((current) => current.map((product) => {
-                const dispatchNow = dispatchLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-                const short = shortages.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-                if (!dispatchNow && !short) return product;
-                return { ...product, availableQuantity: Math.max(0, freeStock(product) - dispatchNow), reservedStock: (product.reservedStock || 0) + short };
-              }));
-              const firstDispatch = dispatchLines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
-              savedOrder = { ...o, product: firstDispatch.product, sku: firstDispatch.sku, quantity: firstDispatch.quantity, unitPrice: firstDispatch.unitPrice, products: dispatchLines, status: dispatchLines.length ? o.status : "Backorder", backorders: shortages };
-              if (shortages.length) {
-                const advanceAmount = shortages.reduce((total, line) => total + line.quantity * line.unitPrice, 0);
-                const firstAdvance = shortages[0];
-                const advanceOrderId = `ADV-${o.id}`;
-                advanceOrder = { ...o, id: advanceOrderId, product: firstAdvance.product, sku: firstAdvance.sku, quantity: firstAdvance.quantity, unitPrice: firstAdvance.unitPrice, products: shortages, status: "Advance order", payment: "Partial" };
-                setInvoices((current) => [...current, { id: advanceOrderId, client: o.client, order: advanceOrderId, amount: money(advanceAmount), due: "Advance payment", status: "Partial" }]);
-                setTasks((current) => [...current, { id: `TASK-${Date.now()}`, title: `Arrange future dispatch for advance order ${advanceOrderId}`, time: "10:00", dueDate: new Date().toISOString().slice(0, 10), assignee: "Rahul", type: "Follow-up", status: "Open", relatedTo: advanceOrderId }]);
-              }
-            }
-            setOrders((x) =>
-              editing ? x.map((y) => (y.id === editing.id ? savedOrder : y)) : [...x, ...(savedOrder.products?.length ? [savedOrder] : []), ...(advanceOrder ? [advanceOrder] : [])],
-            );
+            // Creating an order only records the customer's request. Inventory
+            // is intentionally untouched until the user moves it to Dispatch Plan.
+            const savedOrder = editing ? { ...o, status: editing.status } : { ...o, status: o.status === "Cancelled" ? "Confirmed" : o.status, backorders: [] };
+            setOrders((current) => editing ? current.map((item) => item.id === editing.id ? savedOrder : item) : [...current, savedOrder]);
             setModal(null);
             logActivity(editing ? "Updated order" : "Created order", "Orders", o.id);
-            flash(
-              editing
-                ? "Order updated successfully"
-                : savedOrder.backorders?.length ? `Order created with ${savedOrder.backorders.length} backorder line(s), a client advance order, and advance invoice` : "New order created successfully",
-            );
+            flash(editing ? "Order updated successfully" : "New order created. Inventory will be allocated only after it is pushed to Dispatch Plan.");
           }}
         />
       )}
@@ -1154,22 +1157,24 @@ function Orders({
   edit,
   cancel,
   remove,
+  pushToDispatch,
 }: {
   orders: Order[];
   clients: Client[];
   edit: (o: Order) => void;
   cancel: (order: Order) => void;
   remove: (ids: string[]) => void;
+  pushToDispatch: (order: Order) => void;
 }) {
   return (
     <section className="panel record-panel">
       <div className="panel-head">
         <div>
           <h2>Order register</h2>
-          <p>Every product line can be edited at any time.</p>
+          <p>Orders do not affect inventory until they are pushed to Dispatch Plan.</p>
         </div>
       </div>
-      <OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} sendWhatsApp={(order) => { const client = clients.find((item) => item.name === order.client); openWhatsApp(client?.whatsapp || client?.phone || "", `Dear ${order.client}, your GeeBee order #${order.id} is confirmed. Order value: ${money(orderTotal(order))}. We will keep you updated.`); }} />
+      <OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} pushToDispatch={pushToDispatch} sendWhatsApp={(order) => { const client = clients.find((item) => item.name === order.client); openWhatsApp(client?.whatsapp || client?.phone || "", `Dear ${order.client}, your GeeBee order #${order.id} is confirmed. Order value: ${money(orderTotal(order))}. We will keep you updated.`); }} />
     </section>
   );
 }
@@ -1179,6 +1184,7 @@ function OrderTable({
   cancel,
   remove,
   sendWhatsApp,
+  pushToDispatch,
   compact = false,
 }: {
   orders: Order[];
@@ -1186,6 +1192,7 @@ function OrderTable({
   cancel?: (order: Order) => void;
   remove?: (ids: string[]) => void;
   sendWhatsApp?: (order: Order) => void;
+  pushToDispatch?: (order: Order) => void;
   compact?: boolean;
 }) {
   const [selected, setSelected] = useState<string[]>([]);
@@ -1264,7 +1271,7 @@ function OrderTable({
                 <Pill value={o.payment} />
               </td>
               <td>
-                <div className="record-actions">{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>WA</button>}<button className="whatsapp-action" type="button" onClick={() => downloadOrderPdf(o)} aria-label={`Download ${o.status === "Advance order" ? "advance order" : "purchase order"} ${o.id}`}>{o.status === "Advance order" ? "AO" : "PO"}</button><button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>{cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
+                <div className="record-actions">{pushToDispatch && o.status !== "Cancelled" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>WA</button>}<button className="whatsapp-action" type="button" onClick={() => downloadOrderPdf(o)} aria-label={`Download ${o.status === "Advance order" ? "advance order" : "purchase order"} ${o.id}`}>{o.status === "Advance order" ? "AO" : "PO"}</button><button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>{cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
               </td>
             </tr>
           ))}
@@ -1420,6 +1427,9 @@ function ReportsDashboard({ report, orders, clients, catalogue, leads, quotes, i
     {report === "Inventory Report" && <><section className="panel"><h3>Products needing stock action</h3><div className="report-list">{lowStock.slice(0, 8).map((product) => <article key={product.id}><span>{product.sku} · {product.name}</span><b>{freeStock(product).toLocaleString("en-IN")} free</b></article>)}{!lowStock.length && <p className="profile-empty">All SKUs have free stock available.</p>}</div></section><section className="panel"><h3>Highest reserved SKUs</h3><div className="report-list">{[...catalogue].filter((product) => (product.reservedStock || 0) > 0).sort((a, b) => (b.reservedStock || 0) - (a.reservedStock || 0)).slice(0, 8).map((product) => <article key={product.id}><span>{product.sku} · {product.name}</span><b>{(product.reservedStock || 0).toLocaleString("en-IN")} reserved</b></article>)}{!catalogue.some((product) => (product.reservedStock || 0) > 0) && <p className="profile-empty">No quantity is reserved for backorders.</p>}</div></section></>}
     {report === "Payment Report" && <><section className="panel"><h3>Outstanding invoices</h3><div className="report-list">{openInvoices.sort((a, b) => amount(b.amount) - amount(a.amount)).slice(0, 8).map((invoice) => <article key={invoice.id}><span>{invoice.id} · {invoice.client}</span><b>{invoice.amount}</b></article>)}{!openInvoices.length && <p className="profile-empty">No outstanding invoices.</p>}</div></section><section className="panel"><h3>Recent collections</h3><div className="report-list">{invoices.filter((invoice) => invoice.status === "Paid").slice(0, 8).map((invoice) => <article key={invoice.id}><span>{invoice.id} · {invoice.client}</span><b>{invoice.amount}</b></article>)}{!invoices.some((invoice) => invoice.status === "Paid") && <p className="profile-empty">No paid invoices recorded yet.</p>}</div></section></>}
   </div></section>;
+}
+function DispatchPlanPanel({ orders, clients, edit, cancel, remove }: { orders: Order[]; clients: Client[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove: (ids: string[]) => void }) {
+  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">INVENTORY ALLOCATION</span><h2>Dispatch Plan</h2><p>Only orders moved here consume available SKU quantity. Any unavailable quantity is automatically sent to Backorders.</p></div></div><OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} sendWhatsApp={(order) => { const client = clients.find((item) => item.name === order.client); openWhatsApp(client?.whatsapp || client?.phone || "", `Dear ${order.client}, your GeeBee order #${order.id} is being prepared for dispatch.`); }} /></section>;
 }
 function BackordersPanel({ orders, clients, edit, cancel, remove }: { orders: Order[]; clients: Client[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove: (ids: string[]) => void }) {
   return <section className="panel record-panel"><div className="panel-head"><div><span className="overline">BACKORDER & ADVANCE ORDER</span><h2>Advance order register</h2><p>Only quantities unavailable in free stock appear here. Each advance order is editable and has its own PDF.</p></div></div><OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} sendWhatsApp={(order) => { const client = clients.find((item) => item.name === order.client); openWhatsApp(client?.whatsapp || client?.phone || "", `Dear ${order.client}, your GeeBee advance order #${order.id} is pending future dispatch. Advance value: ${money(orderTotal(order))}.`); }} /></section>;

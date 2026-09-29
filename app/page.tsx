@@ -408,10 +408,11 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         const skuText = await readCell(tableLeft, top, cellWidth, height);
         const quantityText = await readCell(tableLeft + cellWidth, top, cellWidth, height, true);
         const priceText = await readCell(tableLeft + cellWidth * 2, top, cellWidth, height, true);
-        const valueText = await readCell(tableLeft + cellWidth * 3, top, cellWidth, height, true);
-        // A second pass across the three numeric cells recovers values when a
+        // Read only the two source fields the CRM needs: quantity and price.
+        // Line value and the order total are calculated by the CRM itself.
+        // A second pass across the two numeric cells recovers values when a
         // vertical grid border interferes with a single-cell OCR pass.
-        const rowNumbers = (await readCell(tableLeft + cellWidth, top, cellWidth * 3, height, true)).match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
+        const rowNumbers = (await readCell(tableLeft + cellWidth, top, cellWidth * 2, height, true)).match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
         // Grid borders can hide the first or final character of a SKU. Take a
         // few nearby crops, retaining the longest valid code; catalogue
         // matching below still refuses ambiguous codes.
@@ -419,14 +420,8 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         for (const shift of [-3, 3]) skuCandidates.push(await readCell(tableLeft, Math.max(0, top + shift), cellWidth, height));
         const skuMatch = skuCandidates.map((text) => text.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i)?.[0]).filter(Boolean).sort((a, b) => skuKey(b || "").length - skuKey(a || "").length)[0]?.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, "")) || rowNumbers[0] || 0;
         if (skuMatch && quantity) {
-          blanks = 0; const value = Number(valueText.replace(/[^\d.]/g, "")) || rowNumbers[2] || 0; const printedPrice = Number(priceText.replace(/[^\d.]/g, "")) || rowNumbers[1] || 0;
-          // GeeBee's locked internal-sheet template has a dedicated PRICE
-          // column. That short cell is more reliable than a long VALUE such
-          // as 234000, where OCR can drop a zero. Use PRICE as the source of
-          // truth and only use VALUE / QTY when PRICE is unreadable.
-          const calculatedPrice = value && quantity ? value / quantity : 0;
-          const priceConflict = Boolean(printedPrice && calculatedPrice && Math.abs(printedPrice - calculatedPrice) > Math.max(.01, printedPrice * .01));
-          gridProducts.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: printedPrice || calculatedPrice, review: { price: priceConflict || (!printedPrice && !calculatedPrice) } });
+          blanks = 0; const printedPrice = Number(priceText.replace(/[^\d.]/g, "")) || rowNumbers[1] || 0;
+          gridProducts.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: printedPrice, review: { price: !printedPrice } });
           continue;
         }
         const rowText = await readCell(tableLeft, top, cellWidth * 3, height);
@@ -447,12 +442,10 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         const skuText = await readCell(0, top + 1, continuationWidth, continuationRow - 2);
         const quantityText = await readCell(continuationWidth, top + 1, continuationWidth, continuationRow - 2, true);
         const priceText = await readCell(continuationWidth * 2, top + 1, continuationWidth, continuationRow - 2, true);
-        const valueText = await readCell(continuationWidth * 3, top + 1, continuationWidth, continuationRow - 2, true);
         const match = skuText.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, ""));
         if (!match || !quantity) { blanks += 1; if (blanks >= 3) break; continue; }
-        blanks = 0; const value = Number(valueText.replace(/[^\d.]/g, "")); const printedPrice = Number(priceText.replace(/[^\d.]/g, "")); const calculatedPrice = value && quantity ? value / quantity : 0;
-        const priceConflict = Boolean(printedPrice && calculatedPrice && Math.abs(printedPrice - calculatedPrice) > Math.max(.01, printedPrice * .01));
-        continuationProducts.push({ product: "", sku: match[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: printedPrice || calculatedPrice, review: { price: priceConflict || (!printedPrice && !calculatedPrice) } });
+        blanks = 0; const printedPrice = Number(priceText.replace(/[^\d.]/g, ""));
+        continuationProducts.push({ product: "", sku: match[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: printedPrice, review: { price: !printedPrice } });
       }
       const transportTop = continuationProducts.length * continuationRow;
       const transportRead = continuationProducts.length ? await readCell(0, transportTop, continuationWidth * 3, continuationRow - 1) : "";
@@ -479,7 +472,6 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
       let sku = await readCell(gridLeft, top - 2 * y, columnWidth, 24 * y);
       let quantityText = await readCell(gridLeft + columnWidth, top - 2 * y, columnWidth, 24 * y, true);
       const priceText = await readCell(gridLeft + columnWidth * 2, top - 2 * y, columnWidth, 24 * y, true);
-      const valueText = await readCell(gridLeft + columnWidth * 3, top - 2 * y, columnWidth, 24 * y, true);
       let skuMatch = sku.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); let quantity = Number(quantityText.replace(/[^\d]/g, ""));
       // The final handwritten/phone-screenshot row commonly sits closest to a
       // gridline. Retry only an unreadable row with two nearby crops rather
@@ -502,10 +494,10 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
           if (candidateSku && candidateQuantity) { sku = retrySku; quantityText = retryQuantity; skuMatch = candidateSku; quantity = candidateQuantity; break; }
         }
       }
-      const value = Number(valueText.replace(/[^\d.]/g, "")); const scannedPrice = Number(priceText.replace(/[^\d.]/g, ""));
+      const scannedPrice = Number(priceText.replace(/[^\d.]/g, ""));
       if (!skuMatch || !quantity) { blankRows += 1; if (blankRows >= 4) break; continue; }
-      blankRows = 0; const calculatedPrice = value && quantity ? value / quantity : 0; const priceConflict = Boolean(scannedPrice && calculatedPrice && Math.abs(scannedPrice - calculatedPrice) > Math.max(.01, scannedPrice * .01)); const unitPrice = scannedPrice || calculatedPrice;
-      products.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice, review: { price: priceConflict || (!scannedPrice && !calculatedPrice) } });
+      blankRows = 0;
+      products.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: scannedPrice, review: { price: !scannedPrice } });
     }
     // The row immediately after the product lines has the transporter merged
     // across the left-hand cells, followed by TOTAL on the right.

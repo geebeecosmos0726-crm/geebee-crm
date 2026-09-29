@@ -417,6 +417,16 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
       // The final handwritten/phone-screenshot row commonly sits closest to a
       // gridline. Retry only an unreadable row with two nearby crops rather
       // than silently dropping it.
+      // Always take a few nearby reads and retain the SKU with the most
+      // characters. This prevents AB-203 being shortened to AB-20 when a
+      // gridline sits across the final digit.
+      const skuCandidates = skuMatch ? [skuMatch[0]] : [];
+      for (const shift of [-7, -3, 4, 7]) {
+        const retrySku = await readCell(gridLeft, top + shift * y, columnWidth, 21 * y);
+        const candidateSku = retrySku.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i);
+        if (candidateSku) skuCandidates.push(candidateSku[0]);
+      }
+      if (skuCandidates.length) { const bestSku = skuCandidates.sort((a, b) => skuKey(b).length - skuKey(a).length)[0]; skuMatch = bestSku.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); }
       if (!skuMatch || !quantity) {
         for (const shift of [-6, 4]) {
           const retrySku = await readCell(gridLeft, top + shift * y, columnWidth, 21 * y);
@@ -1782,7 +1792,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
     if (i !== index) return item;
     const updated = { ...item, [key]: value };
     if (key !== "sku" && key !== "product") return updated;
-    const catalogueProduct = catalogue.find((product) => key === "sku" ? skuKey(product.sku) === skuKey(String(value)) : product.name.trim().toLowerCase() === String(value).trim().toLowerCase());
+    const catalogueProduct = catalogue.find((product) => key === "sku" ? skuKey(product.sku) === skuKey(String(value)) : `${catalogueName(product)} · ${product.sku}`.toLowerCase() === String(value).trim().toLowerCase() || catalogueName(product).trim().toLowerCase() === String(value).trim().toLowerCase());
     const selectedSku = catalogueProduct?.sku || (key === "sku" ? String(value) : updated.sku);
     const rate = specialRate(f.client, selectedSku) ?? catalogueProduct?.unitPrice;
     return { ...updated, sku: selectedSku, product: catalogueProduct?.name || updated.product, unitPrice: rate ?? updated.unitPrice };
@@ -1812,7 +1822,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
   }, [catalogue, clients, transporters]);
   useEffect(() => {
     const list = document.createElement("datalist"); list.id = "order-product-search";
-    catalogue.forEach((product) => { const option = document.createElement("option"); option.value = catalogueName(product); option.label = `${product.sku} · ${money(specialRate(f.client, product.sku) ?? product.unitPrice)}`; list.append(option); });
+    catalogue.forEach((product) => { const option = document.createElement("option"); option.value = `${catalogueName(product)} · ${product.sku}`; option.label = money(specialRate(f.client, product.sku) ?? product.unitPrice); list.append(option); });
     document.body.append(list);
     const productInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="Product name"]'));
     const skuInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="SKU ID"]'));
@@ -1838,7 +1848,14 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
         const matchedTransporter = transporters.find((item) => skuKey(item.name) === skuKey(internalSheet.transporter || ""));
         const transporterName = matchedTransporter?.name || internalSheet.transporter || "";
         setF((current) => ({ ...current, client: clientName || current.client, city: matchedClient?.city || current.city, eta: internalSheet.eta || current.eta, transporter: transporterName || current.transporter || "", avatar: matchedClient?.avatar || initials(clientName || current.client) }));
-        const importedLines = internalSheet.products.map((line) => { const catalogueMatch = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku)); return { product: catalogueMatch?.name || line.product || `Product ${line.sku}`, sku: catalogueMatch?.sku || line.sku, quantity: line.quantity, unitPrice: line.unitPrice }; });
+        const importedLines = internalSheet.products.map((line) => {
+          const exactMatch = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));
+          const partialMatches = exactMatch ? [] : catalogue.filter((item) => skuKey(item.sku).startsWith(skuKey(line.sku)) || skuKey(line.sku).startsWith(skuKey(item.sku)));
+          const catalogueMatch = exactMatch || (partialMatches.length === 1 ? partialMatches[0] : undefined);
+          // A readable sheet price always wins. Catalogue price is only a
+          // safety fallback when the source image contains no numeric price.
+          return { product: catalogueMatch?.name || line.product || `Product ${line.sku}`, sku: catalogueMatch?.sku || line.sku, quantity: line.quantity, unitPrice: line.unitPrice || catalogueMatch?.unitPrice || 0 };
+        });
         setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), ...importedLines] : importedLines);
         setScanState("ready"); setScanNote(`GeeBee internal order sheet recognised: ${internalSheet.products.length} product line${internalSheet.products.length === 1 ? "" : "s"} added${clientName ? ` for ${clientName}` : ""}${transporterName ? ` with transporter ${transporterName}` : ""}.${createdClient ? " A new incomplete client profile was created—please complete it in Clients." : ""} Please review, then save the new order.${internalSheet.note ? ` Note: ${internalSheet.note}` : ""}`);
         return;

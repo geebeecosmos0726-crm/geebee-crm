@@ -420,7 +420,13 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         const skuMatch = skuCandidates.map((text) => text.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i)?.[0]).filter(Boolean).sort((a, b) => skuKey(b || "").length - skuKey(a || "").length)[0]?.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, "")) || rowNumbers[0] || 0;
         if (skuMatch && quantity) {
           blanks = 0; const value = Number(valueText.replace(/[^\d.]/g, "")) || rowNumbers[2] || 0; const printedPrice = Number(priceText.replace(/[^\d.]/g, "")) || rowNumbers[1] || 0;
-          gridProducts.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: value && quantity ? value / quantity : printedPrice });
+          // GeeBee's locked internal-sheet template has a dedicated PRICE
+          // column. That short cell is more reliable than a long VALUE such
+          // as 234000, where OCR can drop a zero. Use PRICE as the source of
+          // truth and only use VALUE / QTY when PRICE is unreadable.
+          const calculatedPrice = value && quantity ? value / quantity : 0;
+          const priceConflict = Boolean(printedPrice && calculatedPrice && Math.abs(printedPrice - calculatedPrice) > Math.max(.01, printedPrice * .01));
+          gridProducts.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: printedPrice || calculatedPrice, review: { price: priceConflict || (!printedPrice && !calculatedPrice) } });
           continue;
         }
         const rowText = await readCell(tableLeft, top, cellWidth * 3, height);
@@ -444,8 +450,9 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         const valueText = await readCell(continuationWidth * 3, top + 1, continuationWidth, continuationRow - 2, true);
         const match = skuText.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, ""));
         if (!match || !quantity) { blanks += 1; if (blanks >= 3) break; continue; }
-        blanks = 0; const value = Number(valueText.replace(/[^\d.]/g, "")); const printedPrice = Number(priceText.replace(/[^\d.]/g, ""));
-        continuationProducts.push({ product: "", sku: match[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: value && quantity ? value / quantity : printedPrice });
+        blanks = 0; const value = Number(valueText.replace(/[^\d.]/g, "")); const printedPrice = Number(priceText.replace(/[^\d.]/g, "")); const calculatedPrice = value && quantity ? value / quantity : 0;
+        const priceConflict = Boolean(printedPrice && calculatedPrice && Math.abs(printedPrice - calculatedPrice) > Math.max(.01, printedPrice * .01));
+        continuationProducts.push({ product: "", sku: match[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: printedPrice || calculatedPrice, review: { price: priceConflict || (!printedPrice && !calculatedPrice) } });
       }
       const transportTop = continuationProducts.length * continuationRow;
       const transportRead = continuationProducts.length ? await readCell(0, transportTop, continuationWidth * 3, continuationRow - 1) : "";
@@ -497,8 +504,8 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
       }
       const value = Number(valueText.replace(/[^\d.]/g, "")); const scannedPrice = Number(priceText.replace(/[^\d.]/g, ""));
       if (!skuMatch || !quantity) { blankRows += 1; if (blankRows >= 4) break; continue; }
-      blankRows = 0; const calculatedPrice = value && quantity ? value / quantity : 0; const unitPrice = calculatedPrice || scannedPrice;
-      products.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice });
+      blankRows = 0; const calculatedPrice = value && quantity ? value / quantity : 0; const priceConflict = Boolean(scannedPrice && calculatedPrice && Math.abs(scannedPrice - calculatedPrice) > Math.max(.01, scannedPrice * .01)); const unitPrice = scannedPrice || calculatedPrice;
+      products.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice, review: { price: priceConflict || (!scannedPrice && !calculatedPrice) } });
     }
     // The row immediately after the product lines has the transporter merged
     // across the left-hand cells, followed by TOTAL on the right.
@@ -1939,7 +1946,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
             sku: catalogueMatch?.sku || line.sku,
             quantity: line.quantity || 0,
             unitPrice: line.unitPrice || 0,
-            review: { product: inferredProduct || !catalogueMatch, quantity: !line.quantity, price: !line.unitPrice }
+            review: { product: inferredProduct || !catalogueMatch || line.review?.product, quantity: !line.quantity || line.review?.quantity, price: !line.unitPrice || line.review?.price }
           };
         });
         setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), ...importedLines] : importedLines);

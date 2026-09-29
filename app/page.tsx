@@ -369,9 +369,29 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         if (yellowPixels > strongestYellow && right > left) { strongestYellow = yellowPixels; gridLeft = Math.max(0, left - step); gridRight = Math.min(source.width, right + step); }
       }
     }
-    // A continuation screenshot has no yellow ITEM header. Let normal OCR
-    // parse its rows rather than applying the first-page grid coordinates.
-    if (strongestYellow < 16 || !headerBottom) return null;
+    // A continuation screenshot has no yellow ITEM header, but it still has
+    // the same five equal-width columns. Read those cells directly rather
+    // than using first-page offsets or loose full-page OCR.
+    if (strongestYellow < 16 || !headerBottom) {
+      const continuationWidth = source.width / 5;
+      const continuationRow = source.height / 9.05; // 8 product rows + total row
+      const continuationProducts: ProductLine[] = []; let blanks = 0;
+      for (let row = 0; row < 30; row += 1) {
+        const top = row * continuationRow;
+        const skuText = await readCell(0, top + 1, continuationWidth, continuationRow - 2);
+        const quantityText = await readCell(continuationWidth, top + 1, continuationWidth, continuationRow - 2, true);
+        const priceText = await readCell(continuationWidth * 2, top + 1, continuationWidth, continuationRow - 2, true);
+        const valueText = await readCell(continuationWidth * 3, top + 1, continuationWidth, continuationRow - 2, true);
+        const match = skuText.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, ""));
+        if (!match || !quantity) { blanks += 1; if (blanks >= 3) break; continue; }
+        blanks = 0; const value = Number(valueText.replace(/[^\d.]/g, "")); const printedPrice = Number(priceText.replace(/[^\d.]/g, ""));
+        continuationProducts.push({ product: "", sku: match[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: value && quantity ? value / quantity : printedPrice });
+      }
+      const transportTop = continuationProducts.length * continuationRow;
+      const transportRead = continuationProducts.length ? await readCell(0, transportTop, continuationWidth * 3, continuationRow - 1) : "";
+      const transporter = /\btransport\b/i.test(transportRead) ? transportRead.replace(/\btotal\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim() : "";
+      return continuationProducts.length ? { client: "", eta: "", products: continuationProducts, note: "GeeBee internal order continuation", transporter: transporter || undefined } : null;
+    }
     const gridWidth = gridRight - gridLeft;
     const columnWidth = gridWidth / 5;
     // Screen captures often include a different amount of empty spreadsheet
@@ -406,7 +426,7 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         }
       }
       const value = Number(valueText.replace(/[^\d.]/g, "")); const scannedPrice = Number(priceText.replace(/[^\d.]/g, ""));
-      if (!skuMatch || !quantity) { blankRows += 1; if (blankRows >= 2) break; continue; }
+      if (!skuMatch || !quantity) { blankRows += 1; if (blankRows >= 4) break; continue; }
       blankRows = 0; const calculatedPrice = value && quantity ? value / quantity : 0; const unitPrice = calculatedPrice || scannedPrice;
       products.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice });
     }
@@ -1223,7 +1243,6 @@ function OrderTable({
             {!compact && (
               <>
                 <th>PRODUCT</th>
-                <th>SKU ID</th>
                 <th>QTY</th>
                 <th>UNIT PRICE</th>
               </>
@@ -1256,7 +1275,6 @@ function OrderTable({
                   <td>
                     <b>{o.product}{o.products && o.products.length > 1 ? ` +${o.products.length - 1}` : ""}</b>
                   </td>
-                  <td>{o.sku}</td>
                   <td>{orderQuantity(o).toLocaleString("en-IN")}</td>
                   <td>{money(o.unitPrice)}</td>
                 </>
@@ -1763,9 +1781,9 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
   const updateProduct = (index: number, key: keyof ProductLine, value: string | number) => setProducts(products.map((item, i) => {
     if (i !== index) return item;
     const updated = { ...item, [key]: value };
-    if (key !== "sku") return updated;
-    const catalogueProduct = catalogue.find((product) => skuKey(product.sku) === skuKey(String(value)));
-    const selectedSku = catalogueProduct?.sku || String(value);
+    if (key !== "sku" && key !== "product") return updated;
+    const catalogueProduct = catalogue.find((product) => key === "sku" ? skuKey(product.sku) === skuKey(String(value)) : product.name.trim().toLowerCase() === String(value).trim().toLowerCase());
+    const selectedSku = catalogueProduct?.sku || (key === "sku" ? String(value) : updated.sku);
     const rate = specialRate(f.client, selectedSku) ?? catalogueProduct?.unitPrice;
     return { ...updated, sku: selectedSku, product: catalogueProduct?.name || updated.product, unitPrice: rate ?? updated.unitPrice };
   }));
@@ -1793,12 +1811,14 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
     return () => label.remove();
   }, [catalogue, clients, transporters]);
   useEffect(() => {
-    const list = document.createElement("datalist"); list.id = "order-sku-search";
-    catalogue.forEach((product) => { const option = document.createElement("option"); option.value = product.sku; option.label = `${catalogueName(product)} · ${money(specialRate(f.client, product.sku) ?? product.unitPrice)}`; list.append(option); });
+    const list = document.createElement("datalist"); list.id = "order-product-search";
+    catalogue.forEach((product) => { const option = document.createElement("option"); option.value = catalogueName(product); option.label = `${product.sku} · ${money(specialRate(f.client, product.sku) ?? product.unitPrice)}`; list.append(option); });
     document.body.append(list);
-    const inputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="SKU ID"]'));
-    inputs.forEach((input) => { input.setAttribute("list", list.id); input.setAttribute("placeholder", "Type SKU or product code"); });
-    return () => { inputs.forEach((input) => input.removeAttribute("list")); list.remove(); };
+    const productInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="Product name"]'));
+    const skuInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="SKU ID"]'));
+    productInputs.forEach((input) => { input.setAttribute("list", list.id); input.setAttribute("placeholder", "Type product name to search catalogue"); });
+    skuInputs.forEach((input) => { input.style.display = "none"; input.required = false; });
+    return () => { productInputs.forEach((input) => input.removeAttribute("list")); skuInputs.forEach((input) => { input.style.display = ""; input.required = true; }); list.remove(); };
   }, [catalogue, f.client]);
   const scanDocument = async (file: File, append = false) => {
     setPreview((file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) ? "" : URL.createObjectURL(file)); setScanState("scanning"); setScanNote("Reading document and finding product lines…");

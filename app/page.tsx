@@ -408,9 +408,12 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         const quantityText = await readCell(tableLeft + cellWidth, top, cellWidth, height, true);
         const priceText = await readCell(tableLeft + cellWidth * 2, top, cellWidth, height, true);
         const valueText = await readCell(tableLeft + cellWidth * 3, top, cellWidth, height, true);
-        const skuMatch = skuText.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, ""));
+        // A second pass across the three numeric cells recovers values when a
+        // vertical grid border interferes with a single-cell OCR pass.
+        const rowNumbers = (await readCell(tableLeft + cellWidth, top, cellWidth * 3, height, true)).match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
+        const skuMatch = skuText.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, "")) || rowNumbers[0] || 0;
         if (skuMatch && quantity) {
-          blanks = 0; const value = Number(valueText.replace(/[^\d.]/g, "")); const printedPrice = Number(priceText.replace(/[^\d.]/g, ""));
+          blanks = 0; const value = Number(valueText.replace(/[^\d.]/g, "")) || rowNumbers[2] || 0; const printedPrice = Number(priceText.replace(/[^\d.]/g, "")) || rowNumbers[1] || 0;
           gridProducts.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: value && quantity ? value / quantity : printedPrice });
           continue;
         }
@@ -1903,9 +1906,10 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
           const exactMatch = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));
           const partialMatches = exactMatch ? [] : catalogue.filter((item) => skuKey(item.sku).startsWith(skuKey(line.sku)) || skuKey(line.sku).startsWith(skuKey(item.sku)));
           const catalogueMatch = exactMatch || (partialMatches.length === 1 ? partialMatches[0] : undefined);
-          // A readable sheet price always wins. Catalogue price is only a
-          // safety fallback when the source image contains no numeric price.
-          return { product: catalogueMatch ? `${catalogueName(catalogueMatch)} · ${catalogueMatch.sku}` : line.product || `Product ${line.sku}`, sku: catalogueMatch?.sku || line.sku, quantity: line.quantity, unitPrice: line.unitPrice || catalogueMatch?.unitPrice || 0 };
+          // Pricing is never taken from the catalogue for an uploaded order.
+          // If sheet OCR cannot read a price, it stays visibly blank/zero for
+          // review instead of silently using a different catalogue rate.
+          return { product: catalogueMatch ? `${catalogueName(catalogueMatch)} · ${catalogueMatch.sku}` : line.product || `Product ${line.sku}`, sku: catalogueMatch?.sku || line.sku, quantity: line.quantity, unitPrice: line.unitPrice || 0 };
         });
         setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), ...importedLines] : importedLines);
         setScanState("ready"); setScanNote(`GeeBee internal order sheet recognised: ${internalSheet.products.length} product line${internalSheet.products.length === 1 ? "" : "s"} added${clientName ? ` for ${clientName}` : ""}${transporterName ? ` with transporter ${transporterName}` : ""}.${createdClient ? " A new incomplete client profile was created—please complete it in Clients." : ""} Please review, then save the new order.${internalSheet.note ? ` Note: ${internalSheet.note}` : ""}`);

@@ -35,8 +35,12 @@ export async function POST(request: Request) {
       const split = page.view[2] * 0.42;
       const parseColumn = (column: typeof items, side: "left" | "right") => {
         const raw = column.map((item) => item.text).join(" ");
-        const skuItems = column.filter((item) => /^AB\s*\d{2,8}$/i.test(item.text));
-        return [...raw.matchAll(/\b(AB\s*\d{2,8})\b([\s\S]*?)(?=\bAB\s*\d{2,8}\b|$)/gi)].map((match, itemIndex) => {
+        // Keep catalogue variants such as AB 201-A as distinct SKUs. The old
+        // digits-only expression skipped them, and then shifted the image
+        // crops assigned to every product following the skipped card.
+        const skuPattern = "AB\\s*\\d{2,8}(?:\\s*-\\s*[A-Z])?";
+        const skuItems = column.filter((item) => new RegExp(`^${skuPattern}$`, "i").test(item.text));
+        return [...raw.matchAll(new RegExp(`\\b(${skuPattern})\\b([\\s\\S]*?)(?=\\b${skuPattern}\\b|$)`, "gi"))].map((match, itemIndex) => {
           const details = match[2];
           const description = details.match(/Description-\s*([\s\S]*?)(?=Carton Qty-|Inner Qty-|PRICE-|$)/i)?.[1]?.replace(/Sizes-\s*/gi, " ").trim() || "";
           const cartonQty = details.match(/Carton Qty-\s*([^]*?)(?=Inner Qty-|PRICE-|$)/i)?.[1]?.trim() || "";

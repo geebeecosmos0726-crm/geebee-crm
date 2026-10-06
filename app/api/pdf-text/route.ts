@@ -5,7 +5,7 @@ import { createCanvas, DOMMatrix, ImageData, Path2D } from "@napi-rs/canvas";
 
 export const runtime = "nodejs";
 
-type ParsedProduct = { sku: string; name: string; description: string; cartonQty: string; unitPrice: number; category: string; image: string; y: number; column: "left" | "right" };
+type ParsedProduct = { sku: string; name: string; description: string; cartonQty: string; innerQty: string; unitPrice: number; category: string; image: string; y: number; column: "left" | "right" };
 
 export async function POST(request: Request) {
   try {
@@ -44,8 +44,9 @@ export async function POST(request: Request) {
           const details = match[2];
           const description = details.match(/Description-\s*([\s\S]*?)(?=Carton Qty-|Inner Qty-|PRICE-|$)/i)?.[1]?.replace(/Sizes-\s*/gi, " ").trim() || "";
           const cartonQty = details.match(/Carton Qty-\s*([^]*?)(?=Inner Qty-|PRICE-|$)/i)?.[1]?.trim() || "";
+          const innerQty = details.match(/Inner Qty-\s*([^]*?)(?=PRICE-|$)/i)?.[1]?.trim() || "";
           const priceText = details.match(/PRICE-\s*([\d,.]+)/i)?.[1]?.replaceAll(",", "") || "0";
-          return { sku: match[1].replace(/\s+/g, "-"), name: description || `Product ${match[1]}`, description, cartonQty, unitPrice: Number(priceText) || 0, category: "Imported PDF", image: "", y: skuItems[itemIndex]?.y || 0, column: side } satisfies ParsedProduct;
+          return { sku: match[1].replace(/\s+/g, "-"), name: description || `Product ${match[1]}`, description, cartonQty, innerQty, unitPrice: Number(priceText) || 0, category: "Imported PDF", image: "", y: skuItems[itemIndex]?.y || 0, column: side } satisfies ParsedProduct;
         });
       };
       const products = [...parseColumn(items.filter((item) => item.x < split), "left"), ...parseColumn(items.filter((item) => item.x >= split), "right")];

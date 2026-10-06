@@ -435,8 +435,10 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
           gridProducts.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: 0 });
           continue;
         }
-        const rowText = await readCell(tableLeft, top, cellWidth * 3, height);
-        if (/\btransport\b/i.test(rowText)) transporter = rowText.replace(/\btotal\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim();
+        const rowText = await readCell(tableLeft, top, cellWidth * 4, height);
+        // The transporter is written in the cells before TOTAL. Some vendors
+        // use a name such as "New KRC", so do not require the word Transport.
+        if ((/\btransport\b|\btotal\b/i.test(rowText)) && gridProducts.length) transporter = rowText.replace(/\btotal\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim();
         if (gridProducts.length) { blanks += 1; if (blanks >= 2) break; }
       }
       if (gridProducts.length) return { client: gridClient.replace(/^['’]/, "").trim(), eta: gridEta, products: gridProducts, note: "GeeBee grid order sheet", transporter: transporter || undefined };
@@ -458,8 +460,8 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         continuationProducts.push({ product: "", sku: match[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: 0 });
       }
       const transportTop = continuationProducts.length * continuationRow;
-      const transportRead = continuationProducts.length ? await readCell(0, transportTop, continuationWidth * 3, continuationRow - 1) : "";
-      const transporter = /\btransport\b/i.test(transportRead) ? transportRead.replace(/\btotal\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim() : "";
+      const transportRead = continuationProducts.length ? await readCell(0, transportTop, continuationWidth * 4, continuationRow - 1) : "";
+      const transporter = /\btransport\b|\btotal\b/i.test(transportRead) ? transportRead.replace(/\btotal\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim() : "";
       return continuationProducts.length ? { client: "", eta: "", products: continuationProducts, note: "GeeBee internal order continuation", transporter: transporter || undefined } : null;
     }
     const gridWidth = gridRight - gridLeft;
@@ -509,8 +511,8 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
     }
     // The row immediately after the product lines has the transporter merged
     // across the left-hand cells, followed by TOTAL on the right.
-    const transporterRead = products.length ? await readCell(gridLeft, rowStart + products.length * 21 * y - 2 * y, columnWidth * 3, 24 * y) : "";
-    const transporter = /\btransport\b/i.test(transporterRead) ? transporterRead.replace(/\b(?:total|remarks?)\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim() : "";
+    const transporterRead = products.length ? await readCell(gridLeft, rowStart + products.length * 21 * y - 2 * y, columnWidth * 4, 24 * y) : "";
+    const transporter = /\btransport\b|\btotal\b/i.test(transporterRead) ? transporterRead.replace(/\b(?:total|remarks?)\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim() : "";
     return products.length ? { client: client.replace(/^['’]/, "").trim(), eta, products, note: "GeeBee internal order sheet", transporter: transporter || undefined } : null;
   } finally { await worker.terminate(); URL.revokeObjectURL(source.src); }
 };
@@ -1031,6 +1033,11 @@ export default function Home() {
             setClients((current) => current.some((item) => item.name.trim().toLowerCase() === client.name.trim().toLowerCase()) ? current : [...current, client]);
             logActivity("Created incomplete client from order sheet", "Clients", client.name);
             flash(`${client.name} was added as an incomplete client profile.`);
+          }}
+          createTransporter={(transporter) => {
+            setTransporters((current) => current.some((item) => skuKey(item.name) === skuKey(transporter.name)) ? current : [...current, transporter]);
+            logActivity("Created incomplete transporter from order sheet", "Transporters", transporter.name);
+            flash(`${transporter.name} was added to Transporters. Complete its details when available.`);
           }}
           close={() => setModal(null)}
           save={(o) => {
@@ -1847,7 +1854,7 @@ function LegacyMultiProductOrderModal({ order, clients, close, save }: { order: 
   const saveOrder = () => { const first = products[0]; save({ ...f, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products }); };
   return <Shell close={close}><div className="modal-mark"><PackageCheck size={22} /></div><h2>{order ? "Edit order" : "Create a new order"}</h2><p>Add as many product lines as this order needs.</p><label>Client<select value={f.client} onChange={(e) => selectClient(e.target.value)} required><option value="" disabled>Select a client</option>{clients.map((client) => <option key={client.id}>{client.name}</option>)}</select></label><div className="product-lines"><div className="line-heading"><b>Product lines</b><span>{products.length} item{products.length !== 1 ? "s" : ""}</span></div>{products.map((item, index) => <div className="product-line" key={index}><div className="line-number">{index + 1}</div><div className="line-fields"><input aria-label="Product name" value={item.product} onChange={(e) => updateProduct(index, "product", e.target.value)} placeholder="Product name" required /><input aria-label="SKU ID" value={item.sku} onChange={(e) => updateProduct(index, "sku", e.target.value)} placeholder="SKU ID" required /><input aria-label="Quantity" type="number" min="1" value={item.quantity || ""} onChange={(e) => updateProduct(index, "quantity", Number(e.target.value))} placeholder="Qty" required /><input aria-label="Unit price" type="number" min="0" value={item.unitPrice || ""} onChange={(e) => updateProduct(index, "unitPrice", Number(e.target.value))} placeholder="Price ₹" required /></div><b className="line-total">{money(item.quantity * item.unitPrice)}</b>{products.length > 1 && <button type="button" className="remove-line" onClick={() => setProducts(products.filter((_, i) => i !== index))}>×</button>}</div>)}<button type="button" className="add-line" onClick={() => setProducts([...products, { product: "", sku: "", quantity: 0, unitPrice: 0 }])}><Plus size={15} /> Add another product</button></div><div className="order-total"><span>Order total</span><b>{money(total)}</b></div><div className="form-row"><label>Expected arrival<input type="date" value={f.eta} onChange={(e) => setF({ ...f, eta: e.target.value })} required /></label><label>Status<select value={f.status} onChange={(e) => setF({ ...f, status: e.target.value })}>{["Confirmed", "Production", "In transit", "Customs clearance", "Delivered"].map((value) => <option key={value}>{value}</option>)}</select></label></div><label>Payment status<select value={f.payment} onChange={(e) => setF({ ...f, payment: e.target.value })}>{["Partial", "Paid", "Overdue"].map((value) => <option key={value}>{value}</option>)}</select></label><button className="primary modal-submit" type="button" onClick={saveOrder}>Save order</button></Shell>;
 }
-function OrderModal({ order, clients, catalogue, transporters, createClient, close, save }: { order: Order | null; clients: Client[]; catalogue: CatalogueItem[]; transporters: Transporter[]; createClient: (client: Client) => void; close: () => void; save: (o: Order) => void }) {
+function OrderModal({ order, clients, catalogue, transporters, createClient, createTransporter, close, save }: { order: Order | null; clients: Client[]; catalogue: CatalogueItem[]; transporters: Transporter[]; createClient: (client: Client) => void; createTransporter: (transporter: Transporter) => void; close: () => void; save: (o: Order) => void }) {
   const base = order || { id: nextOrderNumber(), client: "", city: "", eta: "", status: "Confirmed", payment: "Partial", transporter: "", avatar: "" };
   const [f, setF] = useState(base);
   const [products, setProducts] = useState<ProductLine[]>(order?.products || (order ? [{ product: order.product, sku: order.sku, quantity: order.quantity, unitPrice: order.unitPrice }] : [{ product: "", sku: "", quantity: 0, unitPrice: 0 }]));
@@ -1924,7 +1931,13 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
           createdClient = true;
         }
         const clientName = matchedClient?.name || internalSheet.client;
-        const matchedTransporter = transporters.find((item) => skuKey(item.name) === skuKey(internalSheet.transporter || ""));
+        let matchedTransporter = transporters.find((item) => skuKey(item.name) === skuKey(internalSheet.transporter || ""));
+        let createdTransporter = false;
+        if (!matchedTransporter && internalSheet.transporter?.trim()) {
+          matchedTransporter = { id: Date.now() + 1, name: internalSheet.transporter.trim(), contact: "", phone: "", email: "", city: "", area: "", gstin: "", serviceType: "", notes: "" };
+          createTransporter(matchedTransporter);
+          createdTransporter = true;
+        }
         const transporterName = matchedTransporter?.name || internalSheet.transporter || "";
         setF((current) => ({ ...current, client: clientName || current.client, city: matchedClient?.city || current.city, eta: internalSheet.eta || current.eta, transporter: transporterName || current.transporter || "", avatar: matchedClient?.avatar || initials(clientName || current.client) }));
         const importedLines = internalSheet.products.map((line) => {
@@ -1952,7 +1965,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, clo
           };
         });
         setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), ...importedLines] : importedLines);
-        setScanState("ready"); setScanNote(`GeeBee internal order sheet recognised: ${internalSheet.products.length} product line${internalSheet.products.length === 1 ? "" : "s"} added${clientName ? ` for ${clientName}` : ""}${transporterName ? ` with transporter ${transporterName}` : ""}.${createdClient ? " A new incomplete client profile was created—please complete it in Clients." : ""} Please review, then save the new order.${internalSheet.note ? ` Note: ${internalSheet.note}` : ""}`);
+        setScanState("ready"); setScanNote(`GeeBee internal order sheet recognised: ${internalSheet.products.length} product line${internalSheet.products.length === 1 ? "" : "s"} added${clientName ? ` for ${clientName}` : ""}${transporterName ? ` with transporter ${transporterName}` : ""}.${createdClient ? " A new incomplete client profile was created—please complete it in Clients." : ""}${createdTransporter ? " A new incomplete transporter was added to Transporters—please complete its details when available." : ""} Please review, then save the new order.${internalSheet.note ? ` Note: ${internalSheet.note}` : ""}`);
         return;
       }
       const text = rawText.replace(/\s+/g, " ");

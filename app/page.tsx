@@ -1000,7 +1000,7 @@ export default function Home() {
           <CataloguePanel
             items={catalogue.filter((item) => `${catalogueName(item)} ${item.sku} ${item.category}`.toLowerCase().includes(search.toLowerCase()) || skuKey(item.sku).includes(skuKey(search)))}
             edit={(item) => show("catalogue", item)}
-            addDrafts={(drafts) => { setCatalogue((current) => [...current, ...drafts]); logActivity("Imported catalogue products", "Catalogue", `${drafts.length} SKU draft(s)`); flash(`${drafts.length} SKU draft${drafts.length === 1 ? "" : "s"} added from catalogue image`); }}
+            addDrafts={(drafts) => { setCatalogue((current) => { const incoming = new Map(drafts.map((item) => [skuKey(item.sku), item])); const existing = new Set(current.map((item) => skuKey(item.sku))); return [...current.map((item) => { const replacement = incoming.get(skuKey(item.sku)); return replacement ? { ...item, ...replacement, id: item.id } : item; }), ...drafts.filter((item) => !existing.has(skuKey(item.sku)))]; }); logActivity("Imported catalogue products", "Catalogue", `${drafts.length} SKU record(s) reconciled`); flash("Catalogue PDF processed: matching SKUs updated and missing SKUs added."); }}
             setAllOpeningStock={() => { if (window.confirm(`Reset demo inventory for all ${catalogue.length} products to 10,000 available units? Existing stock allocations will be cleared.`)) initialiseOpeningStock(); }}
             remove={(ids) => { setCatalogue((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed catalogue product", "Catalogue", ids.join(", ")); flash(`${ids.length} product${ids.length === 1 ? "" : "s"} removed from catalogue`); }}
           />

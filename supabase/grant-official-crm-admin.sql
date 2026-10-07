@@ -6,7 +6,7 @@
 insert into public.crm_workspace_members (workspace_owner_id, email, role, modules)
 select
   owner_id,
-  'geebeecos0726@gmail.com',
+  'geebeecosmos0726@gmail.com',
   'admin',
   array[
     'Overview', 'Clients', 'Leads', 'Orders', 'Invoices', 'Catalogue',
@@ -23,4 +23,4 @@ do update set
 -- Verification: this should return one row with role = admin.
 select email, role, modules
 from public.crm_workspace_members
-where lower(email) = 'geebeecos0726@gmail.com';
+where lower(email) = 'geebeecosmos0726@gmail.com';

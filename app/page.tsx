@@ -601,7 +601,13 @@ function SharedAccessScreen({ notice = "" }: { notice?: string }) {
       window.location.assign(result.url);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Shared access could not be opened."); setLoading(false); }
   };
-  return <main className="auth-screen"><section className="auth-card"><div className="auth-logo">G</div><span className="overline">GEEBEE IMPORTS</span><h1>Internal CRM access</h1><p>Enter the shared internal passcode to open the GeeBee workspace.</p><label>Shared passcode<input type="password" value={passcode} onChange={(event) => setPasscode(event.target.value)} onKeyDown={(event) => event.key === "Enter" && enter()} placeholder="Enter passcode" autoFocus/></label><button className="primary auth-submit" type="button" disabled={loading || !passcode.trim()} onClick={enter}>{loading ? "Opening workspace…" : "Open CRM"}</button>{message && <div className="auth-message warning">{message}</div>}<small>Temporary internal access. Do not share the passcode outside GeeBee.</small></section></main>;
+  const signInWithGoogle = async () => {
+    if (!supabase || loading) return;
+    setLoading(true); setMessage("");
+    const { error } = await supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.origin } });
+    if (error) { setLoading(false); setMessage(error.message.includes("provider") ? "Google sign-in has not been enabled in Supabase yet. Complete the Google setup steps, then try again." : error.message); }
+  };
+  return <main className="auth-screen"><section className="auth-card"><div className="auth-logo">G</div><span className="overline">GEEBEE IMPORTS</span><h1>Internal CRM access</h1><p>Use your authorised Google account, or enter the shared internal passcode.</p><button className="google-auth" type="button" disabled={loading} onClick={signInWithGoogle}><span>G</span>Continue with Google</button><div className="auth-divider"><i/>or<i/></div><label>Shared passcode<input type="password" value={passcode} onChange={(event) => setPasscode(event.target.value)} onKeyDown={(event) => event.key === "Enter" && enter()} placeholder="Enter passcode" autoFocus/></label><button className="primary auth-submit" type="button" disabled={loading || !passcode.trim()} onClick={enter}>{loading ? "Opening workspace…" : "Open CRM"}</button>{message && <div className="auth-message warning">{message}</div>}<small>Google users must still be granted access by a GeeBee administrator. Do not share the passcode outside GeeBee.</small></section></main>;
 }
 export default function Home() {
   const [section, setSection] = useState("Overview"),

@@ -2,8 +2,6 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-const adminEmail = "vishu108818@gmail.com";
-
 export async function POST(request: Request) {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -12,9 +10,12 @@ export async function POST(request: Request) {
 
   const db = createClient(url, serviceKey, { auth: { persistSession: false } });
   const { data: userResult, error: userError } = await db.auth.getUser(token);
-  if (userError || userResult.user?.email?.toLowerCase() !== adminEmail) return Response.json({ error: "Administrator access is required." }, { status: 403 });
+  if (userError || !userResult.user?.email) return Response.json({ error: "Administrator access is required." }, { status: 403 });
 
-  const ownerId = userResult.user.id;
+  const { data: ownedWorkspace } = await db.from("crm_workspaces").select("owner_id").eq("owner_id", userResult.user.id).maybeSingle();
+  const { data: adminMembership } = ownedWorkspace ? { data: null } : await db.from("crm_workspace_members").select("workspace_owner_id, role").ilike("email", userResult.user.email).eq("role", "admin").maybeSingle();
+  const ownerId = ownedWorkspace?.owner_id || adminMembership?.workspace_owner_id;
+  if (!ownerId) return Response.json({ error: "Administrator access is required." }, { status: 403 });
   const { data: products, error: readError } = await db.from("crm_products").select("record_id, data").eq("workspace_owner_id", ownerId).limit(100000);
   if (readError) return Response.json({ error: readError.message }, { status: 500 });
   const updates = (products || []).map((row: { record_id: string; data: Record<string, unknown> }) => ({
@@ -28,6 +29,6 @@ export async function POST(request: Request) {
     const { error: writeError } = await db.from("crm_products").upsert(updates, { onConflict: "workspace_owner_id,record_id" });
     if (writeError) return Response.json({ error: writeError.message }, { status: 500 });
   }
-  await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: adminEmail, action: "Reset demo inventory", module: "Catalogue", details: `${updates.length} products set to 10,000 available units with test allocations cleared` });
+  await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: userResult.user.email, action: "Reset demo inventory", module: "Catalogue", details: `${updates.length} products set to 10,000 available units with test allocations cleared` });
   return Response.json({ ok: true, updated: updates.length });
 }

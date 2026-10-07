@@ -517,7 +517,6 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
   } finally { await worker.terminate(); URL.revokeObjectURL(source.src); }
 };
 const storageKey = "geebee-crm-data-v1";
-const approvedWorkspaceEmails = ["vishu108818@gmail.com"];
 type SavedCrmData = { orders: Order[]; clients: Client[]; invoices: Invoice[]; catalogue: CatalogueItem[]; leads: Lead[]; quotes: Quote[]; tasks: SalesTask[]; transporters: Transporter[] };
 const loadCrmData = (): SavedCrmData => {
   const fallback = { orders: seedOrders, clients: seedClients, invoices: seedInvoices, catalogue: seedCatalogue, leads: seedLeads, quotes: seedQuotes, tasks: seedTasks, transporters: seedTransporters };
@@ -676,11 +675,17 @@ export default function Home() {
     let profile: { fullName?: string; phone?: string } = {};
     try { profile = draft ? JSON.parse(draft) : {}; } catch { /* ignore an invalid local profile */ }
     cloud.from("crm_profiles").upsert({ user_id: session.user.id, email: session.user.email, full_name: profile.fullName || session.user.user_metadata?.full_name || "", phone: profile.phone || session.user.user_metadata?.phone || "" }, { onConflict: "user_id" }).then(() => { if (draft) window.localStorage.removeItem("geebee-signup-profile"); });
-    if (approvedWorkspaceEmails.includes(email)) { setWorkspaceOwnerId(session.user.id); setAllowedModules([...crmModules]); setIsAdmin(true); return; }
-    cloud.from("crm_workspace_members").select("id, workspace_owner_id, email, role, modules").ilike("email", email).maybeSingle().then(({ data }) => {
-      if (!data) { setAccessNotice("Your account is awaiting access approval from a GeeBee administrator."); cloud.auth.signOut(); return; }
+    const resolveWorkspaceAccess = async () => {
+      // A workspace owner is identified by their stable Supabase user ID, not
+      // by a hard-coded email address. This allows GeeBee to change its
+      // official email without ever disconnecting the stored CRM data.
+      const { data: ownedWorkspace } = await cloud.from("crm_workspaces").select("owner_id").eq("owner_id", session.user.id).maybeSingle();
+      if (ownedWorkspace) { setWorkspaceOwnerId(session.user.id); setAllowedModules([...crmModules]); setIsAdmin(true); return; }
+      const { data } = await cloud.from("crm_workspace_members").select("id, workspace_owner_id, email, role, modules").ilike("email", email).maybeSingle();
+      if (!data) { setAccessNotice("Your account is awaiting access approval from a GeeBee administrator."); await cloud.auth.signOut(); return; }
       const member = data as WorkspaceMember; setWorkspaceOwnerId(member.workspace_owner_id); setAllowedModules(member.modules || ["Overview"]); setIsAdmin(member.role === "admin");
-    });
+    };
+    void resolveWorkspaceAccess();
   }, [session]);
   useEffect(() => {
     const cloud = supabase;
@@ -850,13 +855,6 @@ export default function Home() {
     logActivity("Moved order to Dispatch Plan", "Dispatch Plan", shortages.length ? `${order.id} · ${shortages.length} shortage line(s) moved to backorder` : order.id);
     flash(shortages.length ? `${order.id} added to Dispatch Plan; shortage created as advance backorder.` : `${order.id} added to Dispatch Plan and inventory allocated.`);
   };
-  useEffect(() => {
-    if (!cloudReady || !session || session.user.email?.toLowerCase() !== "vishu108818@gmail.com") return;
-    if (window.localStorage.getItem("geebee-available-stock-10000-v3")) return;
-    initialiseOpeningStock();
-  // This is an authorised one-time data migration for the workspace owner.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cloudReady, session]);
   const navigationGroups = [
     { label: "Dashboard", icon: LayoutDashboard, items: [{ label: "Dashboard", section: "Overview", module: "Overview" as CrmModule }] },
     { label: "Customers", icon: Users, items: [{ label: "All Customers", section: "Clients", module: "Clients" as CrmModule, count: String(clients.length) }, { label: "New Customers", section: "New Customers", module: "Clients" as CrmModule }, { label: "Customer Groups", section: "Customer Groups", module: "Clients" as CrmModule }, { label: "Customer Activity", section: "Customer Activity", module: "Clients" as CrmModule }] },

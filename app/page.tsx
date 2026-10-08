@@ -620,6 +620,7 @@ export default function Home() {
     [clients, setClients] = useState(seedClients),
     [invoices, setInvoices] = useState(seedInvoices),
     [catalogue, setCatalogue] = useState(seedCatalogue),
+    [catalogueHydrated, setCatalogueHydrated] = useState(false),
     [leads, setLeads] = useState(seedLeads),
     [quotes, setQuotes] = useState(seedQuotes),
     [tasks, setTasks] = useState(seedTasks),
@@ -723,19 +724,21 @@ export default function Home() {
         if (workspaceCreateError || cancelled) { if (!cancelled) setCloudError("Cloud workspace is not ready yet. Please run the latest Supabase setup script."); return; }
       }
       if (!existingWorkspace && !isAdmin) { setCloudError("Shared access could not locate the GeeBee workspace."); return; }
-      const results = await Promise.all(scalableTables.map(({ table }) => cloud.from(table).select("record_id, data").eq("workspace_owner_id", workspaceOwnerId).order("updated_at", { ascending: false }).limit(50000)));
+      // Product records carry catalogue images and are intentionally loaded a
+      // moment later. That lets the dashboard become usable immediately.
+      const initialTables = scalableTables.filter((config) => config.key !== "catalogue");
+      const results = await Promise.all(initialTables.map(({ table }) => cloud.from(table).select("record_id, data").eq("workspace_owner_id", workspaceOwnerId).order("updated_at", { ascending: false }).limit(50000)));
       if (cancelled) return;
       const failed = results.find((result) => result.error);
       if (failed?.error) { setCloudError("Database upgrade required: run the latest scalable CRM SQL script in Supabase, then refresh this page."); return; }
-      const records = Object.fromEntries(scalableTables.map((config, index) => [config.key, (results[index].data || []) as ScalableRecord[]])) as Record<string, ScalableRecord[]>;
-      const toItems = <T,>(key: string) => records[key].map((row) => row.data as T);
-      if (records.clients.length || records.catalogue.length || records.orders.length || records.invoices.length || records.leads.length || records.quotes.length || records.tasks.length || records.transporters.length) {
-        const loadedCatalogue = toItems<CatalogueItem>("catalogue").map((item) => ({ ...item, name: catalogueName(item) }));
+      const records = Object.fromEntries(initialTables.map((config, index) => [config.key, (results[index].data || []) as ScalableRecord[]])) as Record<string, ScalableRecord[]>;
+      const toItems = <T,>(key: string) => (records[key] || []).map((row) => row.data as T);
+      if (records.clients?.length || records.orders?.length || records.invoices?.length || records.leads?.length || records.quotes?.length || records.tasks?.length || records.transporters?.length) {
         const loadedOrders = toItems<Order>("orders");
         const currentOrderIds = new Set(loadedOrders.map((order) => order.id));
         const loadedInvoices = toItems<Invoice>("invoices").filter((invoice) => !invoice.order || currentOrderIds.has(invoice.order));
-        setClients(toItems<Client>("clients")); setCatalogue(loadedCatalogue); setOrders(loadedOrders); setInvoices(loadedInvoices); setLeads(toItems<Lead>("leads")); setQuotes(toItems<Quote>("quotes")); setTasks(toItems<SalesTask>("tasks")); setTransporters(toItems<Transporter>("transporters"));
-        recordSnapshots.current = Object.fromEntries(scalableTables.map((config) => [config.table, new Map(records[config.key].map((row) => [row.record_id, JSON.stringify(row.data)]))]));
+        setClients(toItems<Client>("clients")); setOrders(loadedOrders); setInvoices(loadedInvoices); setLeads(toItems<Lead>("leads")); setQuotes(toItems<Quote>("quotes")); setTasks(toItems<SalesTask>("tasks")); setTransporters(toItems<Transporter>("transporters"));
+        recordSnapshots.current = Object.fromEntries(initialTables.map((config) => [config.table, new Map((records[config.key] || []).map((row) => [row.record_id, JSON.stringify(row.data)]))]));
       } else recordSnapshots.current = {};
       const workspaceData = existingWorkspace?.data as { purchases?: PurchaseOrder[] } | null;
       if (Array.isArray(workspaceData?.purchases)) setPurchases(workspaceData.purchases);
@@ -746,10 +749,25 @@ export default function Home() {
   }, [authReady, session, storageReady, workspaceOwnerId, isAdmin]);
   useEffect(() => {
     const cloud = supabase;
+    if (!cloud || !cloudReady || !workspaceOwnerId || catalogueHydrated) return;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      const { data, error } = await cloud.from("crm_products").select("record_id, data").eq("workspace_owner_id", workspaceOwnerId).order("updated_at", { ascending: false }).limit(50000);
+      if (cancelled) return;
+      if (error) { setCloudError("Catalogue could not be loaded yet. Please refresh once your connection is stable."); return; }
+      const rows = (data || []) as ScalableRecord[];
+      setCatalogue(rows.map((row) => ({ ...(row.data as CatalogueItem), name: catalogueName(row.data as CatalogueItem) })));
+      recordSnapshots.current.crm_products = new Map(rows.map((row) => [row.record_id, JSON.stringify(row.data)]));
+      setCatalogueHydrated(true);
+    }, 300);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [cloudReady, workspaceOwnerId, catalogueHydrated]);
+  useEffect(() => {
+    const cloud = supabase;
     if (!cloud || !session || !cloudReady || !workspaceOwnerId) return;
     const collections: Array<{ table: string; items: any[]; search: (item: any) => string }> = [
       { table: "crm_clients", items: clients, search: scalableTables[0].search }, { table: "crm_products", items: catalogue, search: scalableTables[1].search }, { table: "crm_orders", items: orders, search: scalableTables[2].search }, { table: "crm_invoices", items: invoices, search: scalableTables[3].search }, { table: "crm_leads", items: leads, search: scalableTables[4].search }, { table: "crm_quotes", items: quotes, search: scalableTables[5].search }, { table: "crm_tasks", items: tasks, search: scalableTables[6].search }, { table: "crm_transporters", items: transporters, search: scalableTables[7].search },
-    ];
+    ].filter((collection) => collection.table !== "crm_products" || catalogueHydrated);
     const syncTimer = window.setTimeout(async () => {
       for (const { table, items, search } of collections) {
         const previous = recordSnapshots.current[table] || new Map<string, string>();
@@ -762,7 +780,7 @@ export default function Home() {
       }
     }, 650);
     return () => window.clearTimeout(syncTimer);
-  }, [orders, clients, invoices, catalogue, leads, quotes, tasks, transporters, session, cloudReady, workspaceOwnerId]);
+  }, [orders, clients, invoices, catalogue, catalogueHydrated, leads, quotes, tasks, transporters, session, cloudReady, workspaceOwnerId]);
   useEffect(() => {
     const cloud = supabase;
     if (!cloud || !session || !cloudReady || !workspaceOwnerId) return;

@@ -324,6 +324,14 @@ const readDocumentText = async (file: File) => {
 };
 type InternalOrderSheet = { client: string; eta: string; products: ProductLine[]; note: string; transporter?: string };
 const skuKey = (value: string) => value.replace(/[^a-z0-9]/gi, "").toLowerCase();
+// GeeBee order sheets legitimately use more than one SKU style: AB 851,
+// 204-2, 205 MIX, and sometimes just 337. Keep the source code intact;
+// catalogue matching later accepts it only when it identifies one SKU.
+const extractSheetSku = (value: string) => {
+  const cleaned = value.replace(/[^a-z0-9 .-]/gi, " ").replace(/\s+/g, " ").trim();
+  const match = cleaned.match(/[A-Z]{1,6}\s*[- ]?\s*\d{1,8}|\d{1,6}\s*[- ]\s*\d{1,4}|\d{1,6}\s+[A-Z]{2,12}|\b\d{2,6}\b/i)?.[0];
+  return match ? match.trim().replace(/\s*[- ]\s*/g, "-").toUpperCase() : "";
+};
 const isBackorderRecord = (order: Order) => /^ADV-/i.test(order.id) || /advance|back\s*order/i.test(order.status || "");
 const isVisibleBackorder = (order: Order) => isBackorderRecord(order) && (/^ADV-/i.test(order.id) || linesFor(order).some((line) => line.quantity > 0));
 const catalogueSku = (item: CatalogueItem) => item.sku?.trim() || "SKU pending";
@@ -343,9 +351,10 @@ const parseInternalOrderSheet = (raw: string): InternalOrderSheet | null => {
   const trailing: string[] = [];
   for (const line of lines.slice(rowsStart)) {
     if (/\btotal\b/i.test(line)) { const beforeTotal = line.replace(/\btotal\b.*$/i, "").trim(); if (beforeTotal && !/^\d[\d,.]*$/.test(beforeTotal)) trailing.push(beforeTotal); break; }
-    const match = line.match(/^([A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8}))\s+([\d,]+)\s+([\d,.]+)(?:\s+[\d,.]+)?(?:\s+(.*))?$/i);
-    if (!match) continue;
-    products.push({ product: "", sku: match[1].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity: Number(match[2].replaceAll(",", "")) || 0, unitPrice: Number(match[3].replaceAll(",", "")) || 0 });
+    const match = line.match(/^(.+?)\s+([\d,]+)\s+([\d,.]+)(?:\s+[\d,.]+)?(?:\s+(.*))?$/i);
+    const sku = match ? extractSheetSku(match[1]) : "";
+    if (!match || !sku) continue;
+    products.push({ product: "", sku, quantity: Number(match[2].replaceAll(",", "")) || 0, unitPrice: Number(match[3].replaceAll(",", "")) || 0 });
     if (match[4]) trailing.push(match[4]);
   }
   const transporter = lines.find((line) => /\btransport\b/i.test(line))?.replace(/\btotal\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim();
@@ -433,10 +442,10 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         // matching below still refuses ambiguous codes.
         const skuCandidates = [skuText];
         for (const shift of [-3, 3]) skuCandidates.push(await readCell(tableLeft, Math.max(0, top + shift), cellWidth, height));
-        const skuMatch = skuCandidates.map((text) => text.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i)?.[0]).filter(Boolean).sort((a, b) => skuKey(b || "").length - skuKey(a || "").length)[0]?.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, "")) || rowNumbers[0] || 0;
+        const skuMatch = skuCandidates.map(extractSheetSku).filter(Boolean).sort((a, b) => skuKey(b).length - skuKey(a).length)[0]; const quantity = Number(quantityText.replace(/[^\d]/g, "")) || rowNumbers[0] || 0;
         if (skuMatch && quantity) {
           blanks = 0;
-          gridProducts.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: 0 });
+          gridProducts.push({ product: "", sku: skuMatch, quantity, unitPrice: 0 });
           continue;
         }
         const rowText = await readCell(tableLeft, top, cellWidth * 4, height);
@@ -458,10 +467,10 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         const top = row * continuationRow;
         const skuText = await readCell(0, top + 1, continuationWidth, continuationRow - 2);
         const quantityText = await readCell(continuationWidth, top + 1, continuationWidth, continuationRow - 2, true);
-        const match = skuText.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const quantity = Number(quantityText.replace(/[^\d]/g, ""));
+        const match = extractSheetSku(skuText); const quantity = Number(quantityText.replace(/[^\d]/g, ""));
         if (!match || !quantity) { blanks += 1; if (blanks >= 3) break; continue; }
         blanks = 0;
-        continuationProducts.push({ product: "", sku: match[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: 0 });
+        continuationProducts.push({ product: "", sku: match, quantity, unitPrice: 0 });
       }
       const transportTop = continuationProducts.length * continuationRow;
       const transportRead = continuationProducts.length ? await readCell(0, transportTop, continuationWidth * 4, continuationRow - 1) : "";
@@ -487,31 +496,31 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
       // screenshots whose grid line is one or two pixels higher or lower.
       let sku = await readCell(gridLeft, top - 2 * y, columnWidth, 24 * y);
       let quantityText = await readCell(gridLeft + columnWidth, top - 2 * y, columnWidth, 24 * y, true);
-      let skuMatch = sku.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); let quantity = Number(quantityText.replace(/[^\d]/g, ""));
+      let skuMatch = extractSheetSku(sku); let quantity = Number(quantityText.replace(/[^\d]/g, ""));
       // The final handwritten/phone-screenshot row commonly sits closest to a
       // gridline. Retry only an unreadable row with two nearby crops rather
       // than silently dropping it.
       // Always take a few nearby reads and retain the SKU with the most
       // characters. This prevents AB-203 being shortened to AB-20 when a
       // gridline sits across the final digit.
-      const skuCandidates = skuMatch ? [skuMatch[0]] : [];
+      const skuCandidates = skuMatch ? [skuMatch] : [];
       for (const shift of [-7, -3, 4, 7]) {
         const retrySku = await readCell(gridLeft, top + shift * y, columnWidth, 21 * y);
-        const candidateSku = retrySku.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i);
-        if (candidateSku) skuCandidates.push(candidateSku[0]);
+        const candidateSku = extractSheetSku(retrySku);
+        if (candidateSku) skuCandidates.push(candidateSku);
       }
-      if (skuCandidates.length) { const bestSku = skuCandidates.sort((a, b) => skuKey(b).length - skuKey(a).length)[0]; skuMatch = bestSku.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); }
+      if (skuCandidates.length) { skuMatch = skuCandidates.sort((a, b) => skuKey(b).length - skuKey(a).length)[0]; }
       if (!skuMatch || !quantity) {
         for (const shift of [-6, 4]) {
           const retrySku = await readCell(gridLeft, top + shift * y, columnWidth, 21 * y);
           const retryQuantity = await readCell(gridLeft + columnWidth, top + shift * y, columnWidth, 21 * y, true);
-          const candidateSku = retrySku.match(/[A-Z]{1,6}(?:\s*[- ]?\s*\d{2,8})/i); const candidateQuantity = Number(retryQuantity.replace(/[^\d]/g, ""));
+          const candidateSku = extractSheetSku(retrySku); const candidateQuantity = Number(retryQuantity.replace(/[^\d]/g, ""));
           if (candidateSku && candidateQuantity) { sku = retrySku; quantityText = retryQuantity; skuMatch = candidateSku; quantity = candidateQuantity; break; }
         }
       }
       if (!skuMatch || !quantity) { blankRows += 1; if (blankRows >= 4) break; continue; }
       blankRows = 0;
-      products.push({ product: "", sku: skuMatch[0].replace(/\s+/g, "-").replace(/-+/g, "-"), quantity, unitPrice: 0 });
+      products.push({ product: "", sku: skuMatch, quantity, unitPrice: 0 });
     }
     // The row immediately after the product lines has the transporter merged
     // across the left-hand cells, followed by TOTAL on the right.

@@ -1,0 +1,1 @@
+.task-list article{grid-template-columns:46px 28px minmax(0,1fr) 28px 28px}.task-list article.done span{opacity:.68}

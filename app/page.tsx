@@ -641,6 +641,7 @@ export default function Home() {
     [storageReady, setStorageReady] = useState(false),
     [session, setSession] = useState<Session | null>(null),
     [authReady, setAuthReady] = useState(false),
+    [workspaceAccessReady, setWorkspaceAccessReady] = useState(false),
     [cloudReady, setCloudReady] = useState(false),
     [cloudError, setCloudError] = useState(""),
     [accessNotice, setAccessNotice] = useState(""),
@@ -699,8 +700,8 @@ export default function Home() {
   }, [orders, clients, invoices, catalogue, leads, quotes, tasks, transporters, purchases, storageReady]);
   useEffect(() => {
     if (!supabase) { setAuthReady(true); return; }
-    supabase.auth.getSession().then(({ data }) => { setSession(data.session); setAuthReady(true); });
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => setSession(nextSession));
+    supabase.auth.getSession().then(({ data }) => { setSession(data.session); setWorkspaceAccessReady(!data.session); setAuthReady(true); });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => { setWorkspaceAccessReady(!nextSession); setSession(nextSession); });
     return () => listener.subscription.unsubscribe();
   }, []);
   useEffect(() => {
@@ -710,16 +711,20 @@ export default function Home() {
     const draft = typeof window !== "undefined" ? window.localStorage.getItem("geebee-signup-profile") : null;
     let profile: { fullName?: string; phone?: string } = {};
     try { profile = draft ? JSON.parse(draft) : {}; } catch { /* ignore an invalid local profile */ }
-    cloud.from("crm_profiles").upsert({ user_id: session.user.id, email: session.user.email, full_name: profile.fullName || session.user.user_metadata?.full_name || "", phone: profile.phone || session.user.user_metadata?.phone || "" }, { onConflict: "user_id" }).then(() => { if (draft) window.localStorage.removeItem("geebee-signup-profile"); });
+    const saveProfile = cloud.from("crm_profiles").upsert({ user_id: session.user.id, email: session.user.email, full_name: profile.fullName || session.user.user_metadata?.full_name || "", phone: profile.phone || session.user.user_metadata?.phone || "" }, { onConflict: "user_id" });
     const resolveWorkspaceAccess = async () => {
+      // Save this sign-in attempt before access is checked, so administrators
+      // can review and approve people who are not yet workspace members.
+      const { error: profileError } = await saveProfile;
+      if (!profileError && draft) window.localStorage.removeItem("geebee-signup-profile");
       // A workspace owner is identified by their stable Supabase user ID, not
       // by a hard-coded email address. This allows GeeBee to change its
       // official email without ever disconnecting the stored CRM data.
       const { data: ownedWorkspace } = await cloud.from("crm_workspaces").select("owner_id").eq("owner_id", session.user.id).maybeSingle();
-      if (ownedWorkspace) { setWorkspaceOwnerId(session.user.id); setAllowedModules([...crmModules]); setIsAdmin(true); return; }
+      if (ownedWorkspace) { setWorkspaceOwnerId(session.user.id); setAllowedModules([...crmModules]); setIsAdmin(true); setWorkspaceAccessReady(true); return; }
       const { data } = await cloud.from("crm_workspace_members").select("id, workspace_owner_id, email, role, modules").ilike("email", email).maybeSingle();
-      if (!data) { setAccessNotice("Your account is awaiting access approval from a GeeBee administrator."); await cloud.auth.signOut(); return; }
-      const member = data as WorkspaceMember; setWorkspaceOwnerId(member.workspace_owner_id); setAllowedModules(member.modules || ["Overview"]); setIsAdmin(member.role === "admin");
+      if (!data) { setAccessNotice("Your access request has been sent to the GeeBee administrator. You can sign in once your account is approved."); setWorkspaceAccessReady(true); await cloud.auth.signOut(); return; }
+      const member = data as WorkspaceMember; setWorkspaceOwnerId(member.workspace_owner_id); setAllowedModules(member.modules || ["Overview"]); setIsAdmin(member.role === "admin"); setWorkspaceAccessReady(true);
     };
     void resolveWorkspaceAccess();
   }, [session]);
@@ -989,6 +994,7 @@ export default function Home() {
   const liveSections = new Set(["Overview", "Clients", "Leads", "Follow-ups", "Lost Leads", "Quotations", "Orders", "Confirmed Orders", "Dispatch Plan", "Backorders", "Invoices", "Catalogue", "Transporters", "Purchase Orders", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report", "Image Studio", "Settings", "Recovery"]);
   if (!authReady) return <div className="auth-screen"><div className="auth-card"><b>Opening secure workspace…</b></div></div>;
   if (!supabase) return <div className="auth-screen"><div className="auth-card"><span className="overline">GEEBEE CRM</span><h1>Cloud connection needed</h1><p>Add the Supabase environment settings to open this private workspace.</p></div></div>;
+  if (session && !workspaceAccessReady) return <div className="auth-screen"><div className="auth-card"><b>Checking workspace access…</b><p>Your account is being securely verified.</p></div></div>;
   if (!session) return <SharedAccessScreen notice={accessNotice} />;
   return (
     <main>

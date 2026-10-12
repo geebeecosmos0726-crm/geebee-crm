@@ -341,6 +341,8 @@ const extractSheetSku = (value: string) => {
 const cleanSheetClient = (value: string) => {
   const withoutDate = value.replace(/\bdate\b\s*[-:. ]*\s*[0-3]?\d[.\/-][01]?\d[.\/-](?:20)?\d{2}/ig, "").replace(/\bdate\b/ig, "").replace(/[|_]/g, " ").replace(/\s+/g, " ").trim();
   if (!withoutDate || !/[a-z]{2}/i.test(withoutDate) || /^[\d.\/\- ]+$/.test(withoutDate)) return "";
+  const letters = (withoutDate.match(/[a-z]/gi) || []).length; const digits = (withoutDate.match(/\d/g) || []).length;
+  if (/\b(item|quantity|price|value|remarks)\b/i.test(withoutDate) || digits > 1 || digits > letters / 2 || withoutDate.split(" ").length > 6) return "";
   return withoutDate.replace(/^['’]/, "").trim();
 };
 const isBackorderRecord = (order: Order) => /^ADV-/i.test(order.id) || /advance|back\s*order/i.test(order.status || "");
@@ -2104,6 +2106,12 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     label.append(selector); productLines.parentElement.insertBefore(label, productLines);
     return () => label.remove();
   }, [transporters, f.transporter]);
+  useEffect(() => {
+    const clientSelect = Array.from(document.querySelectorAll<HTMLSelectElement>("select")).find((select) => select.parentElement?.textContent?.trim().startsWith("Client"));
+    if (!clientSelect || !f.client || clients.some((client) => client.name === f.client) || Array.from(clientSelect.options).some((option) => option.value === f.client)) return;
+    const option = new Option(`${f.client} — will be created when you save`, f.client); clientSelect.append(option); clientSelect.value = f.client;
+    return () => option.remove();
+  }, [clients, f.client]);
   useEffect(() => { const capture = document.querySelector(".document-capture"); if (!capture) return; const button = document.createElement("button"); button.type = "button"; button.className = "outline"; button.textContent = "Download internal order sheet"; button.onclick = downloadInternalOrderFormat; capture.append(button); return () => button.remove(); }, []);
   useEffect(() => {
     const capture = document.querySelector(".document-capture");
@@ -2142,21 +2150,9 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
       const rawText = recognisedSheet ? "" : await readDocumentText(file);
       const internalSheet = recognisedSheet || parseInternalOrderSheet(rawText);
       if (internalSheet) {
-        let matchedClient = clients.find((client) => client.name.trim().toLowerCase() === internalSheet.client.trim().toLowerCase());
-        let createdClient = false;
-        if (!matchedClient && internalSheet.client.trim()) {
-          matchedClient = { id: Date.now(), customerId: `GB-C${String(Date.now()).slice(-4)}`, name: internalSheet.client.trim(), city: "", contact: "", phone: "", credit: "", customerStatus: "Prospect", avatar: initials(internalSheet.client), specialRates: [] };
-          createClient(matchedClient);
-          createdClient = true;
-        }
+        const matchedClient = clients.find((client) => client.name.trim().toLowerCase() === internalSheet.client.trim().toLowerCase());
         const clientName = matchedClient?.name || internalSheet.client;
-        let matchedTransporter = transporters.find((item) => skuKey(item.name) === skuKey(internalSheet.transporter || ""));
-        let createdTransporter = false;
-        if (!matchedTransporter && internalSheet.transporter?.trim()) {
-          matchedTransporter = { id: Date.now() + 1, name: internalSheet.transporter.trim(), contact: "", phone: "", email: "", city: "", area: "", gstin: "", serviceType: "", notes: "" };
-          createTransporter(matchedTransporter);
-          createdTransporter = true;
-        }
+        const matchedTransporter = transporters.find((item) => skuKey(item.name) === skuKey(internalSheet.transporter || ""));
         const transporterName = matchedTransporter?.name || internalSheet.transporter || "";
         setF((current) => ({ ...current, client: clientName || current.client, city: matchedClient?.city || current.city, eta: internalSheet.eta || current.eta, transporter: transporterName || current.transporter || "", avatar: matchedClient?.avatar || initials(clientName || current.client) }));
         const importedLines = internalSheet.products.map((line) => {
@@ -2184,7 +2180,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
           };
         });
         setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), ...importedLines] : importedLines);
-        setScanState("ready"); setScanNote(`GeeBee internal order sheet recognised: ${internalSheet.products.length} product line${internalSheet.products.length === 1 ? "" : "s"} added${clientName ? ` for ${clientName}` : ""}${transporterName ? ` with transporter ${transporterName}` : ""}.${createdClient ? " A new incomplete client profile was created—please complete it in Clients." : ""}${createdTransporter ? " A new incomplete transporter was added to Transporters—please complete its details when available." : ""} Please review, then save the new order.${internalSheet.note ? ` Note: ${internalSheet.note}` : ""}`);
+        setScanState("ready"); setScanNote(`GeeBee internal order sheet recognised: ${internalSheet.products.length} product line${internalSheet.products.length === 1 ? "" : "s"} added${clientName ? ` for ${clientName}` : ""}${transporterName ? ` with transporter ${transporterName}` : ""}. Please review the customer and transporter, then save the order. New names are created only when you save.${internalSheet.note ? ` Note: ${internalSheet.note}` : ""}`);
         return;
       }
       const text = rawText.replace(/\s+/g, " ");
@@ -2206,7 +2202,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     for (let index = 0; index < uploads.length; index += 1) await scanDocument(uploads[index], index > 0);
     if (uploads.length > 1) setScanNote(`${uploads.length} order images/documents processed. Review the combined product lines before saving.`);
   };
-  const saveOrder = () => { const first = products[0]; save({ ...f, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products }); };
+  const saveOrder = () => { const first = products[0]; const clientName = f.client.trim(); const transporterName = (f.transporter || "").trim(); if (clientName && !clients.some((client) => client.name.trim().toLowerCase() === clientName.toLowerCase())) createClient({ id: Date.now(), customerId: `GB-C${String(Date.now()).slice(-4)}`, name: clientName, city: "", contact: "", phone: "", credit: "", customerStatus: "Prospect", avatar: initials(clientName), specialRates: [] }); if (transporterName && !transporters.some((transporter) => skuKey(transporter.name) === skuKey(transporterName))) createTransporter({ id: Date.now() + 1, name: transporterName, contact: "", phone: "", email: "", city: "", area: "", gstin: "", serviceType: "", notes: "" }); save({ ...f, client: clientName, transporter: transporterName, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products }); };
   return <Shell close={close}><div className="order-modal-head"><div className="modal-mark"><PackageCheck size={22} /></div><div><span className="overline">ORDER WORKSPACE</span><h2>{order ? "Edit order" : "Create an order"}</h2><p>Capture a document or enter product lines yourself.</p></div></div><div className="document-capture"><div className="capture-copy"><div className="capture-icon"><ScanText size={19}/></div><div><b>Smart document capture</b><p>Upload a supplier PO, invoice, product-list image, or PDF.</p></div></div><label className="upload-button"><ImagePlus size={15}/><span>{scanState === "scanning" ? "Reading document…" : "Upload image or PDF"}</span><input type="file" accept="image/*,application/pdf" onChange={(e) => e.target.files?.[0] && scanDocument(e.target.files[0])} disabled={scanState === "scanning"}/></label>{preview && <img className="document-preview" src={preview} alt="Uploaded document preview"/>}{scanState !== "idle" && <div className={`scan-feedback ${scanState}`}><ScanText size={15}/>{scanNote}</div>}</div><div className="modal-section-title">Order details</div><label>Client<select value={f.client} onChange={(e) => selectClient(e.target.value)} required><option value="" disabled>Select a client</option>{clients.map((client) => <option key={client.id}>{client.name}</option>)}</select></label><div className="product-lines"><div className="line-heading"><b>Product lines</b><span>{products.length} item{products.length !== 1 ? "s" : ""}</span></div>{products.map((item, index) => <div className="product-line" key={index}><div className="line-number">{index + 1}</div><div className="line-fields"><input aria-label="Product name" value={item.product} onChange={(e) => updateProduct(index, "product", e.target.value)} placeholder="Product name" required /><input aria-label="SKU ID" value={item.sku} onChange={(e) => updateProduct(index, "sku", e.target.value)} placeholder="SKU ID" required /><input aria-label="Quantity" type="number" min="1" value={item.quantity || ""} onChange={(e) => updateProduct(index, "quantity", Number(e.target.value))} placeholder="Qty" required /><input aria-label="Unit price" type="number" min="0" value={item.unitPrice || ""} onChange={(e) => updateProduct(index, "unitPrice", Number(e.target.value))} placeholder="Price ₹" required /></div><b className="line-total">{money(item.quantity * item.unitPrice)}</b>{products.length > 1 && <button type="button" className="remove-line" onClick={() => setProducts(products.filter((_, i) => i !== index))}>×</button>}</div>)}<button type="button" className="add-line" onClick={() => setProducts([...products, { product: "", sku: "", quantity: 0, unitPrice: 0 }])}><Plus size={15} /> Add product line</button></div><div className="order-total"><span>Order total</span><b>{money(total)}</b></div><div className="form-row"><label>Expected arrival<input type="date" value={f.eta} onChange={(e) => setF({ ...f, eta: e.target.value })} required /></label><label>Status<select value={f.status} onChange={(e) => setF({ ...f, status: e.target.value })}>{["Confirmed", "Production", "In transit", "Customs clearance", "Delivered", "Backorder", "Advance order"].map((value) => <option key={value}>{value}</option>)}</select></label></div><label>Payment status<select value={f.payment} onChange={(e) => setF({ ...f, payment: e.target.value })}>{["Partial", "Paid", "Overdue"].map((value) => <option key={value}>{value}</option>)}</select></label><label>Remarks<textarea value={f.remarks || ""} onChange={(e) => setF({ ...f, remarks: e.target.value })} placeholder="Optional order remark"/></label><button className="primary modal-submit" type="button" onClick={saveOrder}>Save order</button></Shell>;
 }
 function LegacyCataloguePanel({ items, edit }: { items: CatalogueItem[]; edit: (item: CatalogueItem) => void }) {

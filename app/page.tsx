@@ -721,7 +721,7 @@ export default function Home() {
   useEffect(() => {
     if (!supabase) { setAuthReady(true); return; }
     supabase.auth.getSession().then(({ data }) => { setSession(data.session); setWorkspaceAccessReady(!data.session); setAuthReady(true); });
-    const { data: listener } = supabase.auth.onAuthStateChange((event, nextSession) => { if (event === "SIGNED_OUT") setWorkspaceAccessReady(true); if (event === "SIGNED_IN" || event === "USER_UPDATED") setWorkspaceAccessReady(false); setSession(nextSession); });
+    const { data: listener } = supabase.auth.onAuthStateChange((event, nextSession) => { if (event === "SIGNED_OUT") setWorkspaceAccessReady(true); setSession(nextSession); });
     return () => listener.subscription.unsubscribe();
   }, []);
   useEffect(() => {

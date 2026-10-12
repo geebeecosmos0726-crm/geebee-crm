@@ -721,7 +721,7 @@ export default function Home() {
   useEffect(() => {
     if (!supabase) { setAuthReady(true); return; }
     supabase.auth.getSession().then(({ data }) => { setSession(data.session); setWorkspaceAccessReady(!data.session); setAuthReady(true); });
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => { setWorkspaceAccessReady(!nextSession); setSession(nextSession); });
+    const { data: listener } = supabase.auth.onAuthStateChange((event, nextSession) => { if (event === "SIGNED_OUT") setWorkspaceAccessReady(true); if (event === "SIGNED_IN" || event === "USER_UPDATED") setWorkspaceAccessReady(false); setSession(nextSession); });
     return () => listener.subscription.unsubscribe();
   }, []);
   useEffect(() => {
@@ -747,7 +747,7 @@ export default function Home() {
       const member = data as WorkspaceMember; setWorkspaceOwnerId(member.workspace_owner_id); setAllowedModules(member.modules || ["Overview"]); setIsAdmin(member.role === "admin"); setWorkspaceAccessReady(true);
     };
     void resolveWorkspaceAccess();
-  }, [session]);
+  }, [session?.user.id]);
   useEffect(() => {
     const cloud = supabase;
     if (!cloud || !authReady || !session || !storageReady || !workspaceOwnerId) return;

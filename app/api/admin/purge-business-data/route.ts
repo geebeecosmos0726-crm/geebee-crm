@@ -17,16 +17,15 @@ const sheetHeaders: Record<string, string[]> = {
 
 export async function POST(request: Request) {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   const spreadsheetId = process.env.GOOGLE_SHEET_ID;
   const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
   const body = await request.json().catch(() => ({}));
   if (body.confirm !== "DELETE ALL BUSINESS DATA") return Response.json({ error: "Confirmation is required." }, { status: 400 });
-  if (!url || !anonKey || !serviceKey || !token) return Response.json({ error: "Reset service is not configured." }, { status: 500 });
+  if (!url || !serviceKey || !token) return Response.json({ error: "Reset service is not configured." }, { status: 500 });
 
-  const auth = createClient(url, anonKey, { auth: { persistSession: false } });
+  const auth = createClient(url, serviceKey, { auth: { persistSession: false } });
   const { data: userData, error: userError } = await auth.auth.getUser(token);
   if (userError || !userData.user?.email) return Response.json({ error: "Sign in again before clearing data." }, { status: 401 });
   const db = createClient(url, serviceKey, { auth: { persistSession: false } });

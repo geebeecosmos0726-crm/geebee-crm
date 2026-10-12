@@ -337,6 +337,11 @@ const extractSheetSku = (value: string) => {
   const match = cleaned.match(/[A-Z]{1,6}\s*[- ]?\s*\d{1,8}|\d{1,6}\s*[- ]\s*\d{1,4}|\d{1,6}\s+[A-Z]{2,12}|\b\d{2,6}\b/i)?.[0];
   return match ? match.trim().replace(/\s*[- ]\s*/g, "-").toUpperCase() : "";
 };
+const cleanSheetClient = (value: string) => {
+  const withoutDate = value.replace(/\bdate\b\s*[-:. ]*\s*[0-3]?\d[.\/-][01]?\d[.\/-](?:20)?\d{2}/ig, "").replace(/\bdate\b/ig, "").replace(/[|_]/g, " ").replace(/\s+/g, " ").trim();
+  if (!withoutDate || !/[a-z]{2}/i.test(withoutDate) || /^[\d.\/\- ]+$/.test(withoutDate)) return "";
+  return withoutDate.replace(/^['’]/, "").trim();
+};
 const isBackorderRecord = (order: Order) => /^ADV-/i.test(order.id) || /advance|back\s*order/i.test(order.status || "");
 const isVisibleBackorder = (order: Order) => isBackorderRecord(order) && (/^ADV-/i.test(order.id) || linesFor(order).some((line) => line.quantity > 0));
 const catalogueSku = (item: CatalogueItem) => item.sku?.trim() || "SKU pending";
@@ -355,7 +360,7 @@ const parseInternalOrderSheet = (raw: string): InternalOrderSheet | null => {
   const dateText = lines.slice(0, headerAt).join(" ").match(/date\s*[-: ]*([0-3]?\d[.\/-][01]?\d[.\/-](?:20)?\d{2})/i)?.[1];
   let eta = "";
   if (dateText) { const [day, month, year] = dateText.split(/[.\/-]/); eta = `${year.length === 2 ? `20${year}` : year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`; }
-  const client = headerAt < 0 ? "" : lines.slice(0, headerAt).filter((line) => !/\bdate\b/i.test(line)).filter((line) => !/^[A-Z]$/.test(line)).at(-1) || "";
+  const client = headerAt < 0 ? "" : lines.slice(0, headerAt).map(cleanSheetClient).filter(Boolean).filter((line) => !/^[A-Z]$/.test(line)).at(-1) || "";
   const products: ProductLine[] = [];
   const trailing: string[] = [];
   for (const line of lines.slice(rowsStart)) {
@@ -429,7 +434,8 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
       const headerScale = (tableRight - tableLeft) / 485;
       const headerTop = headerBottom - Math.round(20 * headerScale);
       const dateRead = await readCell(tableLeft + (tableRight - tableLeft) * .2, Math.max(0, headerTop - 43 * headerScale), (tableRight - tableLeft) * .8, 28 * headerScale);
-      gridClient = await readCell(tableLeft + (tableRight - tableLeft) * .085, Math.max(0, headerTop - 22 * headerScale), (tableRight - tableLeft) * .8, 27 * headerScale);
+      const clientReads = await Promise.all([-28, -22, -16, -10, -4].map((offset) => readCell(tableLeft + (tableRight - tableLeft) * .085, Math.max(0, headerTop + offset * headerScale), (tableRight - tableLeft) * .8, 25 * headerScale)));
+      gridClient = clientReads.map(cleanSheetClient).filter(Boolean).sort((a, b) => b.replace(/[^a-z]/gi, "").length - a.replace(/[^a-z]/gi, "").length)[0] || "";
       const dateText = dateRead.match(/([0-3]?\d[.\/-][01]?\d[.\/-](?:20)?\d{2})/)?.[1];
       if (dateText) { const [day, month, year] = dateText.split(/[.\/-]/); gridEta = `${year.length === 2 ? `20${year}` : year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`; }
     }
@@ -463,7 +469,7 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
         if ((/\btransport\b|\btotal\b/i.test(rowText)) && gridProducts.length) transporter = rowText.replace(/\btotal\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim();
         if (gridProducts.length) { blanks += 1; if (blanks >= 2) break; }
       }
-      if (gridProducts.length) return { client: gridClient.replace(/^['’]/, "").trim(), eta: gridEta, products: gridProducts, note: "GeeBee grid order sheet", transporter: transporter || undefined };
+      if (gridProducts.length) return { client: cleanSheetClient(gridClient), eta: gridEta, products: gridProducts, note: "GeeBee grid order sheet", transporter: transporter || undefined };
     }
     // A continuation screenshot has no yellow ITEM header, but it still has
     // the same five equal-width columns. Read those cells directly rather
@@ -495,7 +501,8 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
     const rowStart = headerBottom ? headerBottom + Math.max(1, Math.round(1.5 * y)) : 245 * y;
     const headerTop = headerBottom ? headerBottom - Math.round(20 * y) : 225 * y;
     const dateRead = await readCell(gridLeft + columnWidth, Math.max(0, headerTop - 43 * y), gridWidth * .8, 28 * y);
-    const client = await readCell(gridLeft + gridWidth * .085, Math.max(0, headerTop - 22 * y), gridWidth * .8, 27 * y);
+    const clientReads = await Promise.all([-28, -22, -16, -10, -4].map((offset) => readCell(gridLeft + gridWidth * .085, Math.max(0, headerTop + offset * y), gridWidth * .8, 25 * y)));
+    const client = clientReads.map(cleanSheetClient).filter(Boolean).sort((a, b) => b.replace(/[^a-z]/gi, "").length - a.replace(/[^a-z]/gi, "").length)[0] || "";
     const dateText = dateRead.match(/([0-3]?\d[.\/-][01]?\d[.\/-](?:20)?\d{2})/)?.[1];
     let eta = ""; if (dateText) { const [day, month, year] = dateText.split(/[.\/-]/); eta = `${year.length === 2 ? `20${year}` : year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`; }
     const products: ProductLine[] = []; let blankRows = 0;
@@ -535,7 +542,7 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
     // across the left-hand cells, followed by TOTAL on the right.
     const transporterRead = products.length ? await readCell(gridLeft, rowStart + products.length * 21 * y - 2 * y, columnWidth * 4, 24 * y) : "";
     const transporter = /\btransport\b|\btotal\b/i.test(transporterRead) ? transporterRead.replace(/\b(?:total|remarks?)\b.*$/i, "").replace(/[^a-z0-9 &.-]/gi, "").replace(/\s+/g, " ").trim() : "";
-    return products.length ? { client: client.replace(/^['’]/, "").trim(), eta, products, note: "GeeBee internal order sheet", transporter: transporter || undefined } : null;
+    return products.length ? { client: cleanSheetClient(client), eta, products, note: "GeeBee internal order sheet", transporter: transporter || undefined } : null;
   } finally { await worker.terminate(); URL.revokeObjectURL(source.src); }
 };
 const storageKey = "geebee-crm-data-v1";

@@ -25,3 +25,27 @@ export async function GET(request: Request) {
   const granted = new Set((members || []).map((member) => member.email.toLowerCase()));
   return Response.json({ requests: (profiles || []).filter((profile) => !granted.has(profile.email.toLowerCase()) && profile.user_id !== ownerId) });
 }
+
+export async function DELETE(request: Request) {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  const body = await request.json().catch(() => ({}));
+  if (!url || !serviceKey || !token || typeof body.userId !== "string") return Response.json({ error: "Access request service is not configured." }, { status: 400 });
+  const db = createClient(url, serviceKey, { auth: { persistSession: false } });
+  const { data: userData, error: userError } = await db.auth.getUser(token);
+  if (userError || !userData.user?.email) return Response.json({ error: "Sign in again to manage access requests." }, { status: 401 });
+  const user = userData.user;
+  const { data: owned } = await db.from("crm_workspaces").select("owner_id").eq("owner_id", user.id).maybeSingle();
+  const { data: membership } = owned ? { data: null } : await db.from("crm_workspace_members").select("workspace_owner_id, role").ilike("email", user.email!).eq("role", "admin").maybeSingle();
+  const ownerId = owned?.owner_id || membership?.workspace_owner_id;
+  if (!ownerId || body.userId === ownerId) return Response.json({ error: "Administrator access is required." }, { status: 403 });
+  const { data: profile, error: profileError } = await db.from("crm_profiles").select("email").eq("user_id", body.userId).maybeSingle();
+  if (profileError || !profile) return Response.json({ error: "Access request was not found." }, { status: 404 });
+  const { data: member } = await db.from("crm_workspace_members").select("id").eq("workspace_owner_id", ownerId).ilike("email", profile.email).maybeSingle();
+  if (member) return Response.json({ error: "This user already has workspace access." }, { status: 400 });
+  const { error: deleteError } = await db.from("crm_profiles").delete().eq("user_id", body.userId);
+  if (deleteError) return Response.json({ error: deleteError.message }, { status: 400 });
+  await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: user.email!, action: "Rejected access request", module: "Team access", details: profile.email });
+  return Response.json({ ok: true });
+}

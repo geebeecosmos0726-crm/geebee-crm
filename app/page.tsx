@@ -360,10 +360,11 @@ const parseInternalOrderSheet = (raw: string): InternalOrderSheet | null => {
   // A continuation image often begins straight with product rows, without the
   // blue/yellow header. It is still a valid page of the same internal order.
   const rowsStart = headerAt < 0 ? 0 : headerAt + 1;
+  const dateLineIndex = lines.findIndex((line) => /\bdate\b/i.test(line));
   const dateText = lines.slice(0, headerAt).join(" ").match(/date\s*[-: ]*([0-3]?\d[.\/-][01]?\d[.\/-](?:20)?\d{2})/i)?.[1];
   let eta = "";
   if (dateText) { const [day, month, year] = dateText.split(/[.\/-]/); eta = `${year.length === 2 ? `20${year}` : year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`; }
-  const client = headerAt < 0 ? "" : lines.slice(0, headerAt).map(cleanSheetClient).filter(Boolean).filter((line) => !/^[A-Z]$/.test(line)).at(-1) || "";
+  const client = headerAt < 0 ? "" : cleanSheetClient(lines[dateLineIndex + 1] || "") || lines.slice(0, headerAt).map(cleanSheetClient).filter(Boolean).filter((line) => !/^[A-Z]$/.test(line)).at(-1) || "";
   const products: ProductLine[] = [];
   const trailing: string[] = [];
   for (const line of lines.slice(rowsStart)) {
@@ -397,7 +398,7 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
     // GeeBee sheet, so find it first and then read the rows beneath it.
     const marker = document.createElement("canvas"); marker.width = source.width; marker.height = source.height;
     const markerContext = marker.getContext("2d"); markerContext?.drawImage(source, 0, 0);
-    let headerBottom = 0; let strongestYellow = 0; let gridLeft = 44 * x; let gridRight = 529 * x;
+    let headerTopYellow = 0; let headerBottom = 0; let strongestYellow = 0; let gridLeft = 44 * x; let gridRight = 529 * x;
     const pixels = markerContext?.getImageData(0, 0, marker.width, marker.height).data;
     if (pixels) {
       const scanFrom = Math.floor(source.height * 0.12); const scanTo = Math.floor(source.height * 0.42);
@@ -408,7 +409,7 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
           const at = (row * source.width + column) * 4; const red = pixels[at]; const green = pixels[at + 1]; const blue = pixels[at + 2];
           if (red > 145 && green > 130 && blue < 105 && red + green > blue * 3) { yellowPixels += 1; left = Math.min(left, column); right = Math.max(right, column); }
         }
-        if (yellowPixels >= 16) headerBottom = row;
+        if (yellowPixels >= 16) { if (!headerTopYellow) headerTopYellow = row; headerBottom = row; }
         if (yellowPixels > strongestYellow && right > left) { strongestYellow = yellowPixels; gridLeft = Math.max(0, left - step); gridRight = Math.min(source.width, right + step); }
       }
     }
@@ -435,10 +436,12 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
     let gridClient = ""; let gridEta = "";
     if (strongestYellow >= 16) {
       const headerScale = (tableRight - tableLeft) / 485;
-      const headerTop = headerBottom - Math.round(20 * headerScale);
-      const dateRead = await readCell(tableLeft + (tableRight - tableLeft) * .2, Math.max(0, headerTop - 43 * headerScale), (tableRight - tableLeft) * .8, 28 * headerScale);
-      const clientReads = await Promise.all([-28, -22, -16, -10, -4].map((offset) => readCell(tableLeft + (tableRight - tableLeft) * .085, Math.max(0, headerTop + offset * headerScale), (tableRight - tableLeft) * .8, 25 * headerScale)));
-      gridClient = clientReads.map(cleanSheetClient).filter(Boolean).sort((a, b) => b.replace(/[^a-z]/gi, "").length - a.replace(/[^a-z]/gi, "").length)[0] || "";
+      const yellowTopLine = gridLines.filter((line) => line <= headerTopYellow + 3).at(-1) || headerTopYellow;
+      const clientTopLine = gridLines.filter((line) => line < yellowTopLine - 2).at(-1) || Math.max(0, yellowTopLine - 40 * headerScale);
+      const dateTopLine = gridLines.filter((line) => line < clientTopLine - 2).at(-1) || Math.max(0, clientTopLine - 40 * headerScale);
+      const dateRead = await readCell(tableLeft + (tableRight - tableLeft) * .12, dateTopLine + 2, (tableRight - tableLeft) * .82, Math.max(12, clientTopLine - dateTopLine - 4));
+      const clientRead = await readCell(tableLeft + (tableRight - tableLeft) * .035, clientTopLine + 2, (tableRight - tableLeft) * .93, Math.max(12, yellowTopLine - clientTopLine - 4));
+      gridClient = cleanSheetClient(clientRead);
       const dateText = dateRead.match(/([0-3]?\d[.\/-][01]?\d[.\/-](?:20)?\d{2})/)?.[1];
       if (dateText) { const [day, month, year] = dateText.split(/[.\/-]/); gridEta = `${year.length === 2 ? `20${year}` : year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`; }
     }

@@ -111,6 +111,7 @@ type Client = {
   specialRates?: ClientSpecialRate[];
 };
 const isClientProfileIncomplete = (client: Client) => !client.contact?.trim() || !client.phone?.trim() || !client.city?.trim() || !client.address?.trim() || !client.credit?.trim();
+const isProductProfileIncomplete = (product: CatalogueItem) => !product.sku?.trim() || !product.name?.trim() || !product.image || !String(product.outerQty || product.cartonQty || "").trim() || product.unitPrice <= 0 || product.availableQuantity === undefined || product.reorderThreshold === undefined;
 type Invoice = {
   id: string;
   client: string;
@@ -665,6 +666,7 @@ export default function Home() {
     [accessRequests, setAccessRequests] = useState<AccessRequest[]>([]),
     [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]),
     [clientProfile, setClientProfile] = useState<Client | null>(null),
+    [catalogueAttentionOnly, setCatalogueAttentionOnly] = useState(false),
     [notificationsOpen, setNotificationsOpen] = useState(false),
     [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({ Customers: true, "Leads & Enquiries": true, Sales: true, Products: true, Inventory: true, Operations: true, Billing: true, Imports: true, Reports: true, Automation: true, Settings: true }),
     [modal, setModal] = useState<"order" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "purchase" | null>(null),
@@ -854,6 +856,7 @@ export default function Home() {
     [orders, search],
   );
   const lowStockProducts = catalogue.filter((product) => (product.reorderThreshold || 0) > 0 && availableStock(product) <= (product.reorderThreshold || 0));
+  const incompleteCatalogueProducts = catalogue.filter(isProductProfileIncomplete);
   const taskViewer = `${session?.user.user_metadata?.full_name || ""} ${session?.user.email || ""}`.trim().toLowerCase();
   const visibleTasks = isAdmin ? tasks : tasks.filter((task) => { const assignee = task.assignee.trim().toLowerCase(); return Boolean(assignee) && (assignee === taskViewer || taskViewer.includes(assignee)); });
   const activeTasks = visibleTasks.filter((task) => task.status === "Open");
@@ -1062,7 +1065,7 @@ export default function Home() {
           <div className="header-avatar">RM</div>
         </header>
         {cloudError && <div className="cloud-warning">{cloudError}</div>}
-        {(activeTasks.length > 0 || lowStockProducts.length > 0) && <div className="crm-alert-strip" role="status">{activeTasks.length > 0 && <button type="button" onClick={() => setSection("Follow-ups")}><ClipboardList size={15}/><b>{activeTasks.length} active task{activeTasks.length === 1 ? "" : "s"}</b><span>Review today’s work</span></button>}{lowStockProducts.length > 0 && <button type="button" onClick={() => setSection("Purchase Orders")}><PackageCheck size={15}/><b>{lowStockProducts.length} low-stock item{lowStockProducts.length === 1 ? "" : "s"}</b><span>Create purchase orders</span></button>}</div>}
+        {(activeTasks.length > 0 || lowStockProducts.length > 0 || incompleteCatalogueProducts.length > 0) && <div className="crm-alert-strip" role="status">{activeTasks.length > 0 && <button type="button" onClick={() => setSection("Follow-ups")}><ClipboardList size={15}/><b>{activeTasks.length} active task{activeTasks.length === 1 ? "" : "s"}</b><span>Review today’s work</span></button>}{lowStockProducts.length > 0 && <button type="button" onClick={() => setSection("Purchase Orders")}><PackageCheck size={15}/><b>{lowStockProducts.length} low-stock item{lowStockProducts.length === 1 ? "" : "s"}</b><span>Create purchase orders</span></button>}{incompleteCatalogueProducts.length > 0 && <button type="button" onClick={() => { setSearch(""); setCatalogueAttentionOnly(true); setSection("Catalogue"); }}><PackageCheck size={15}/><b>{incompleteCatalogueProducts.length} incomplete product{incompleteCatalogueProducts.length === 1 ? "" : "s"}</b><span>Complete SKU details</span></button>}</div>}
         <div className="page-head">
           <div>
             <div className="eyebrow">MONDAY, 15 SEPTEMBER 2026</div>
@@ -1142,7 +1145,9 @@ export default function Home() {
         )}{" "}
         {section === "Catalogue" && (
           <CataloguePanel
-            items={catalogue.filter((item) => `${catalogueName(item)} ${item.sku} ${item.category}`.toLowerCase().includes(search.toLowerCase()) || skuKey(item.sku).includes(skuKey(search)))}
+            items={catalogue.filter((item) => (!catalogueAttentionOnly || isProductProfileIncomplete(item)) && (`${catalogueName(item)} ${item.sku} ${item.category}`.toLowerCase().includes(search.toLowerCase()) || skuKey(item.sku).includes(skuKey(search))))}
+            attentionOnly={catalogueAttentionOnly}
+            showAll={() => setCatalogueAttentionOnly(false)}
             edit={(item) => show("catalogue", item)}
             addDrafts={(drafts) => { setCatalogue((current) => { const incoming = new Map(drafts.map((item) => [skuKey(item.sku), item])); const existing = new Set(current.map((item) => skuKey(item.sku))); return [...current.map((item) => { const replacement = incoming.get(skuKey(item.sku)); return replacement ? { ...item, ...replacement, id: item.id } : item; }), ...drafts.filter((item) => !existing.has(skuKey(item.sku)))]; }); logActivity("Imported catalogue products", "Catalogue", `${drafts.length} SKU record(s) reconciled`); flash("Catalogue PDF processed: matching SKUs updated and missing SKUs added."); }}
             setAllOpeningStock={() => { if (window.confirm(`Reset demo inventory for all ${catalogue.length} products to 10,000 available units? Existing stock allocations will be cleared.`)) initialiseOpeningStock(); }}
@@ -1188,10 +1193,18 @@ export default function Home() {
             // Creating an order only records the customer's request. Inventory
             // is intentionally untouched until the user moves it to Dispatch Plan.
             const savedOrder = editing ? { ...o, status: editing.status } : { ...o, status: "Draft", backorders: [] };
+            const orderedLines = o.products?.length ? o.products : [{ product: o.product, sku: o.sku, quantity: o.quantity, unitPrice: o.unitPrice }];
+            const missingLines = orderedLines.filter((line) => !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku)));
+            if (missingLines.length) {
+              setCatalogue((current) => {
+                const known = new Set(current.map((product) => skuKey(product.sku)));
+                return [...current, ...missingLines.filter((line) => !known.has(skuKey(line.sku))).map((line, index) => ({ id: Date.now() + index, sku: line.sku.trim() || `UNMATCHED-${Date.now() + index}`, name: line.product?.startsWith("Review SKU:") ? "" : line.product || "", unitPrice: line.unitPrice || 0, category: "Uncategorised", image: "", description: "", cartonQty: "", innerQty: "", outerQty: "" } as CatalogueItem))];
+              });
+            }
             setOrders((current) => editing ? current.map((item) => item.id === editing.id ? savedOrder : item) : [...current, savedOrder]);
             setModal(null);
             logActivity(editing ? "Updated order" : "Created order", "Orders", o.id);
-            flash(editing ? "Order updated successfully" : "Draft order created. Confirm it to reserve available stock and create any backorder.");
+            flash(missingLines.length ? `${missingLines.length} unmatched product${missingLines.length === 1 ? " was" : "s were"} added to Products as incomplete records. Complete their details from the alert above.` : editing ? "Order updated successfully" : "Draft order created. Confirm it to reserve available stock and create any backorder.");
           }}
         />
       )}
@@ -2205,7 +2218,7 @@ function CatalogueImportReview({ drafts, pages, confirm, cancel }: { drafts: Cat
   const incomplete = drafts.filter((item) => !item.sku || !item.name || !item.unitPrice || !item.image).length;
   return <section className="catalogue-page"><section className="panel"><div className="panel-head"><div><span className="overline">PDF IMPORT REVIEW</span><h2>Verify before saving</h2><p>This PDF produced {drafts.length} records across {pages} pages. Check SKU, details, price, and image before confirming.</p></div><div><button className="outline" type="button" onClick={cancel}>Cancel import</button><button className="primary" type="button" onClick={confirm}>Confirm import</button></div></div><div className="report-metrics"><div><span>Records read</span><b>{drafts.length}</b></div><div><span>Duplicate SKU warnings</span><b>{duplicateCount}</b></div><div><span>Incomplete records</span><b>{incomplete}</b></div></div>{(duplicateCount > 0 || incomplete > 0) && <div className="catalogue-notice error"><ScanText size={16}/>Review highlighted records carefully. Cancel if anything does not match the PDF.</div>}<div className="table-wrap" style={{ maxHeight: "58vh", overflow: "auto" }}><table className="records"><thead><tr><th>IMAGE</th><th>SKU</th><th>PRODUCT</th><th>OUTER QTY</th><th>INNER QTY</th><th>PRICE</th><th>CHECK</th></tr></thead><tbody>{drafts.map((item) => { const duplicate = (skuCounts.get(skuKey(item.sku)) || 0) > 1; const missing = !item.sku || !item.name || !item.unitPrice || !item.image; return <tr key={item.id} style={duplicate || missing ? { background: "#fff6dc" } : undefined}><td>{item.image ? <img src={item.image} alt={item.sku} style={{ width: 72, height: 54, objectFit: "contain", background: "#fff" }}/> : "Missing"}</td><td><b>{item.sku || "Missing SKU"}</b></td><td>{item.name || "Missing product name"}</td><td>{item.outerQty || item.cartonQty || "—"}</td><td>{item.innerQty || "—"}</td><td>{item.unitPrice ? money(item.unitPrice) : "Missing price"}</td><td>{duplicate ? "Duplicate SKU" : missing ? "Check details/image" : "Ready"}</td></tr>; })}</tbody></table></div><p className="catalogue-tip">Matching existing SKUs will be updated; only new SKUs will be added after confirmation.</p></section></section>;
 }
-function CataloguePanel({ items, edit, addDrafts, setAllOpeningStock, remove }: { items: CatalogueItem[]; edit: (item: CatalogueItem) => void; addDrafts: (drafts: CatalogueItem[]) => void; setAllOpeningStock: () => void; remove: (ids: number[]) => void }) {
+function CataloguePanel({ items, edit, addDrafts, setAllOpeningStock, remove, attentionOnly = false, showAll }: { items: CatalogueItem[]; edit: (item: CatalogueItem) => void; addDrafts: (drafts: CatalogueItem[]) => void; setAllOpeningStock: () => void; remove: (ids: number[]) => void; attentionOnly?: boolean; showAll?: () => void }) {
   const [scanState, setScanState] = useState<"idle" | "scanning" | "ready" | "error">("idle");
   const [notice, setNotice] = useState("");
   const [selected, setSelected] = useState<number[]>([]);

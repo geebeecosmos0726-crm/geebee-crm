@@ -49,3 +49,25 @@ export async function DELETE(request: Request) {
   await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: user.email!, action: "Rejected access request", module: "Team access", details: profile.email });
   return Response.json({ ok: true });
 }
+
+export async function POST(request: Request) {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  const body = await request.json().catch(() => ({}));
+  if (!url || !serviceKey || !token || typeof body.email !== "string" || !["admin", "employee"].includes(body.role)) return Response.json({ error: "Access approval service is not configured." }, { status: 400 });
+  const db = createClient(url, serviceKey, { auth: { persistSession: false } });
+  const { data: userData, error: userError } = await db.auth.getUser(token);
+  if (userError || !userData.user?.email) return Response.json({ error: "Sign in again to approve access." }, { status: 401 });
+  const user = userData.user;
+  const { data: owned } = await db.from("crm_workspaces").select("owner_id").eq("owner_id", user.id).maybeSingle();
+  const { data: membership } = owned ? { data: null } : await db.from("crm_workspace_members").select("workspace_owner_id, role").ilike("email", user.email!).eq("role", "admin").maybeSingle();
+  const ownerId = owned?.owner_id || membership?.workspace_owner_id;
+  if (!ownerId) return Response.json({ error: "Administrator access is required." }, { status: 403 });
+  const email = body.email.trim().toLowerCase();
+  const modules = body.role === "admin" ? ["Overview", "Clients", "Leads", "Orders", "Catalogue", "Invoices", "Payments", "Shipments"] : Array.isArray(body.modules) ? body.modules.filter((module: unknown) => typeof module === "string") : ["Overview"];
+  const { data, error } = await db.from("crm_workspace_members").upsert({ workspace_owner_id: ownerId, email, role: body.role, modules }, { onConflict: "workspace_owner_id,email" }).select("id, workspace_owner_id, email, role, modules").single();
+  if (error) return Response.json({ error: error.message }, { status: 400 });
+  await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: user.email, action: "Approved employee access", module: "Team access", details: `${email} — ${body.role}` });
+  return Response.json({ member: data });
+}

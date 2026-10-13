@@ -1,0 +1,1 @@
+.panel-head-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px}.panel-head-actions .outline{width:auto;white-space:nowrap;padding:8px 10px}@media(max-width:760px){.record-panel .panel-head{display:block}.panel-head-actions{justify-content:flex-start;margin-top:12px}.panel-head-actions .outline{font-size:9px;padding:7px}}

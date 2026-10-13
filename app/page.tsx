@@ -23,6 +23,7 @@ import "./image-studio-fit.css";
 import "./dispatch-plan.css";
 import "./purchasing.css";
 import "./order-import-review.css";
+import "./customer-transfer.css";
 import { supabase } from "./lib/supabase";
 import type { Session } from "@supabase/supabase-js";
 import {
@@ -1157,6 +1158,7 @@ export default function Home() {
             )}
             edit={(c) => show("client", c)}
             view={(c) => setClientProfile(c)}
+            importCustomers={async (file) => { if (!file) return; try { const rows = await readCsv(file); const now = Date.now(); const incoming = rows.filter((row) => row["business name"]).map((row, index) => ({ id: now + index, customerId: row["customer id"] || `GB-C${now + index}`, name: row["business name"], city: row.city || "", phone: row.phone || "", contact: row["contact person"] || row["business name"], credit: row["payment threshold"] || "", paymentTerms: row["payment terms"] || "", customerStatus: row.status || "Active", avatar: initials(row["business name"]), specialRates: [] } as Client)); setClients((current) => { const incomingByName = new Map(incoming.map((client) => [client.name.toLowerCase(), client])); const existing = new Set(current.map((client) => client.name.toLowerCase())); return [...current.map((client) => incomingByName.has(client.name.toLowerCase()) ? { ...client, ...incomingByName.get(client.name.toLowerCase())!, id: client.id } : client), ...incoming.filter((client) => !existing.has(client.name.toLowerCase()))]; }); logActivity("Imported customer sheet", "Customers", `${incoming.length} customer row(s)`); flash(`${incoming.length} customer row${incoming.length === 1 ? "" : "s"} imported.`); } catch { flash("Customer import failed. Use the downloaded CSV template and keep the column headings unchanged."); } }}
             remove={(ids) => { setClients((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed client", "Clients", ids.join(", ")); flash(`${ids.length} client${ids.length === 1 ? "" : "s"} removed`); }}
           />
         )}{" "}
@@ -1241,6 +1243,7 @@ export default function Home() {
                 return [...current, ...missingLines.filter((line) => !known.has(skuKey(line.sku))).map((line, index) => ({ id: Date.now() + index, sku: line.sku.trim() || `UNMATCHED-${Date.now() + index}`, name: line.product, unitPrice: line.unitPrice || 0, category: "Uncategorised", image: "", description: "", cartonQty: "", innerQty: "", outerQty: "", availableQuantity: 10000 } as CatalogueItem))];
               });
             }
+            setClients((current) => current.map((client) => client.name.trim().toLowerCase() === savedOrder.client.trim().toLowerCase() ? { ...client, customerStatus: "Active" } : client));
             setOrders((current) => {
               if (!editing) return [...current, savedOrder];
               const previousAdvanceId = `ADV-${editing.id}`;
@@ -1636,14 +1639,17 @@ function Clients({
   clients,
   edit,
   view,
+  importCustomers,
   remove,
 }: {
   clients: Client[];
   edit: (c: Client) => void;
   view: (c: Client) => void;
+  importCustomers: (file?: File) => void;
   remove: (ids: number[]) => void;
 }) {
   const [selected, setSelected] = useState<number[]>([]);
+  const importRef = useRef<HTMLInputElement>(null);
   const toggle = (id: number) => setSelected((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]);
   const removeSelected = () => { if (selected.length && window.confirm(`Remove ${selected.length} selected client${selected.length === 1 ? "" : "s"}?`)) { remove(selected); setSelected([]); } };
   const removeOne = (client: Client) => { if (window.confirm(`Remove ${client.name} from the client directory?`)) { remove([client.id]); setSelected((current) => current.filter((id) => id !== client.id)); } };
@@ -1654,6 +1660,7 @@ function Clients({
           <h2>Client directory</h2>
           <p>Edit contacts, cities and payment thresholds.</p>
         </div>
+        <div className="panel-head-actions"><button className="outline" type="button" onClick={() => csvDownload("geebee-customers-template.csv", ["Customer ID", "Business Name", "Contact Person", "City", "Phone", "Payment Terms", "Payment Threshold", "Status"], [["GB-C001", "Example Party Store", "Amit Shah", "Delhi", "9876543210", "30 days", "50000", "Active"]])}>Download customer template</button><button className="outline" type="button" onClick={() => csvDownload("geebee-customers-export.csv", ["Customer ID", "Business Name", "Contact Person", "City", "Phone", "Payment Terms", "Payment Threshold", "Status"], clients.map((client) => [client.customerId || "", client.name, client.contact || "", client.city || "", client.phone || "", client.paymentTerms || "", client.credit || "", client.customerStatus || "Active"]))}>Export customers</button><button className="outline" type="button" onClick={() => importRef.current?.click()}>Import customer sheet</button><input ref={importRef} className="visually-hidden" type="file" accept=".csv,text/csv" onChange={(event) => { importCustomers(event.target.files?.[0]); event.currentTarget.value = ""; }}/></div>
       </div>
       <div className="record-bulk-bar"><span>Select clients to manage them together.</span>{selected.length > 0 && <button type="button" className="bulk-delete" onClick={removeSelected}><Trash2 size={14}/> Remove {selected.length} selected</button>}</div><div className="table-wrap">
         <table className="records">
@@ -1880,9 +1887,12 @@ function TeamAccess({ members, requests, workspaceOwnerId, canManage, onChange, 
   const save = async () => {
     if (!supabase || !workspaceOwnerId || !email.trim()) return;
     const payload = { workspace_owner_id: workspaceOwnerId, email: email.trim().toLowerCase(), role, modules: role === "admin" ? [...crmModules] : modules };
-    const { data, error } = await supabase.from("crm_workspace_members").upsert(payload, { onConflict: "workspace_owner_id,email" }).select("id, workspace_owner_id, email, role, modules").single();
-    if (error) { setMessage(error.message); return; }
-    onChange([...members.filter((member) => member.id !== editingId && member.email !== payload.email), data as WorkspaceMember]); onRequestsChange(requests.filter((request) => request.email.toLowerCase() !== payload.email)); onAudit(editingId ? "Updated employee access" : "Granted employee access", "Team access", `${payload.email} — ${payload.role}`); setMessage("Access saved."); reset();
+    const { data: sessionData } = await supabase.auth.getSession(); const token = sessionData.session?.access_token;
+    if (!token) { setMessage("Sign in again to approve access."); return; }
+    const response = await fetch("/api/admin/access-requests", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const result = await response.json() as { member?: WorkspaceMember; error?: string };
+    if (!response.ok || !result.member) { setMessage(result.error || "Could not save access."); return; }
+    onChange([...members.filter((member) => member.id !== editingId && member.email !== payload.email), result.member]); onRequestsChange(requests.filter((request) => request.email.toLowerCase() !== payload.email)); onAudit(editingId ? "Updated employee access" : "Granted employee access", "Team access", `${payload.email} — ${payload.role}`); setMessage("Access saved."); reset();
   };
   const editMember = (member: WorkspaceMember) => { setEditingId(member.id); setEmail(member.email); setRole(member.role); setModules(member.modules); setMessage(""); };
   const remove = async (member: WorkspaceMember) => { if (!supabase || !window.confirm(`Remove ${member.email} from this workspace?`)) return; const { error } = await supabase.from("crm_workspace_members").delete().eq("id", member.id); if (error) { setMessage(error.message); return; } onChange(members.filter((item) => item.id !== member.id)); onAudit("Removed employee access", "Team access", member.email); };

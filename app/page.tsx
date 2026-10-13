@@ -652,7 +652,7 @@ function SharedAccessScreen({ notice = "" }: { notice?: string }) {
 }
 export default function Home() {
   const [section, setSection] = useState("Overview"),
-    [search, setSearch] = useState(""),
+    [sectionSearches, setSectionSearches] = useState<Record<string, string>>({}),
     [orders, setOrders] = useState(seedOrders),
     [clients, setClients] = useState(seedClients),
     [invoices, setInvoices] = useState(seedInvoices),
@@ -684,6 +684,8 @@ export default function Home() {
     [modal, setModal] = useState<"order" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | null>(null),
     [editing, setEditing] = useState<any>(null),
     [toast, setToast] = useState("");
+  const search = sectionSearches[section] || "";
+  const setSearch = (value: string) => setSectionSearches((current) => ({ ...current, [section]: value }));
   const recordSnapshots = useRef<Record<string, Map<string, string>>>({});
   const flash = (m: string) => {
       setToast(m);
@@ -1086,7 +1088,7 @@ export default function Home() {
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search SKU, product, client, order..."
+              placeholder={`Search ${section === "Catalogue" ? "SKU or product" : section === "Clients" ? "customers" : section === "Orders" || section === "Confirmed Orders" || section === "Dispatch Plan" ? "orders" : section.toLowerCase()}...`}
             />
           </div>
           <button className="icon-btn" type="button" aria-label="Open notifications" onClick={() => setNotificationsOpen((current) => !current)}>
@@ -1231,11 +1233,12 @@ export default function Home() {
             // is intentionally untouched until the user moves it to Dispatch Plan.
             const savedOrder = editing ? { ...o, id: requestedId, status: editing.status } : { ...o, id: requestedId, status: "Draft", backorders: [] };
             const orderedLines = o.products?.length ? o.products : [{ product: o.product, sku: o.sku, quantity: o.quantity, unitPrice: o.unitPrice }];
+            if (orderedLines.some((line) => !line.product.trim())) { flash("Enter a product name for every unmatched SKU before saving the order."); return; }
             const missingLines = orderedLines.filter((line) => !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku)));
             if (missingLines.length) {
               setCatalogue((current) => {
                 const known = new Set(current.map((product) => skuKey(product.sku)));
-                return [...current, ...missingLines.filter((line) => !known.has(skuKey(line.sku))).map((line, index) => ({ id: Date.now() + index, sku: line.sku.trim() || `UNMATCHED-${Date.now() + index}`, name: line.product?.startsWith("Review SKU:") ? "" : line.product || "", unitPrice: line.unitPrice || 0, category: "Uncategorised", image: "", description: "", cartonQty: "", innerQty: "", outerQty: "" } as CatalogueItem))];
+                return [...current, ...missingLines.filter((line) => !known.has(skuKey(line.sku))).map((line, index) => ({ id: Date.now() + index, sku: line.sku.trim() || `UNMATCHED-${Date.now() + index}`, name: line.product, unitPrice: line.unitPrice || 0, category: "Uncategorised", image: "", description: "", cartonQty: "", innerQty: "", outerQty: "", availableQuantity: 10000 } as CatalogueItem))];
               });
             }
             setOrders((current) => {
@@ -2237,7 +2240,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
           // rate taking priority when one exists.
           const unitPrice = catalogueMatch ? specialRate(clientName || f.client, catalogueMatch.sku) ?? catalogueMatch.unitPrice : 0;
           return {
-            product: catalogueMatch ? `${catalogueName(catalogueMatch)} · ${catalogueMatch.sku}` : line.product || `Review SKU: ${line.sku}`,
+            product: catalogueMatch ? `${catalogueName(catalogueMatch)} · ${catalogueMatch.sku}` : "",
             sku: catalogueMatch?.sku || line.sku,
             quantity: line.quantity || 0,
             unitPrice,
@@ -2323,7 +2326,7 @@ function CataloguePanel({ items, edit, addDrafts, setAllOpeningStock, remove, at
         try { result = JSON.parse(raw); } catch { throw new Error(response.status === 413 ? "This PDF is over the online upload limit. Please run the Supabase setup script for large-file imports." : "The PDF service returned an unexpected response. Please try again."); }
         if (!response.ok) throw new Error(result.error || "The catalogue PDF could not be read.");
         if (!result.products?.length) throw new Error("No product records were found in this catalogue PDF.");
-        const drafts = result.products.map((product: Omit<CatalogueItem, "id">, index: number) => ({ ...product, id: Date.now() + index }));
+        const drafts = result.products.map((product: Omit<CatalogueItem, "id">, index: number) => ({ ...product, availableQuantity: product.availableQuantity ?? 10000, id: Date.now() + index }));
         setPendingPdf({ drafts, pages: result.pages || 0 });
         setScanState("ready"); setNotice(`${drafts.length} products read from the PDF. Review them before saving.`);
         return;
@@ -2332,7 +2335,7 @@ function CataloguePanel({ items, edit, addDrafts, setAllOpeningStock, remove, at
       const skus = [...new Set((text.toUpperCase().match(/\b[A-Z]{1,4}[- ]?\d{2,8}\b/g) || []).map((sku) => sku.replace(" ", "-")))];
       if (!skus.length) throw new Error("No SKUs found");
       const image = (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) ? "" : await fileToDataUrl(file);
-      addDrafts(skus.map((sku, index) => ({ id: Date.now() + index, sku, name: `New product — ${sku}`, description: "", cartonQty: "", unitPrice: 0, category: "Uncategorised", image })));
+      addDrafts(skus.map((sku, index) => ({ id: Date.now() + index, sku, name: `New product — ${sku}`, description: "", cartonQty: "", unitPrice: 0, category: "Uncategorised", image, availableQuantity: 10000 })));
       setScanState("ready"); setNotice(`${skus.length} SKU draft${skus.length === 1 ? "" : "s"} added. Open each card to add its product name and price.`);
     } catch (error) { setScanState("error"); setNotice(error instanceof Error ? error.message : "The catalogue file could not be read."); }
   };
@@ -2340,7 +2343,7 @@ function CataloguePanel({ items, edit, addDrafts, setAllOpeningStock, remove, at
   return <section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT LIBRARY</span><h2>Your catalogue, ready for order matching.</h2><p>Upload individual product photos, or scan a complete catalogue image or PDF to create SKU drafts quickly.</p></div><div className="catalogue-count"><b>{items.length}</b><span>active SKUs</span></div></div><section className="catalogue-actions"><label className="catalogue-scan"><div className="scan-orb"><ScanText size={20}/></div><div><b>Scan catalogue image or PDF</b><p>Read SKU IDs from a complete catalogue page.</p></div><span className="scan-cta">Upload file <ImagePlus size={14}/></span><input type="file" accept="image/*,application/pdf" onChange={(e) => importCatalogueImage(e.target.files?.[0])} disabled={scanState === "scanning"}/></label><div className="catalogue-tip"><b>How it works</b><p>Catalogue SKUs are matched automatically when you scan an incoming order image or PDF.</p></div></section>{scanState !== "idle" && <div className={`catalogue-notice ${scanState}`}><ScanText size={16}/>{notice}</div>}<div className="catalogue-toolbar"><div><h3>Products</h3><span>{items.length} shown</span></div><div className="catalogue-toolbar-actions"><button type="button" className="bulk-delete" onClick={setAllOpeningStock}>Set all available quantity: 10,000</button>{selected.length > 0 && <button type="button" className="bulk-delete" onClick={removeSelected}><Trash2 size={14}/> Remove {selected.length} selected</button>}<span>Click a product to edit it, or select products to remove.</span></div></div><section className="catalogue-grid">{items.map((item) => <article className="catalogue-card" key={item.id} onClick={() => edit(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={catalogueName(item)} onError={(event) => { event.currentTarget.style.display = "none"; }} /> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><div className="catalogue-card-heading"><label className="catalogue-select" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected.includes(item.id)} onChange={() => toggleSelected(item.id)} aria-label={`Select ${catalogueName(item)}`}/><span>Select</span></label><small title={catalogueSku(item)}>{catalogueSku(item)}</small></div><h3 title={catalogueName(item)}>{catalogueName(item)}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / pc` : "Price to be added"}</p><p className="catalogue-stock">Available: <b>{availableStock(item).toLocaleString("en-IN")}</b></p><div className="catalogue-card-actions"><button type="button" className="edit-product"><Pencil size={13}/> Edit product</button><button type="button" className="delete-product" onClick={(event) => { event.stopPropagation(); removeOne(item); }}><Trash2 size={13}/> Remove</button></div></div></article>)}{!items.length && <div className="empty">No catalogue products match your search.</div>}</section></section>;
 }
 function CatalogueModal({ item, close, save }: { item: CatalogueItem | null; close: () => void; save: (item: CatalogueItem) => void }) {
-  const initial: CatalogueItem = item || { id: Date.now(), name: "", sku: "", unitPrice: 0, category: "Party Props", image: "", description: "", cartonQty: "", subCategory: "", brand: "GeeBee", unit: "Piece", packSize: "", moq: 0, purchasePrice: 0, wholesalePrice: 0, distributorPrice: 0, gst: 18, barcode: "", weight: "", dimensions: "", supplier: "", countryOfOrigin: "", availableQuantity: 0, reservedStock: 0, reorderThreshold: 0 };
+  const initial: CatalogueItem = item || { id: Date.now(), name: "", sku: "", unitPrice: 0, category: "Party Props", image: "", description: "", cartonQty: "", subCategory: "", brand: "GeeBee", unit: "Piece", packSize: "", moq: 0, purchasePrice: 0, wholesalePrice: 0, distributorPrice: 0, gst: 18, barcode: "", weight: "", dimensions: "", supplier: "", countryOfOrigin: "", availableQuantity: 10000, reservedStock: 0, reorderThreshold: 0 };
   const [form, setForm] = useState<CatalogueItem>(initial); const [preview, setPreview] = useState(initial.image);
   const update = (key: keyof CatalogueItem, value: string | number) => setForm({ ...form, [key]: value });
   const chooseImage = async (file?: File) => { if (!file) return; const image = await fileToDataUrl(file); setPreview(image); setForm({ ...form, image }); };

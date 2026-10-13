@@ -82,6 +82,7 @@ type Order = {
   remarks?: string;
   clientApproval?: "Approval pending" | "Approval requested" | "Approved" | "Changes requested" | "Rejected";
   cancelledFromDispatch?: boolean;
+  cancelledFromStage?: "Draft" | "Confirmed" | "Dispatch plan";
   avatar: string;
   products?: ProductLine[];
   approvedProducts?: ProductLine[];
@@ -899,7 +900,11 @@ export default function Home() {
       return { ...product, availableQuantity: availableStock(product) + dispatched, reservedStock: Math.max(0, (product.reservedStock || 0) - reserved) };
     }));
     const cancelledIds = isAdvance ? [order.id] : [primaryId, advanceId];
-    setOrders((current) => current.map((item) => cancelledIds.includes(item.id) ? { ...item, status: "Cancelled", cancelledFromDispatch: item.status === "Dispatch plan" } : item));
+    setOrders((current) => current.map((item) => {
+      if (!cancelledIds.includes(item.id)) return item;
+      const cancelledFromStage = item.status === "Draft" || item.status === "Confirmed" || item.status === "Dispatch plan" ? item.status : item.cancelledFromStage;
+      return { ...item, status: "Cancelled", cancelledFromDispatch: item.status === "Dispatch plan", cancelledFromStage };
+    }));
     setInvoices((current) => current.map((invoice) => cancelledIds.includes(invoice.order) ? { ...invoice, status: "Cancelled" } : invoice));
     logActivity("Cancelled order and released stock", "Orders", cancelledIds.join(", "));
     flash(`Cancelled ${order.id}; stock allocation released.`);
@@ -1121,8 +1126,8 @@ export default function Home() {
           />
         )}{" "}
         {section === "Image Studio" && <ImageStudio />}{" "}
-        {section === "Orders" && <Orders orders={shown.filter((order) => order.status === "Draft")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} confirm={confirmOrder} />}{" "}
-        {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} pushToDispatch={pushToDispatchPlan} confirmed />}{" "}
+        {section === "Orders" && <Orders orders={shown.filter((order) => order.status === "Draft")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Draft")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} confirm={confirmOrder} />}{" "}
+        {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} pushToDispatch={pushToDispatchPlan} confirmed />}{" "}
         {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Dispatch Plan", `${id} · ${clientApproval}`); }} />}{" "}
         {section === "Clients" && (
           <Clients
@@ -1458,6 +1463,7 @@ function SupplierModal({ supplier, close, save }: { supplier: Supplier | null; c
 }
 function Orders({
   orders,
+  cancelledOrders = [],
   clients,
   edit,
   cancel,
@@ -1467,6 +1473,7 @@ function Orders({
   confirmed = false,
 }: {
   orders: Order[];
+  cancelledOrders?: Order[];
   clients: Client[];
   edit: (o: Order) => void;
   cancel: (order: Order) => void;
@@ -1475,6 +1482,7 @@ function Orders({
   confirm?: (order: Order) => void;
   confirmed?: boolean;
 }) {
+  const [showCancelled, setShowCancelled] = useState(false);
   return (
     <section className="panel record-panel">
       <div className="panel-head">
@@ -1484,6 +1492,7 @@ function Orders({
         </div>
       </div>
       <OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} pushToDispatch={pushToDispatch} confirm={confirm} />
+      {cancelledOrders.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled {confirmed ? "Confirmed Orders" : "Orders"} <b>{cancelledOrders.length}</b></button>{showCancelled && <OrderTable orders={cancelledOrders} edit={edit} cancel={cancel} remove={remove} />}</section>}
     </section>
   );
 }

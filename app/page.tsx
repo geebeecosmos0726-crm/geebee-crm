@@ -990,9 +990,24 @@ export default function Home() {
   const pushToDispatchPlan = (order: Order) => {
     if (order.status !== "Confirmed") return;
     const approvedLines = order.approvedProducts || linesFor(order);
-    const requestedBySku = new Map(linesFor(order).map((line) => [skuKey(line.sku), line]));
-    const dispatchLines = approvedLines.map((approved) => ({ ...approved, quantity: Math.min(approved.quantity, requestedBySku.get(skuKey(approved.sku))?.quantity ?? 0) })).filter((line) => line.quantity > 0);
-    const releasedLines = approvedLines.map((approved) => ({ ...approved, quantity: Math.max(0, approved.quantity - (requestedBySku.get(skuKey(approved.sku))?.quantity ?? 0)) })).filter((line) => line.quantity > 0);
+    // A sheet may contain the same SKU on more than one row. Do not use a
+    // one-value-per-SKU map here: it silently replaces earlier quantities
+    // with the final row and can therefore send the wrong quantity to Dispatch.
+    const summariseBySku = (lines: ProductLine[]) => {
+      const summary = new Map<string, ProductLine>();
+      lines.forEach((line) => { const key = skuKey(line.sku); const existing = summary.get(key); summary.set(key, existing ? { ...existing, quantity: existing.quantity + line.quantity } : { ...line }); });
+      return summary;
+    };
+    const requestedBySku = summariseBySku(linesFor(order));
+    const approvedBySku = summariseBySku(approvedLines);
+    const dispatchLines: ProductLine[] = []; const releasedLines: ProductLine[] = [];
+    approvedBySku.forEach((approved, key) => {
+      const requested = requestedBySku.get(key);
+      const dispatchQuantity = Math.min(approved.quantity, requested?.quantity || 0);
+      if (dispatchQuantity) dispatchLines.push({ ...(requested || approved), quantity: dispatchQuantity });
+      const releasedQuantity = Math.max(0, approved.quantity - dispatchQuantity);
+      if (releasedQuantity) releasedLines.push({ ...approved, quantity: releasedQuantity });
+    });
     if (!window.confirm(`Send ${order.id} to Dispatch Plan? Any quantity reduced by Operations will be returned to available stock.`)) return;
     setCatalogue((current) => current.map((product) => {
       const released = releasedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);

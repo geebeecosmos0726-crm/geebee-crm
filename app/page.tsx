@@ -388,10 +388,11 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
   // grid begins at these relative positions. Reading each cell avoids gridlines
   // confusing general OCR and preserves every product row.
   const { createWorker, PSM } = await import("tesseract.js"); const worker = await createWorker("eng");
-  const readCell = async (x: number, y: number, width: number, height: number, numeric = false) => {
-    await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_LINE, tessedit_char_whitelist: numeric ? "0123456789.," : "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .:-" });
+  const readCell = async (x: number, y: number, width: number, height: number, numeric = false, highContrast = false) => {
+    await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_LINE, tessedit_char_whitelist: numeric ? "0123456789.," : "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ,&.:-" });
     const canvas = document.createElement("canvas"); const zoom = 5; canvas.width = width * zoom; canvas.height = height * zoom;
     const context = canvas.getContext("2d"); if (!context) return ""; context.fillStyle = "white"; context.fillRect(0, 0, canvas.width, canvas.height); context.drawImage(source, x, y, width, height, 0, 0, canvas.width, canvas.height);
+    if (highContrast) { const imageData = context.getImageData(0, 0, canvas.width, canvas.height); for (let index = 0; index < imageData.data.length; index += 4) { const dark = imageData.data[index] + imageData.data[index + 1] + imageData.data[index + 2] < 550; imageData.data[index] = imageData.data[index + 1] = imageData.data[index + 2] = dark ? 0 : 255; } context.putImageData(imageData, 0, 0); }
     const { data } = await worker.recognize(canvas); return data.text.replace(/\s+/g, " ").trim();
   };
   try {
@@ -443,8 +444,9 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
       const clientTopLine = gridLines.filter((line) => line < yellowTopLine - 2).at(-1) || Math.max(0, yellowTopLine - 40 * headerScale);
       const dateTopLine = gridLines.filter((line) => line < clientTopLine - 2).at(-1) || Math.max(0, clientTopLine - 40 * headerScale);
       const dateRead = await readCell(tableLeft + (tableRight - tableLeft) * .12, dateTopLine + 2, (tableRight - tableLeft) * .82, Math.max(12, clientTopLine - dateTopLine - 4));
-      const clientRead = await readCell(tableLeft + (tableRight - tableLeft) * .035, clientTopLine + 2, (tableRight - tableLeft) * .93, Math.max(12, yellowTopLine - clientTopLine - 4));
-      gridClient = cleanSheetClient(clientRead);
+      const clientHeight = Math.max(14, yellowTopLine - clientTopLine - 3);
+      const clientReads = await Promise.all([-2, 0, 2].map((offset) => readCell(tableLeft + (tableRight - tableLeft) * .025, Math.max(0, clientTopLine + offset), (tableRight - tableLeft) * .95, clientHeight, false, true)));
+      gridClient = clientReads.map(cleanSheetClient).filter(Boolean).sort((a, b) => b.replace(/[^a-z]/gi, "").length - a.replace(/[^a-z]/gi, "").length)[0] || "";
       const dateText = dateRead.match(/([0-3]?\d[.\/-][01]?\d[.\/-](?:20)?\d{2})/)?.[1];
       if (dateText) { const [day, month, year] = dateText.split(/[.\/-]/); gridEta = `${year.length === 2 ? `20${year}` : year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`; }
     }
@@ -1207,9 +1209,12 @@ export default function Home() {
           }}
           close={() => setModal(null)}
           save={(o) => {
+            const requestedId = o.id.trim();
+            if (!requestedId) { flash("Enter an order ID before saving."); return; }
+            if (orders.some((item) => item.id !== editing?.id && skuKey(item.id) === skuKey(requestedId))) { flash(`Order ID ${requestedId} is already in use. Choose a unique ID.`); return; }
             // Creating an order only records the customer's request. Inventory
             // is intentionally untouched until the user moves it to Dispatch Plan.
-            const savedOrder = editing ? { ...o, status: editing.status } : { ...o, status: "Draft", backorders: [] };
+            const savedOrder = editing ? { ...o, id: requestedId, status: editing.status } : { ...o, id: requestedId, status: "Draft", backorders: [] };
             const orderedLines = o.products?.length ? o.products : [{ product: o.product, sku: o.sku, quantity: o.quantity, unitPrice: o.unitPrice }];
             const missingLines = orderedLines.filter((line) => !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku)));
             if (missingLines.length) {
@@ -1218,9 +1223,15 @@ export default function Home() {
                 return [...current, ...missingLines.filter((line) => !known.has(skuKey(line.sku))).map((line, index) => ({ id: Date.now() + index, sku: line.sku.trim() || `UNMATCHED-${Date.now() + index}`, name: line.product?.startsWith("Review SKU:") ? "" : line.product || "", unitPrice: line.unitPrice || 0, category: "Uncategorised", image: "", description: "", cartonQty: "", innerQty: "", outerQty: "" } as CatalogueItem))];
               });
             }
-            setOrders((current) => editing ? current.map((item) => item.id === editing.id ? savedOrder : item) : [...current, savedOrder]);
+            setOrders((current) => {
+              if (!editing) return [...current, savedOrder];
+              const previousAdvanceId = `ADV-${editing.id}`;
+              const nextAdvanceId = `ADV-${requestedId}`;
+              return current.map((item) => item.id === editing.id ? savedOrder : item.id === previousAdvanceId && requestedId !== editing.id ? { ...item, id: nextAdvanceId } : item);
+            });
+            if (editing && requestedId !== editing.id) setInvoices((current) => current.map((invoice) => invoice.order === editing.id ? { ...invoice, order: requestedId } : invoice.order === `ADV-${editing.id}` ? { ...invoice, order: `ADV-${requestedId}` } : invoice));
             setModal(null);
-            logActivity(editing ? "Updated order" : "Created order", "Orders", o.id);
+            logActivity(editing ? "Updated order" : "Created order", "Orders", requestedId);
             flash(missingLines.length ? `${missingLines.length} unmatched product${missingLines.length === 1 ? " was" : "s were"} added to Products as incomplete records. Complete their details from the alert above.` : editing ? "Order updated successfully" : "Draft order created. Confirm it to reserve available stock and create any backorder.");
           }}
         />
@@ -2142,6 +2153,15 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     const option = new Option(`${f.client} — will be created when you save`, f.client); clientSelect.append(option); clientSelect.value = f.client;
     return () => option.remove();
   }, [clients, f.client]);
+  useEffect(() => {
+    const clientLabel = Array.from(document.querySelectorAll<HTMLLabelElement>("label")).find((label) => label.textContent?.trim().startsWith("Client"));
+    if (!clientLabel?.parentElement) return;
+    const label = document.createElement("label"); label.textContent = "Order ID";
+    const input = document.createElement("input"); input.value = order?.id || base.id; input.placeholder = "GB-00001"; input.required = true;
+    input.oninput = () => setF((current) => ({ ...current, id: input.value }));
+    label.append(input); clientLabel.parentElement.insertBefore(label, clientLabel);
+    return () => label.remove();
+  }, [order?.id]);
   useEffect(() => { const capture = document.querySelector(".document-capture"); if (!capture) return; const button = document.createElement("button"); button.type = "button"; button.className = "outline"; button.textContent = "Download internal order sheet"; button.onclick = downloadInternalOrderFormat; capture.append(button); return () => button.remove(); }, []);
   useEffect(() => {
     const capture = document.querySelector(".document-capture");

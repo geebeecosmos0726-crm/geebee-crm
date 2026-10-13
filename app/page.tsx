@@ -2201,6 +2201,29 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     return () => { productInputs.forEach((input) => input.removeAttribute("list")); skuInputs.forEach((input) => { input.style.display = ""; input.required = true; }); list.remove(); };
   }, [catalogue, f.client]);
   useEffect(() => {
+    const productInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="Product name"]'));
+    const controls: HTMLButtonElement[] = [];
+    productInputs.forEach((input, index) => {
+      const field = input.parentElement; if (!field) return;
+      const button = document.createElement("button"); button.type = "button"; button.className = "new-product-option";
+      const refresh = () => {
+        const line = products[index]; const typed = line?.product.trim() || "";
+        const matched = typed && catalogue.some((product) => `${catalogueName(product)} · ${product.sku}`.toLowerCase() === typed.toLowerCase() || catalogueName(product).toLowerCase() === typed.toLowerCase());
+        button.textContent = matched ? "Selected from catalogue" : typed ? `Create “${typed}” as new product` : "+ Create new product";
+        button.disabled = Boolean(matched);
+      };
+      refresh(); input.addEventListener("input", refresh);
+      button.onclick = () => {
+        const current = products[index]; const name = window.prompt("New product name", current?.product || "")?.trim(); if (!name) return;
+        const sku = window.prompt("SKU for this new product", current?.sku || "")?.trim(); if (!sku) return;
+        if (catalogue.some((product) => skuKey(product.sku) === skuKey(sku))) { window.alert("This SKU already exists in the catalogue. Select it from the product list instead, or use a different SKU."); return; }
+        setProducts((currentLines) => currentLines.map((line, lineIndex) => lineIndex === index ? { ...line, product: name, sku: sku.toUpperCase(), unitPrice: line.unitPrice || 0, review: { ...line.review, product: true } } : line));
+      };
+      field.append(button); controls.push(button);
+    });
+    return () => controls.forEach((button) => button.remove());
+  }, [catalogue, products]);
+  useEffect(() => {
     const applyReview = (selector: string, reviewKey: "product" | "quantity" | "price", message: string) => Array.from(document.querySelectorAll<HTMLInputElement>(selector)).forEach((input, index) => {
       const needsReview = Boolean(products[index]?.review?.[reviewKey]);
       input.classList.toggle("import-review", needsReview);

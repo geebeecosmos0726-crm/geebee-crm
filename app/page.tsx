@@ -1147,8 +1147,8 @@ export default function Home() {
         )}{" "}
         {section === "Image Studio" && <ImageStudio />}{" "}
         {section === "Orders" && <Orders orders={shown.filter((order) => order.status === "Draft")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Draft")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} confirm={confirmOrder} />}{" "}
-        {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} pushToDispatch={pushToDispatchPlan} confirmed />}{" "}
-        {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Dispatch Plan", `${id} · ${clientApproval}`); }} />}{" "}
+        {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} pushToDispatch={pushToDispatchPlan} sendWhatsApp={(order) => window.open(`https://wa.me/?text=${encodeURIComponent(dispatchWhatsAppText(order))}`, "_blank", "noopener,noreferrer")} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Confirmed Orders", `${id} · ${clientApproval}`); }} confirmed />}{" "}
+        {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} />}{" "}
         {section === "Clients" && (
           <Clients
             clients={clients.filter((c) =>
@@ -1502,6 +1502,8 @@ function Orders({
   remove,
   pushToDispatch,
   confirm,
+  sendWhatsApp,
+  updateApproval,
   confirmed = false,
 }: {
   orders: Order[];
@@ -1512,6 +1514,8 @@ function Orders({
   remove?: (ids: string[]) => void;
   pushToDispatch?: (order: Order) => void;
   confirm?: (order: Order) => void;
+  sendWhatsApp?: (order: Order) => void;
+  updateApproval?: (id: string, approval: NonNullable<Order["clientApproval"]>) => void;
   confirmed?: boolean;
 }) {
   const [showCancelled, setShowCancelled] = useState(false);
@@ -1520,10 +1524,12 @@ function Orders({
       <div className="panel-head">
         <div>
           <h2>{confirmed ? "Confirmed orders" : "Order register"}</h2>
-          <p>{confirmed ? "Inventory is reserved. Operations can adjust a quantity before moving the approved order to Dispatch Plan." : "Orders are rough drafts. Confirm an order to reserve available stock and automatically create any backorder."}</p>
+          <p>{confirmed ? "Inventory is reserved. Send the customer approval on WhatsApp here, then move the approved order to Dispatch Plan." : "Orders are rough drafts. Confirm an order to reserve available stock and automatically create any backorder."}</p>
         </div>
       </div>
-      <OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} pushToDispatch={pushToDispatch} confirm={confirm} />
+      {confirmed && orders.length > 0 && <section className="dispatch-approval-required"><b>Customer approval before dispatch</b><span>Send the GeeBee order on WhatsApp from this approved-order stage, then record the customer’s reply before moving it to Dispatch Plan.</span></section>}
+      <OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} pushToDispatch={pushToDispatch} confirm={confirm} sendWhatsApp={sendWhatsApp} whatsAppLabel={confirmed ? "WhatsApp approval" : undefined} />
+      {confirmed && updateApproval && <section className="dispatch-approval-list">{orders.map((order) => <article key={order.id}><div><b>{order.id} · {order.client}</b><small>{order.clientApproval || "Approval pending"} · Send the exact order text to the customer’s WhatsApp group before Dispatch Plan.</small></div><div><button className="outline" type="button" onClick={() => updateApproval(order.id, "Approval requested")}>Mark sent on WhatsApp</button><label>Client approval<select value={order.clientApproval || "Approval pending"} onChange={(event) => updateApproval(order.id, event.target.value as NonNullable<Order["clientApproval"]>)}><option>Approval pending</option><option>Approval requested</option><option>Approved</option><option>Changes requested</option><option>Rejected</option></select></label></div></article>)}</section>}
       {cancelledOrders.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled {confirmed ? "Confirmed Orders" : "Orders"} <b>{cancelledOrders.length}</b></button>{showCancelled && <OrderTable orders={cancelledOrders} edit={edit} cancel={cancel} remove={remove} />}</section>}
     </section>
   );
@@ -1793,10 +1799,9 @@ function ReportsDashboard({ report, orders, clients, catalogue, leads, quotes, i
     {report === "Payment Report" && <><section className="panel"><h3>Outstanding invoices</h3><div className="report-list">{openInvoices.sort((a, b) => amount(b.amount) - amount(a.amount)).slice(0, 8).map((invoice) => <article key={invoice.id}><span>{invoice.id} · {invoice.client}</span><b>{invoice.amount}</b></article>)}{!openInvoices.length && <p className="profile-empty">No outstanding invoices.</p>}</div></section><section className="panel"><h3>Recent collections</h3><div className="report-list">{invoices.filter((invoice) => invoice.status === "Paid").slice(0, 8).map((invoice) => <article key={invoice.id}><span>{invoice.id} · {invoice.client}</span><b>{invoice.amount}</b></article>)}{!invoices.some((invoice) => invoice.status === "Paid") && <p className="profile-empty">No paid invoices recorded yet.</p>}</div></section></>}
   </div></section>;
 }
-function DispatchPlanPanel({ orders, clients, edit, cancel, remove, updateApproval }: { orders: Order[]; clients: Client[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void; updateApproval: (id: string, approval: NonNullable<Order["clientApproval"]>) => void }) {
+function DispatchPlanPanel({ orders, edit, cancel, remove }: { orders: Order[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void }) {
   const [showCancelled, setShowCancelled] = useState(false); const active = orders.filter((order) => order.status === "Dispatch plan"); const cancelled = orders.filter((order) => order.status === "Cancelled" && order.cancelledFromDispatch);
-  const shareForApproval = (order: Order) => { window.open(`https://wa.me/?text=${encodeURIComponent(dispatchWhatsAppText(order))}`, "_blank", "noopener,noreferrer"); };
-  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">INVENTORY ALLOCATION</span><h2>Dispatch Plan</h2><p>Client confirmation is mandatory. Send the fixed GeeBee order text in the client’s WhatsApp group, then record their approval before dispatch.</p></div></div>{active.length > 0 && <section className="dispatch-approval-required"><b>Required before dispatch</b><span>Use the WhatsApp Order button. WhatsApp opens directly with the full order in a clean table-like text format; select the group, send it, then update the client-approval status.</span></section>}<OrderTable orders={active} edit={edit} cancel={cancel} remove={remove} sendWhatsApp={shareForApproval} whatsAppLabel="WhatsApp Order" /><section className="dispatch-approval-list">{active.map((order) => <article key={order.id}><div><b>{order.id} · {order.client}</b><small>{order.clientApproval || "Approval pending"} · The WhatsApp message contains Item / Quantity / Price / Value in the same order-sheet layout.</small></div><div><button className="outline" type="button" onClick={() => updateApproval(order.id, "Approval requested")}>Mark sent on WhatsApp</button><label>Client approval<select value={order.clientApproval || "Approval pending"} onChange={(event) => updateApproval(order.id, event.target.value as NonNullable<Order["clientApproval"]>)}><option>Approval pending</option><option>Approval requested</option><option>Approved</option><option>Changes requested</option><option>Rejected</option></select></label></div></article>)}</section>{cancelled.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled from Dispatch Plan <b>{cancelled.length}</b></button>{showCancelled && <OrderTable orders={cancelled} edit={edit} cancel={cancel} remove={remove} />}</section>}</section>;
+  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">OPERATIONS HANDOFF</span><h2>Dispatch Plan</h2><p>Orders reach this stage after customer approval has been sent and recorded in Confirmed Orders. Operations can now prepare, pack and dispatch them.</p></div></div><OrderTable orders={active} edit={edit} cancel={cancel} remove={remove} />{cancelled.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled from Dispatch Plan <b>{cancelled.length}</b></button>{showCancelled && <OrderTable orders={cancelled} edit={edit} cancel={cancel} remove={remove} />}</section>}</section>;
 }
 function BackordersPanel({ orders, clients, edit, cancel, remove }: { orders: Order[]; clients: Client[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void }) {
   return <section className="panel record-panel"><div className="panel-head"><div><span className="overline">BACKORDER & ADVANCE ORDER</span><h2>Advance order register</h2><p>Only quantities unavailable in free stock appear here. Each advance order is editable and has its own PDF.</p></div></div><OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} sendWhatsApp={(order) => { const client = clients.find((item) => item.name === order.client); openWhatsApp(client?.whatsapp || client?.phone || "", `Dear ${order.client}, your GeeBee advance order #${order.id} is pending future dispatch. Advance value: ${money(orderTotal(order))}.`); }} /></section>;

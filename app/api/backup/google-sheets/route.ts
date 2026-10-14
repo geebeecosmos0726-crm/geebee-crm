@@ -15,6 +15,8 @@ const headers = {
   Leads: ["Lead ID", "Company", "Contact Person", "Mobile", "City", "Source", "Assigned Salesperson", "Requirement", "Expected Order Value", "Expected Order Date", "Status", "Lost Reason", "Created At"],
   Tasks: ["Task ID", "Title", "Time", "Due Date", "Assignee", "Type", "Status", "Related To"],
   Transporters: ["Record ID", "Transporter Name", "Contact Person", "Phone", "Email", "City", "GSTIN", "Service Type", "Notes"],
+  Suppliers: ["Record ID", "Supplier Name", "Contact Person", "Phone", "Email", "City", "Country", "GSTIN", "Payment Terms", "Status", "Notes"],
+  "Purchase Orders": ["PO Number", "Supplier", "Status", "Expected Date", "Created At", "Notes", "Lines JSON"],
   "Audit Log": ["Event ID", "Workspace Owner", "Actor", "Action", "Module", "Details", "Created At"],
 };
 
@@ -28,31 +30,39 @@ async function ensureSheets(sheets: ReturnType<typeof google.sheets>, spreadshee
   if (missing.length) await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: missing.map((title) => ({ addSheet: { properties: { title } } })) } });
 }
 
-export async function GET(request: Request) {
+async function authorisedWorkspace(request: Request, url: string, serviceKey: string) {
   const expected = process.env.BACKUP_CRON_SECRET;
-  if (!expected || request.headers.get("authorization") !== `Bearer ${expected}`) return Response.json({ error: "Unauthorized backup request." }, { status: 401 });
+  if (expected && request.headers.get("authorization") === `Bearer ${expected}`) return null;
+  const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  if (!token) throw new Error("Unauthorized backup request.");
+  const db = createClient(url, serviceKey, { auth: { persistSession: false } });
+  const { data: userData, error } = await db.auth.getUser(token);
+  if (error || !userData.user?.email) throw new Error("Unauthorized backup request.");
+  const { data: owned } = await db.from("crm_workspaces").select("owner_id").eq("owner_id", userData.user.id).maybeSingle();
+  if (owned?.owner_id) return owned.owner_id as string;
+  const { data: member } = await db.from("crm_workspace_members").select("workspace_owner_id").ilike("email", userData.user.email).maybeSingle();
+  if (!member?.workspace_owner_id) throw new Error("Unauthorized backup request.");
+  return member.workspace_owner_id as string;
+}
+
+export async function GET(request: Request) {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   const spreadsheetId = process.env.GOOGLE_SHEET_ID;
   const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (!url || !serviceKey || !spreadsheetId || !keyJson) return Response.json({ error: "Backup configuration is incomplete." }, { status: 500 });
   try {
+    const requestedOwnerId = await authorisedWorkspace(request, url, serviceKey);
     const credentials = JSON.parse(keyJson);
     if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
     const auth = new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
     const sheets = google.sheets({ version: "v4", auth });
     const supabase = createClient(url, serviceKey, { auth: { persistSession: false } });
+    const owner = requestedOwnerId;
     const [{ data: workspaces, error: workspaceError }, { data: auditEvents, error: auditError }, ...recordResults] = await Promise.all([
-      supabase.from("crm_workspaces").select("owner_id, data, updated_at"),
-      supabase.from("crm_audit_events").select("id, workspace_owner_id, actor_email, action, module, details, created_at").order("created_at", { ascending: false }).limit(500),
-      supabase.from("crm_clients").select("data").limit(100000),
-      supabase.from("crm_products").select("data").limit(100000),
-      supabase.from("crm_orders").select("data").limit(100000),
-      supabase.from("crm_invoices").select("data").limit(100000),
-      supabase.from("crm_leads").select("data").limit(100000),
-      supabase.from("crm_quotes").select("data").limit(100000),
-      supabase.from("crm_tasks").select("data").limit(100000),
-      supabase.from("crm_transporters").select("data").limit(100000),
+      owner ? supabase.from("crm_workspaces").select("owner_id, data, updated_at").eq("owner_id", owner) : supabase.from("crm_workspaces").select("owner_id, data, updated_at"),
+      owner ? supabase.from("crm_audit_events").select("id, workspace_owner_id, actor_email, action, module, details, created_at").eq("workspace_owner_id", owner).order("created_at", { ascending: false }).limit(500) : supabase.from("crm_audit_events").select("id, workspace_owner_id, actor_email, action, module, details, created_at").order("created_at", { ascending: false }).limit(500),
+      ...["crm_clients", "crm_products", "crm_orders", "crm_invoices", "crm_leads", "crm_quotes", "crm_tasks", "crm_transporters"].map((table) => owner ? supabase.from(table).select("data").eq("workspace_owner_id", owner).limit(100000) : supabase.from(table).select("data").limit(100000)),
     ]);
     if (workspaceError) throw workspaceError;
     // Audit history is useful, but a backup of core business data must still
@@ -73,6 +83,8 @@ export async function GET(request: Request) {
       Leads: rows(data.leads, ["id", "company", "contact", "mobile", "city", "source", "salesperson", "requirement", "expectedValue", "expectedDate", "status", "lostReason", "createdAt"]),
       Tasks: rows(data.tasks, ["id", "title", "time", "dueDate", "assignee", "type", "status", "relatedTo"]),
       Transporters: rows(data.transporters, ["id", "name", "contact", "phone", "email", "city", "gstin", "serviceType", "notes"]),
+      Suppliers: rows((workspace.data || {}).suppliers, ["id", "name", "contact", "phone", "email", "city", "country", "gstin", "paymentTerms", "status", "notes"]),
+      "Purchase Orders": rows((workspace.data || {}).purchases, ["id", "supplier", "status", "expectedDate", "createdAt", "notes", "lines"]),
       "Audit Log": safeAuditEvents.map((event: any) => [text(event.id), text(event.workspace_owner_id), text(event.actor_email), text(event.action), text(event.module), text(event.details), text(event.created_at)]),
     };
     const titles = ["README", "Backup Log", ...Object.keys(headers)];

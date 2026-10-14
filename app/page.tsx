@@ -689,6 +689,7 @@ export default function Home() {
   const search = sectionSearches[section] || "";
   const setSearch = (value: string) => setSectionSearches((current) => ({ ...current, [section]: value }));
   const recordSnapshots = useRef<Record<string, Map<string, string>>>({});
+  const sheetSyncTimer = useRef<number | null>(null);
   const flash = (m: string) => {
       setToast(m);
       setTimeout(() => setToast(""), 2600);
@@ -697,6 +698,18 @@ export default function Home() {
       setEditing(d || null);
       setModal(k);
     };
+  // The regular automated backup still runs every 12 hours. For deletions we
+  // also request a short, authenticated backup after the cloud record sync has
+  // completed, so the Google Sheet does not retain removed records.
+  const syncGoogleSheetAfterDelete = () => {
+    if (!session?.access_token || typeof window === "undefined") return;
+    if (sheetSyncTimer.current) window.clearTimeout(sheetSyncTimer.current);
+    sheetSyncTimer.current = window.setTimeout(() => {
+      fetch("/api/backup/google-sheets", { headers: { Authorization: `Bearer ${session.access_token}` } })
+        .then((response) => { if (!response.ok) console.warn("Google Sheet sync after deletion was not completed."); })
+        .catch(() => console.warn("Google Sheet sync after deletion was not completed."));
+    }, 1200);
+  };
   const updateLeadStage = (id: string, status: LeadStage) => {
     const lead = leads.find((item) => item.id === id); if (!lead) return;
     let lostReason = lead.lostReason;
@@ -947,7 +960,36 @@ export default function Home() {
     setInvoices((current) => current.filter((invoice) => !removedIds.has(invoice.order)));
     setTasks((current) => current.filter((task) => !task.relatedTo || !removedIds.has(task.relatedTo)));
     logActivity("Removed order and released stock", "Orders", [...removedIds].join(", "));
+    syncGoogleSheetAfterDelete();
     flash(`${ids.length} order${ids.length === 1 ? "" : "s"} removed; allocated stock returned to available inventory.`);
+  };
+  const returnConfirmedToOrders = (order: Order) => {
+    if (order.status !== "Confirmed") return;
+    if (!window.confirm(`Return ${order.id} to Orders? Its reserved inventory and any backorder allocation will be released.`)) return;
+    const advanceId = `ADV-${order.id}`;
+    const shortageLines = order.backorders?.length ? order.backorders : (orders.find((item) => item.id === advanceId)?.products || []);
+    const confirmedLines = linesFor(order);
+    const restoredLines = [...confirmedLines, ...shortageLines];
+    setCatalogue((current) => current.map((product) => {
+      const released = confirmedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      const unreserved = shortageLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      return !released && !unreserved ? product : { ...product, availableQuantity: availableStock(product) + released, reservedStock: Math.max(0, (product.reservedStock || 0) - unreserved) };
+    }));
+    const first = restoredLines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
+    setOrders((current) => current.filter((item) => item.id !== advanceId).map((item) => item.id === order.id ? { ...item, ...first, products: restoredLines, approvedProducts: undefined, backorders: undefined, clientApproval: undefined, status: "Draft" } : item));
+    setInvoices((current) => current.filter((invoice) => invoice.order !== advanceId));
+    setTasks((current) => current.filter((task) => task.relatedTo !== advanceId));
+    logActivity("Returned confirmed order to Orders", "Orders", order.id);
+    flash(`${order.id} returned to Orders. Inventory allocation and backorder reservation were released.`);
+  };
+  const returnDispatchToConfirmed = (order: Order) => {
+    if (order.status !== "Dispatch plan") return;
+    if (!window.confirm(`Return ${order.id} to Confirmed Orders? The current inventory allocation will remain reserved.`)) return;
+    const lines = linesFor(order);
+    const first = lines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
+    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...first, products: lines, approvedProducts: lines, status: "Confirmed" } : item));
+    logActivity("Returned dispatch order to Confirmed Orders", "Dispatch Plan", order.id);
+    flash(`${order.id} returned to Confirmed Orders. Inventory remains allocated.`);
   };
   const initialiseOpeningStock = async () => {
     if (!supabase || !session) return;
@@ -1148,8 +1190,8 @@ export default function Home() {
         )}{" "}
         {section === "Image Studio" && <ImageStudio />}{" "}
         {section === "Orders" && <Orders orders={shown.filter((order) => order.status === "Draft")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Draft")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} confirm={confirmOrder} />}{" "}
-        {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} pushToDispatch={pushToDispatchPlan} sendWhatsApp={(order) => window.open(`https://wa.me/?text=${encodeURIComponent(dispatchWhatsAppText(order))}`, "_blank", "noopener,noreferrer")} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Confirmed Orders", `${id} · ${clientApproval}`); }} confirmed />}{" "}
-        {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} />}{" "}
+        {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToOrders={returnConfirmedToOrders} pushToDispatch={pushToDispatchPlan} sendWhatsApp={(order) => window.open(`https://wa.me/?text=${encodeURIComponent(dispatchWhatsAppText(order))}`, "_blank", "noopener,noreferrer")} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Confirmed Orders", `${id} · ${clientApproval}`); }} confirmed />}{" "}
+        {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToConfirmed={returnDispatchToConfirmed} />}{" "}
         {section === "Clients" && (
           <Clients
             clients={clients.filter((c) =>
@@ -1160,10 +1202,10 @@ export default function Home() {
             edit={(c) => show("client", c)}
             view={(c) => setClientProfile(c)}
             importCustomers={async (file) => { if (!file) return; try { const rows = await readCsv(file); const now = Date.now(); const incoming = rows.filter((row) => row["business name"]).map((row, index) => ({ id: now + index, customerId: row["customer id"] || `GB-C${now + index}`, name: row["business name"], city: row.city || "", phone: row.phone || "", contact: row["contact person"] || row["business name"], credit: row["payment threshold"] || "", paymentTerms: row["payment terms"] || "", customerStatus: row.status || "Active", avatar: initials(row["business name"]), specialRates: [] } as Client)); setClients((current) => { const incomingByName = new Map(incoming.map((client) => [client.name.toLowerCase(), client])); const existing = new Set(current.map((client) => client.name.toLowerCase())); return [...current.map((client) => incomingByName.has(client.name.toLowerCase()) ? { ...client, ...incomingByName.get(client.name.toLowerCase())!, id: client.id } : client), ...incoming.filter((client) => !existing.has(client.name.toLowerCase()))]; }); logActivity("Imported customer sheet", "Customers", `${incoming.length} customer row(s)`); flash(`${incoming.length} customer row${incoming.length === 1 ? "" : "s"} imported.`); } catch { flash("Customer import failed. Use the downloaded CSV template and keep the column headings unchanged."); } }}
-            remove={(ids) => { setClients((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed client", "Clients", ids.join(", ")); flash(`${ids.length} client${ids.length === 1 ? "" : "s"} removed`); }}
+            remove={(ids) => { setClients((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed client", "Clients", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} client${ids.length === 1 ? "" : "s"} removed`); }}
           />
         )}{" "}
-        {["Leads", "Lost Leads"].includes(section) && <LeadsPanel leads={leads.filter((lead) => section === "Lost Leads" ? lead.status === "Lost" : lead.status !== "Lost").filter((lead) => `${lead.id} ${lead.company} ${lead.contact} ${lead.city}`.toLowerCase().includes(search.toLowerCase()))} edit={(lead) => show("lead", lead)} updateStage={updateLeadStage} remove={(id) => { setLeads((current) => current.filter((lead) => lead.id !== id)); logActivity("Removed enquiry", "Enquiries", id); flash("Enquiry removed"); }} />}{" "}
+        {["Leads", "Lost Leads"].includes(section) && <LeadsPanel leads={leads.filter((lead) => section === "Lost Leads" ? lead.status === "Lost" : lead.status !== "Lost").filter((lead) => `${lead.id} ${lead.company} ${lead.contact} ${lead.city}`.toLowerCase().includes(search.toLowerCase()))} edit={(lead) => show("lead", lead)} updateStage={updateLeadStage} remove={(id) => { setLeads((current) => current.filter((lead) => lead.id !== id)); logActivity("Removed enquiry", "Enquiries", id); syncGoogleSheetAfterDelete(); flash("Enquiry removed"); }} />}{" "}
         {section === "Follow-ups" && <TasksDashboard tasks={visibleTasks} leads={leads} quotes={quotes} invoices={invoices} orders={orders} toggle={(id) => { setTasks((current) => current.map((task) => task.id === id ? { ...task, status: task.status === "Done" ? "Open" : "Done" } : task)); logActivity("Updated task", "Daily Tasks", id); }} edit={(task) => show("task", task)} remove={(id) => { if (!window.confirm("Delete this task permanently?")) return; setTasks((current) => current.filter((task) => task.id !== id)); logActivity("Deleted task", "Daily Tasks", id); flash("Task deleted."); }} />}{" "}
         {section === "Sales Team Report" && <SalesTeamDashboard leads={leads} quotes={quotes} orders={orders} invoices={invoices} />}{" "}
         {["Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report"].includes(section) && <ReportsDashboard report={section} orders={orders} clients={clients} catalogue={catalogue} leads={leads} quotes={quotes} invoices={invoices} />}{" "}
@@ -1178,7 +1220,7 @@ export default function Home() {
             )}
             clients={clients}
             edit={(i) => show("invoice", i)}
-            remove={(ids) => { setInvoices((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed invoice", "Invoices", ids.join(", ")); flash(`${ids.length} invoice${ids.length === 1 ? "" : "s"} removed`); }}
+            remove={(ids) => { setInvoices((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed invoice", "Invoices", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} invoice${ids.length === 1 ? "" : "s"} removed`); }}
           />
         )}{" "}
         {section === "Catalogue" && (
@@ -1190,15 +1232,16 @@ export default function Home() {
             duplicate={(item) => show("catalogue", { ...item, id: Date.now(), sku: "", name: `${catalogueName(item)} (Copy)`, availableQuantity: 10000, openingStock: 0, purchasedStock: 0, orderedStock: 0, damagedStock: 0, reservedStock: 0, duplicateFromId: item.id })}
             addDrafts={(drafts) => { setCatalogue((current) => { const incoming = new Map(drafts.map((item) => [skuKey(item.sku), item])); const existing = new Set(current.map((item) => skuKey(item.sku))); return [...current.map((item) => { const replacement = incoming.get(skuKey(item.sku)); return replacement ? { ...item, ...replacement, id: item.id } : item; }), ...drafts.filter((item) => !existing.has(skuKey(item.sku)))]; }); logActivity("Imported catalogue products", "Catalogue", `${drafts.length} SKU record(s) reconciled`); flash("Catalogue PDF processed: matching SKUs updated and missing SKUs added."); }}
             setAllOpeningStock={() => { if (window.confirm(`Reset demo inventory for all ${catalogue.length} products to 10,000 available units? Existing stock allocations will be cleared.`)) initialiseOpeningStock(); }}
-            remove={(ids) => { setCatalogue((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed catalogue product", "Catalogue", ids.join(", ")); flash(`${ids.length} product${ids.length === 1 ? "" : "s"} removed from catalogue`); }}
+            remove={(ids) => { setCatalogue((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed catalogue product", "Catalogue", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} product${ids.length === 1 ? "" : "s"} removed from catalogue`); }}
           />
         )}{" "}
-        {section === "Transporters" && <TransportersPanel transporters={transporters.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.area || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("transporter", item)} add={() => show("transporter")} remove={(ids) => { setTransporters((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed transporter", "Transporters", ids.join(", ")); flash(`${ids.length} transporter${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
-        {section === "Suppliers" && <SuppliersPanel suppliers={suppliers.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.country || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("supplier", item)} add={() => show("supplier")} remove={(ids) => { setSuppliers((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed supplier", "Suppliers", ids.join(", ")); flash(`${ids.length} supplier${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
+        {section === "Categories" && <CategoriesPanel items={catalogue} query={search} openCategory={(category) => { setSection("Catalogue"); setSectionSearches((current) => ({ ...current, Catalogue: category })); }} />}{" "}
+        {section === "Transporters" && <TransportersPanel transporters={transporters.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.area || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("transporter", item)} add={() => show("transporter")} remove={(ids) => { setTransporters((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed transporter", "Transporters", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} transporter${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
+        {section === "Suppliers" && <SuppliersPanel suppliers={suppliers.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.country || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("supplier", item)} add={() => show("supplier")} remove={(ids) => { setSuppliers((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed supplier", "Suppliers", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} supplier${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
         {section === "Settings" && <TeamAccess members={members} requests={accessRequests} workspaceOwnerId={workspaceOwnerId} canManage={isAdmin} onChange={setMembers} onRequestsChange={setAccessRequests} onAudit={logActivity} auditEvents={auditEvents} />}{" "}
         {section === "Data Transfer" && <DataTransferPanel catalogue={catalogue} clients={clients} orders={orders} invoices={invoices} leads={leads} quotes={quotes} tasks={tasks} transporters={transporters} setCatalogue={setCatalogue} setClients={setClients} setOrders={setOrders} setInvoices={setInvoices} setLeads={setLeads} setQuotes={setQuotes} setTasks={setTasks} setTransporters={setTransporters} onAudit={logActivity} canHardDelete={isAdmin} hardDelete={(scope, ids) => { const wanted = new Set(ids.map((id) => id.trim().toLowerCase()).filter(Boolean)); if (!wanted.size) return 0; if (scope === "Customers") { const removed = clients.filter((client) => wanted.has((client.customerId || "").toLowerCase()) || wanted.has(client.name.toLowerCase())); setClients((current) => current.filter((client) => !removed.some((item) => item.id === client.id))); logActivity("Hard deleted customers from sheet", "Import / Export", removed.map((item) => item.name).join(", ")); return removed.length; } const stage = scope === "Orders" ? "Draft" : scope === "Approved Orders" ? "Confirmed" : "Dispatch plan"; const targetIds = orders.filter((order) => order.status === stage && wanted.has(order.id.toLowerCase())).map((order) => order.id); if (!targetIds.length) return 0; removeOrders(targetIds); logActivity("Hard deleted orders from sheet", "Import / Export", `${scope}: ${targetIds.join(", ")}`); return targetIds.length; }} />}{" "}
         {section === "Recovery" && <RecoveryPanel canManage={isAdmin} session={session} clearBusinessData={() => { setOrders([]); setClients([]); setInvoices([]); setLeads([]); setQuotes([]); setTasks([]); setTransporters([]); setPurchases([]); recordSnapshots.current = {}; flash("Business records have been permanently cleared. SKU catalogue was preserved."); }} applyRestore={(data) => { setOrders(data.orders); setClients(data.clients); setInvoices(data.invoices); setCatalogue(data.catalogue); setLeads(data.leads); setQuotes(data.quotes); setTasks(data.tasks); setTransporters(data.transporters || []); logActivity("Applied Google Sheets recovery", "Data recovery", "Recovery snapshot created before restore"); flash("Backup restored. Your previous CRM state is saved as a recovery snapshot."); }} />}{" "}
-        {section === "Purchase Orders" && <PurchaseOrdersPanel purchases={purchases.filter((purchase) => `${purchase.id} ${purchase.supplier} ${purchase.lines.map((line) => `${line.sku} ${line.product}`).join(" ")}`.toLowerCase().includes(search.toLowerCase()))} catalogue={catalogue} lowStockProducts={lowStockProducts} add={(product) => show("purchase", product ? { lines: [{ sku: product.sku, product: catalogueName(product), quantity: Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)), receivedQuantity: 0 }], supplier: product.supplier || "" } : null)} edit={(purchase) => show("purchase", purchase)} receive={receivePurchase} cancel={(purchase) => { if (!window.confirm(`Cancel purchase order ${purchase.id}? No stock will be changed.`)) return; setPurchases((current) => current.map((item) => item.id === purchase.id ? { ...item, status: "Cancelled" } : item)); logActivity("Cancelled purchase order", "Purchase Orders", purchase.id); flash("Purchase order cancelled."); }} remove={(purchase) => { if (!window.confirm(`Permanently delete ${purchase.id}? This does not change stock.`)) return; setPurchases((current) => current.filter((item) => item.id !== purchase.id)); logActivity("Deleted purchase order", "Purchase Orders", purchase.id); flash("Purchase order permanently deleted."); }} />} {" "}
+        {section === "Purchase Orders" && <PurchaseOrdersPanel purchases={purchases.filter((purchase) => `${purchase.id} ${purchase.supplier} ${purchase.lines.map((line) => `${line.sku} ${line.product}`).join(" ")}`.toLowerCase().includes(search.toLowerCase()))} catalogue={catalogue} lowStockProducts={lowStockProducts} add={(product) => show("purchase", product ? { lines: [{ sku: product.sku, product: catalogueName(product), quantity: Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)), receivedQuantity: 0 }], supplier: product.supplier || "" } : null)} edit={(purchase) => show("purchase", purchase)} receive={receivePurchase} cancel={(purchase) => { if (!window.confirm(`Cancel purchase order ${purchase.id}? No stock will be changed.`)) return; setPurchases((current) => current.map((item) => item.id === purchase.id ? { ...item, status: "Cancelled" } : item)); logActivity("Cancelled purchase order", "Purchase Orders", purchase.id); flash("Purchase order cancelled."); }} remove={(purchase) => { if (!window.confirm(`Permanently delete ${purchase.id}? This does not change stock.`)) return; setPurchases((current) => current.filter((item) => item.id !== purchase.id)); logActivity("Deleted purchase order", "Purchase Orders", purchase.id); syncGoogleSheetAfterDelete(); flash("Purchase order permanently deleted."); }} />} {" "}
         {section === "Notifications" && <AutomationPanel />}{" "}
         {!(["Overview", "Orders", "Confirmed Orders", "Dispatch Plan", "Clients", "Leads", "Enquiries", "Follow-ups", "Lost Leads", "Quotations", "Backorders", "Invoices", "Catalogue", "Transporters", "Suppliers", "Purchase Orders", "Settings", "Recovery", "Data Transfer", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report"].includes(section)) && (
           <section className="panel coming">
@@ -1502,6 +1545,8 @@ function Orders({
   edit,
   cancel,
   remove,
+  returnToOrders,
+  returnLabel = "Return to Orders",
   pushToDispatch,
   confirm,
   sendWhatsApp,
@@ -1514,6 +1559,8 @@ function Orders({
   edit: (o: Order) => void;
   cancel: (order: Order) => void;
   remove?: (ids: string[]) => void;
+  returnToOrders?: (order: Order) => void;
+  returnLabel?: string;
   pushToDispatch?: (order: Order) => void;
   confirm?: (order: Order) => void;
   sendWhatsApp?: (order: Order) => void;
@@ -1530,7 +1577,7 @@ function Orders({
         </div>
       </div>
       {confirmed && orders.length > 0 && <section className="dispatch-approval-required"><b>Customer approval before dispatch</b><span>Send the GeeBee order on WhatsApp from this approved-order stage, then record the customer’s reply before moving it to Dispatch Plan.</span></section>}
-      <OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} pushToDispatch={pushToDispatch} confirm={confirm} sendWhatsApp={sendWhatsApp} whatsAppLabel={confirmed ? "WhatsApp approval" : undefined} />
+      <OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} returnToOrders={returnToOrders} returnLabel={returnLabel} pushToDispatch={pushToDispatch} confirm={confirm} sendWhatsApp={sendWhatsApp} whatsAppLabel={confirmed ? "WhatsApp approval" : undefined} />
       {confirmed && updateApproval && <section className="dispatch-approval-list">{orders.map((order) => <article key={order.id}><div><b>{order.id} · {order.client}</b><small>{order.clientApproval || "Approval pending"} · Send the exact order text to the customer’s WhatsApp group before Dispatch Plan.</small></div><div><button className="outline" type="button" onClick={() => updateApproval(order.id, "Approval requested")}>Mark sent on WhatsApp</button><label>Client approval<select value={order.clientApproval || "Approval pending"} onChange={(event) => updateApproval(order.id, event.target.value as NonNullable<Order["clientApproval"]>)}><option>Approval pending</option><option>Approval requested</option><option>Approved</option><option>Changes requested</option><option>Rejected</option></select></label></div></article>)}</section>}
       {cancelledOrders.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled {confirmed ? "Confirmed Orders" : "Orders"} <b>{cancelledOrders.length}</b></button>{showCancelled && <OrderTable orders={cancelledOrders} edit={edit} cancel={cancel} remove={remove} />}</section>}
     </section>
@@ -1544,6 +1591,8 @@ function OrderTable({
   sendWhatsApp,
   whatsAppLabel,
   pushToDispatch,
+  returnToOrders,
+  returnLabel = "Return to Orders",
   confirm,
   compact = false,
 }: {
@@ -1554,6 +1603,8 @@ function OrderTable({
   sendWhatsApp?: (order: Order) => void;
   whatsAppLabel?: string;
   pushToDispatch?: (order: Order) => void;
+  returnToOrders?: (order: Order) => void;
+  returnLabel?: string;
   confirm?: (order: Order) => void;
   compact?: boolean;
 }) {
@@ -1633,7 +1684,7 @@ function OrderTable({
                 <Pill value={o.payment} />
               </td>
               <td>
-                <div className="record-actions">{confirm && o.status === "Draft" && <button className="dispatch-action" type="button" onClick={() => confirm(o)}>Confirm order</button>}{pushToDispatch && o.status === "Confirmed" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>{whatsAppLabel || "WA"}</button>}<button className="whatsapp-action" type="button" onClick={() => downloadOrderPdf(o)} aria-label={`Download ${o.status === "Advance order" ? "advance order" : "purchase order"} ${o.id}`}>{o.status === "Advance order" ? "AO" : "PO"}</button><button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>{cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
+                <div className="record-actions">{confirm && o.status === "Draft" && <button className="dispatch-action" type="button" onClick={() => confirm(o)}>Confirm order</button>}{returnToOrders && (o.status === "Confirmed" || o.status === "Dispatch plan") && <button className="outline" type="button" onClick={() => returnToOrders(o)}>{returnLabel}</button>}{pushToDispatch && o.status === "Confirmed" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>{whatsAppLabel || "WA"}</button>}<button className="whatsapp-action" type="button" onClick={() => downloadOrderPdf(o)} aria-label={`Download ${o.status === "Advance order" ? "advance order" : "purchase order"} ${o.id}`}>{o.status === "Advance order" ? "AO" : "PO"}</button><button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>{cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
               </td>
             </tr>
           ))}
@@ -1813,9 +1864,9 @@ function ReportsDashboard({ report, orders, clients, catalogue, leads, quotes, i
     {report === "Payment Report" && <><section className="panel"><h3>Outstanding invoices</h3><div className="report-list">{openInvoices.sort((a, b) => amount(b.amount) - amount(a.amount)).slice(0, 8).map((invoice) => <article key={invoice.id}><span>{invoice.id} · {invoice.client}</span><b>{invoice.amount}</b></article>)}{!openInvoices.length && <p className="profile-empty">No outstanding invoices.</p>}</div></section><section className="panel"><h3>Recent collections</h3><div className="report-list">{invoices.filter((invoice) => invoice.status === "Paid").slice(0, 8).map((invoice) => <article key={invoice.id}><span>{invoice.id} · {invoice.client}</span><b>{invoice.amount}</b></article>)}{!invoices.some((invoice) => invoice.status === "Paid") && <p className="profile-empty">No paid invoices recorded yet.</p>}</div></section></>}
   </div></section>;
 }
-function DispatchPlanPanel({ orders, edit, cancel, remove }: { orders: Order[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void }) {
+function DispatchPlanPanel({ orders, edit, cancel, remove, returnToConfirmed }: { orders: Order[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void; returnToConfirmed: (order: Order) => void }) {
   const [showCancelled, setShowCancelled] = useState(false); const active = orders.filter((order) => order.status === "Dispatch plan"); const cancelled = orders.filter((order) => order.status === "Cancelled" && order.cancelledFromDispatch);
-  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">OPERATIONS HANDOFF</span><h2>Dispatch Plan</h2><p>Orders reach this stage after customer approval has been sent and recorded in Confirmed Orders. Operations can now prepare, pack and dispatch them.</p></div></div><OrderTable orders={active} edit={edit} cancel={cancel} remove={remove} />{cancelled.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled from Dispatch Plan <b>{cancelled.length}</b></button>{showCancelled && <OrderTable orders={cancelled} edit={edit} cancel={cancel} remove={remove} />}</section>}</section>;
+  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">OPERATIONS HANDOFF</span><h2>Dispatch Plan</h2><p>Orders reach this stage after customer approval has been sent and recorded in Confirmed Orders. Operations can now prepare, pack and dispatch them.</p></div></div><OrderTable orders={active} edit={edit} cancel={cancel} remove={remove} returnToOrders={returnToConfirmed} returnLabel="Return to Confirmed" />{cancelled.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled from Dispatch Plan <b>{cancelled.length}</b></button>{showCancelled && <OrderTable orders={cancelled} edit={edit} cancel={cancel} remove={remove} />}</section>}</section>;
 }
 function BackordersPanel({ orders, clients, edit, cancel, remove }: { orders: Order[]; clients: Client[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void }) {
   return <section className="panel record-panel"><div className="panel-head"><div><span className="overline">BACKORDER & ADVANCE ORDER</span><h2>Advance order register</h2><p>Only quantities unavailable in free stock appear here. Each advance order is editable and has its own PDF.</p></div></div><OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} sendWhatsApp={(order) => { const client = clients.find((item) => item.name === order.client); openWhatsApp(client?.whatsapp || client?.phone || "", `Dear ${order.client}, your GeeBee advance order #${order.id} is pending future dispatch. Advance value: ${money(orderTotal(order))}.`); }} /></section>;
@@ -2335,6 +2386,12 @@ function CatalogueImportReview({ drafts, pages, confirm, cancel }: { drafts: Cat
   const duplicateCount = [...skuCounts.values()].filter((count) => count > 1).length;
   const incomplete = drafts.filter((item) => !item.sku || !item.name || !item.unitPrice || !item.image).length;
   return <section className="catalogue-page"><section className="panel"><div className="panel-head"><div><span className="overline">PDF IMPORT REVIEW</span><h2>Verify before saving</h2><p>This PDF produced {drafts.length} records across {pages} pages. Check SKU, details, price, and image before confirming.</p></div><div><button className="outline" type="button" onClick={cancel}>Cancel import</button><button className="primary" type="button" onClick={confirm}>Confirm import</button></div></div><div className="report-metrics"><div><span>Records read</span><b>{drafts.length}</b></div><div><span>Duplicate SKU warnings</span><b>{duplicateCount}</b></div><div><span>Incomplete records</span><b>{incomplete}</b></div></div>{(duplicateCount > 0 || incomplete > 0) && <div className="catalogue-notice error"><ScanText size={16}/>Review highlighted records carefully. Cancel if anything does not match the PDF.</div>}<div className="table-wrap" style={{ maxHeight: "58vh", overflow: "auto" }}><table className="records"><thead><tr><th>IMAGE</th><th>SKU</th><th>PRODUCT</th><th>OUTER QTY</th><th>INNER QTY</th><th>PRICE</th><th>CHECK</th></tr></thead><tbody>{drafts.map((item) => { const duplicate = (skuCounts.get(skuKey(item.sku)) || 0) > 1; const missing = !item.sku || !item.name || !item.unitPrice || !item.image; return <tr key={item.id} style={duplicate || missing ? { background: "#fff6dc" } : undefined}><td>{item.image ? <img src={item.image} alt={item.sku} style={{ width: 72, height: 54, objectFit: "contain", background: "#fff" }}/> : "Missing"}</td><td><b>{item.sku || "Missing SKU"}</b></td><td>{item.name || "Missing product name"}</td><td>{item.outerQty || item.cartonQty || "—"}</td><td>{item.innerQty || "—"}</td><td>{item.unitPrice ? money(item.unitPrice) : "Missing price"}</td><td>{duplicate ? "Duplicate SKU" : missing ? "Check details/image" : "Ready"}</td></tr>; })}</tbody></table></div><p className="catalogue-tip">Matching existing SKUs will be updated; only new SKUs will be added after confirmation.</p></section></section>;
+}
+function CategoriesPanel({ items, query, openCategory }: { items: CatalogueItem[]; query: string; openCategory: (category: string) => void }) {
+  const groups = [...items.reduce((map, item) => { const category = item.category?.trim() || "Uncategorised"; map.set(category, [...(map.get(category) || []), item]); return map; }, new Map<string, CatalogueItem[]>()).entries()]
+    .filter(([category, products]) => `${category} ${products.map((product) => `${product.sku} ${catalogueName(product)}`).join(" ")}`.toLowerCase().includes(query.toLowerCase()))
+    .sort(([a], [b]) => a.localeCompare(b));
+  return <section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT ORGANISATION</span><h2>Categories</h2><p>Every SKU is grouped below its category. Use the top search to find a category, SKU or product, then open it in the catalogue.</p></div><div className="catalogue-count"><b>{groups.length}</b><span>categories</span></div></div><section className="catalogue-grid">{groups.map(([category, products]) => <article className="catalogue-card" key={category}><div className="catalogue-image"><PackageCheck size={27}/><span>{products.length} SKU{products.length === 1 ? "" : "s"}</span></div><div className="catalogue-info"><small>CATEGORY</small><h3>{category}</h3><p>{products.slice(0, 4).map((product) => `${catalogueSku(product)} · ${catalogueName(product)}`).join(" · ")}{products.length > 4 ? ` +${products.length - 4} more` : ""}</p><button className="edit-product" type="button" onClick={() => openCategory(category)}>View products</button></div></article>)}{!groups.length && <div className="empty">No category or product matches your search.</div>}</section></section>;
 }
 function CataloguePanel({ items, edit, duplicate, addDrafts, setAllOpeningStock, remove, attentionOnly = false, showAll }: { items: CatalogueItem[]; edit: (item: CatalogueItem) => void; duplicate: (item: CatalogueItem) => void; addDrafts: (drafts: CatalogueItem[]) => void; setAllOpeningStock: () => void; remove: (ids: number[]) => void; attentionOnly?: boolean; showAll?: () => void }) {
   const [scanState, setScanState] = useState<"idle" | "scanning" | "ready" | "error">("idle");

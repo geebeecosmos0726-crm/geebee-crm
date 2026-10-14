@@ -1738,17 +1738,16 @@ const shareDispatchApprovalSheet = async (order: Order, whatsappWindow?: Window 
 const dispatchWhatsAppText = (order: Order) => {
   const rows = linesFor(order);
   const date = new Date().toLocaleDateString("en-GB").replaceAll("/", ".");
-  // WhatsApp applies the receiver's own font size and can wrap any table.
-  // Keep a familiar short header and make each line an independent equation:
-  // wrapping can never move a rate or amount under a different SKU.
+  // WhatsApp controls font size on the receiving phone. A short monospaced
+  // block gives the most room available while retaining one product per row.
   const itemRows = rows.map((line) => {
-    const item = (line.sku || line.product || "Item not set").toUpperCase();
-    const quantity = Number(line.quantity).toLocaleString("en-IN");
-    const rate = Number(line.unitPrice).toLocaleString("en-IN", { maximumFractionDigits: 2 });
-    const amount = Math.round(line.quantity * line.unitPrice).toLocaleString("en-IN");
-    return `*${item}*\n${quantity} × ₹${rate} = ₹${amount}`;
-  }).join("\n\n");
-  return `*GeeBee Dispatch Approval · ${order.id}*\nDate: ${date}\n*${order.client.toUpperCase()}*\n\n${itemRows}\n\n*Total: ₹${Math.round(orderTotal(order)).toLocaleString("en-IN")}*\nTransporter: ${order.transporter || "To be confirmed"}\n\nReply *APPROVED* or share changes.`;
+    const item = (line.sku || line.product || "ITEM").replace(/[^a-z0-9]/gi, "").toUpperCase();
+    const quantity = String(Number(line.quantity));
+    const rate = String(Number(line.unitPrice));
+    const amount = String(Math.round(line.quantity * line.unitPrice));
+    return `${item} ${quantity} ${rate} ${amount}`;
+  }).join("\n");
+  return `*GeeBee Dispatch Approval · ${order.id}*\nDATE - ${date}\n*${order.client.toUpperCase()}*\n\n\`\`\`\nSKU QTY RATE AMT\n${itemRows}\n\`\`\`\n\n*TOTAL ₹${Math.round(orderTotal(order)).toLocaleString("en-IN")}*\n\nReply *APPROVED* or share changes.`;
 };
 function QuotesPanel({ quotes, edit, remove, convert }: { quotes: Quote[]; edit: (quote: Quote) => void; remove: (id: string) => void; convert: (quote: Quote) => void }) {
   return <section className="panel record-panel quotes-panel"><div className="panel-head"><div><span className="overline">QUOTATION MANAGEMENT</span><h2>Customer quotations</h2><p>Build commercial offers, share them, then convert accepted quotes into orders.</p></div></div><div className="table-wrap"><table className="records"><thead><tr><th>QUOTE</th><th>CUSTOMER</th><th>PRODUCTS</th><th>TOTAL</th><th>VALIDITY</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody>{quotes.map((quote) => <tr key={quote.id}><td><b>{quote.id}</b></td><td>{quote.customer}</td><td>{quote.products.length} line{quote.products.length === 1 ? "" : "s"}</td><td><b>{money(quoteTotal(quote))}</b></td><td>{quote.validity || "—"}</td><td><Pill value={quote.status}/></td><td><div className="quote-actions"><button type="button" onClick={() => downloadQuotePdf(quote)}>PDF</button><button type="button" onClick={() => window.open(`https://wa.me/?text=${encodeURIComponent(`GeeBee quotation ${quote.id} for ${quote.customer}: ${money(quoteTotal(quote))}`)}`, "_blank")}>WhatsApp</button><button type="button" onClick={() => window.location.href = `mailto:?subject=${encodeURIComponent(`GeeBee quotation ${quote.id}`)}&body=${encodeURIComponent(`Quotation ${quote.id} for ${quote.customer}\nTotal: ${money(quoteTotal(quote))}`)}`}>Email</button>{quote.status !== "Converted" && <button className="convert-quote" type="button" onClick={() => window.confirm(`Create an order from ${quote.id}?`) && convert(quote)}>Convert to order</button>}<button className="edit-btn" type="button" onClick={() => edit(quote)}><Pencil size={14}/></button><button className="row-delete" type="button" onClick={() => window.confirm(`Remove ${quote.id}?`) && remove(quote.id)}><Trash2 size={14}/></button></div></td></tr>)}</tbody></table>{!quotes.length && <div className="empty">No quotations yet. Create one from a qualified enquiry.</div>}</div></section>;

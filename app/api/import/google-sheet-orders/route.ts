@@ -13,12 +13,30 @@ const number = (value: unknown) => Number(String(value ?? "").replace(/[,₹Rs.\
 const initials = (value: string) => value.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join("").toUpperCase() || "CU";
 const quoteRange = (title: string) => `'${title.replace(/'/g, "''")}'!A:Z`;
 
+const citySuffixes = [
+  "New Delhi", "Greater Noida", "Navi Mumbai", "Ahmedabad", "Bengaluru", "Bangalore", "Bhubaneswar", "Chandigarh", "Coimbatore", "Dehradun", "Ghaziabad", "Hyderabad", "Jabalpur", "Kharagpur", "Kolkata", "Calcutta", "Lucknow", "Ludhiana", "Mumbai", "Nagpur", "Patna", "Jaipur", "Indore", "Jammu", "Jamui", "Pune", "Ranchi", "Surat", "Vadodara", "Varanasi", "Kanpur", "Agra", "Bhopal", "Chennai", "Delhi", "Kochi", "Kota", "Meerut", "Mysore", "Noida", "Raipur", "Rajkot", "Siliguri", "Udaipur",
+].sort((a, b) => b.length - a.length);
+
 function tabDetails(title: string) {
   const parts = title.split("|").map((part) => part.trim()).filter(Boolean);
-  if (parts.length !== 3) return null;
-  const [id, client, city] = parts;
-  if (!id || !client || !city) return null;
-  return { id, client, city };
+  if (parts.length === 3) {
+    const [id, client, city] = parts;
+    return id && client && city ? { id, client, city } : null;
+  }
+  // Existing GeeBee tabs use titles such as "E-269 (OR) SHYAM BALLOON
+  // STORE, PATNA" and "E-404 SHYAM BALLOON PATNA". Read the order number
+  // first, then only infer a no-comma city when it is an unambiguous suffix.
+  const match = title.trim().match(/^([A-Za-z]+-\d+[A-Za-z0-9-]*)\s*(?:\((?:OR|ORDER)\))?\s*(.+)$/i);
+  if (!match) return null;
+  const id = match[1].trim();
+  const remainder = match[2].trim();
+  const comma = remainder.match(/^(.+?),\s*([^,]+)$/);
+  if (comma) return { id, client: comma[1].trim(), city: comma[2].trim() };
+  const city = citySuffixes.find((candidate) => new RegExp(`\\s${candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i").test(remainder));
+  if (city) return { id, client: remainder.slice(0, -city.length).trim(), city };
+  // Never guess a city from a title such as "E-412 CALCUTTA BALLOON STORE".
+  // The order is still useful and the new customer is visibly incomplete.
+  return { id, client: remainder, city: "" };
 }
 
 function findColumn(row: string[], names: string[]) {

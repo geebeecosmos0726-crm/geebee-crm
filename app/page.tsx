@@ -1256,6 +1256,7 @@ export default function Home() {
           />
         )}{" "}
         {section === "Categories" && <CategoriesPanel items={catalogue} query={search} openCategory={(category) => { setSection("Catalogue"); setSectionSearches((current) => ({ ...current, Catalogue: category })); }} />}{" "}
+        {section === "Data Transfer" && <GoogleSheetOrderFetch existingOrders={orders} existingClients={clients} addOrders={setOrders} addClients={setClients} onAudit={logActivity} />}{" "}
         {section === "Transporters" && <TransportersPanel transporters={transporters.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.area || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("transporter", item)} add={() => show("transporter")} remove={(ids) => { setTransporters((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed transporter", "Transporters", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} transporter${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
         {section === "Suppliers" && <SuppliersPanel suppliers={suppliers.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.country || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("supplier", item)} add={() => show("supplier")} remove={(ids) => { setSuppliers((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed supplier", "Suppliers", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} supplier${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
         {section === "Settings" && <TeamAccess members={members} requests={accessRequests} workspaceOwnerId={workspaceOwnerId} canManage={isAdmin} onChange={setMembers} onRequestsChange={setAccessRequests} onAudit={logActivity} auditEvents={auditEvents} />}{" "}
@@ -1917,6 +1918,35 @@ function ClientProfile({ client, orders, invoices, catalogue, auditEvents, close
     <section className="profile-section"><div className="profile-section-head"><h3>Customer timeline</h3><span>Latest activity</span></div><div className="customer-timeline">{timelineEvents.map((event) => <article key={event.id}><span className="timeline-dot"/><div><b>{event.action}</b><p>{event.actor_email} · {event.module}</p></div><time>{new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</time></article>)}{clientInvoices.slice(0, 3).map((invoice) => <article key={`invoice-${invoice.id}`}><span className="timeline-dot invoice"/><div><b>Invoice {invoice.id} is {invoice.status.toLowerCase()}</b><p>{invoice.amount} · Due {invoice.due}</p></div></article>)}{clientOrders.slice(0, 3).map((order) => <article key={`order-${order.id}`}><span className="timeline-dot order"/><div><b>Order {order.id}</b><p>{order.product} · {money(orderTotal(order))}</p></div></article>)}{!timelineEvents.length && !clientInvoices.length && !clientOrders.length && <p className="profile-empty">Activity will appear here as this customer is engaged.</p>}</div></section>
   </Shell>;
 }
+function GoogleSheetOrderFetch({ existingOrders, existingClients, addOrders, addClients, onAudit }: { existingOrders: Order[]; existingClients: Client[]; addOrders: React.Dispatch<React.SetStateAction<Order[]>>; addClients: React.Dispatch<React.SetStateAction<Client[]>>; onAudit: (action: string, module: string, details: string) => void }) {
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState("");
+  const [details, setDetails] = useState<string[]>([]);
+  const fetchOrders = async () => {
+    if (!supabase) return;
+    setLoading(true); setMessage(""); setDetails([]);
+    try {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (!token) throw new Error("Sign in again before fetching orders.");
+      const response = await fetch("/api/import/google-sheet-orders", { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Connected Sheet could not be fetched.");
+      const importedOrders = (result.orders || []) as Order[];
+      const importedClients = (result.clients || []) as Client[];
+      const knownOrders = new Set(existingOrders.map((order) => order.id.trim().toLowerCase()));
+      const knownClients = new Set(existingClients.map((client) => client.name.trim().toLowerCase()));
+      addOrders((current) => [...current, ...importedOrders.filter((order) => !knownOrders.has(order.id.trim().toLowerCase()))]);
+      addClients((current) => [...current, ...importedClients.filter((client) => !knownClients.has(client.name.trim().toLowerCase()))]);
+      onAudit("Fetched connected Google Sheet orders", "Orders", `${importedOrders.length} new order(s)`);
+      setMessage(importedOrders.length ? `${importedOrders.length} new draft order${importedOrders.length === 1 ? "" : "s"} imported from Google Sheets.` : "No new orders found. Existing order IDs were skipped.");
+      setDetails((result.skipped || []).slice(0, 12));
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Connected Sheet could not be fetched."); }
+    finally { setLoading(false); }
+  };
+  return <section className="panel transfer-panel"><div className="panel-head"><div><span className="overline">CONNECTED ORDER SHEET</span><h2>Fetch new orders from Google Sheets</h2><p>Reads tabs named <b>Order ID | Customer | City</b>. Only order IDs not already in the CRM are imported, always as Draft orders.</p></div><button className="primary" type="button" onClick={fetchOrders} disabled={loading}>{loading ? "Fetching orders…" : "Fetch new orders"}</button></div>{message && <p className="transfer-message">{message}</p>}{details.length > 0 && <div className="transfer-fields"><b>Skipped tabs</b><br/>{details.join(" · ")}</div>}</section>;
+}
+
 function DataTransferPanel({ catalogue, clients, orders, invoices, leads, quotes, tasks, transporters, setCatalogue, setClients, setOrders, setInvoices, setLeads, setQuotes, setTasks, setTransporters, onAudit, canHardDelete, hardDelete }: { catalogue: CatalogueItem[]; clients: Client[]; orders: Order[]; invoices: Invoice[]; leads: Lead[]; quotes: Quote[]; tasks: SalesTask[]; transporters: Transporter[]; setCatalogue: any; setClients: any; setOrders: any; setInvoices: any; setLeads: any; setQuotes: any; setTasks: any; setTransporters: any; onAudit: (action: string, module: string, details: string) => void; canHardDelete: boolean; hardDelete: (scope: "Customers" | "Orders" | "Approved Orders" | "Dispatch Plan", ids: string[]) => number }) {
   const [module, setModule] = useState("Products / SKUs"); const [message, setMessage] = useState(""); const inputRef = useRef<HTMLInputElement>(null); const hardDeleteInputRef = useRef<HTMLInputElement>(null); const [deleteScope, setDeleteScope] = useState<"Customers" | "Orders" | "Approved Orders" | "Dispatch Plan">("Customers");
   const configs: Record<string, { headers: string[]; rows: () => unknown[][]; example: unknown[] }> = {

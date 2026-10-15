@@ -9,7 +9,8 @@ type ImportedClient = { id: number; customerId: string; name: string; city: stri
 
 const sheetId = process.env.GOOGLE_ORDER_IMPORT_SHEET_ID;
 const key = (value: unknown) => String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
-const number = (value: unknown) => Number(String(value ?? "").replace(/[,₹Rs.\s]/gi, "")) || 0;
+// Keep the decimal separator intact: ₹6.75 must become 6.75, never 675.
+const number = (value: unknown) => Number.parseFloat(String(value ?? "").replace(/₹|rs\.?/gi, "").replace(/[\s,]/g, "")) || 0;
 const initials = (value: string) => value.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join("").toUpperCase() || "CU";
 const quoteRange = (title: string) => `'${title.replace(/'/g, "''")}'!A:Z`;
 

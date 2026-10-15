@@ -355,8 +355,47 @@ const isVisibleBackorder = (order: Order) => isBackorderRecord(order) && (/^ADV-
 const catalogueSku = (item: CatalogueItem) => item.sku?.trim() || "SKU pending";
 const catalogueName = (item: CatalogueItem) => item.name?.trim() || item.description?.trim() || (item.sku?.trim() ? `Product ${item.sku.trim()}` : "Product name pending");
 const productCategories = ["Candles", "Paper Banner", "Ribbon", "Metal & Paper stands", "Cake crown", "Crown & Tiaras", "Led candles", "Balloon pump", "Goggles /LED Goggles", "Caps", "Paper Sets /Props", "Cake topper", "Party popper", "Party items"] as const;
-const categoriseProduct = (item: Pick<CatalogueItem, "name" | "description" | "category">) => {
-  if ((productCategories as readonly string[]).includes(item.category)) return item.category;
+const categoryImages: Record<(typeof productCategories)[number], string> = {
+  "Party popper": "https://gbcosmos.com/wp-content/uploads/2026/09/Party_Poppers.png",
+  "Candles": "https://gbcosmos.com/wp-content/uploads/2026/09/candles-1.webp",
+  "Cake topper": "https://gbcosmos.com/wp-content/uploads/2026/09/Caketoppers.webp",
+  "Caps": "https://gbcosmos.com/wp-content/uploads/2026/09/caps.webp",
+  "Paper Banner": "https://gbcosmos.com/wp-content/uploads/2026/09/Paper_Banner.webp",
+  "Goggles /LED Goggles": "https://gbcosmos.com/wp-content/uploads/2026/09/Goggles-LED-Goggles.webp",
+  "Led candles": "https://gbcosmos.com/wp-content/uploads/2026/09/LED_candles.webp",
+  "Cake crown": "https://gbcosmos.com/wp-content/uploads/2026/09/cakecrown.webp",
+  "Balloon pump": "https://gbcosmos.com/wp-content/uploads/2026/09/Balloon-Pumps.webp",
+  "Metal & Paper stands": "https://gbcosmos.com/wp-content/uploads/2026/09/Metal-Paper-stands.webp",
+  "Ribbon": "https://gbcosmos.com/wp-content/uploads/2026/09/Ribbon.webp",
+  "Crown & Tiaras": "https://gbcosmos.com/wp-content/uploads/2026/09/Crown-Tiaras.webp",
+  "Paper Sets /Props": "https://gbcosmos.com/wp-content/uploads/2026/09/Papersets_props.webp",
+  "Party items": "https://gbcosmos.com/wp-content/uploads/2026/09/Party_items.webp",
+};
+// Curated from the live GeeBee public catalogue.  The key ignores spaces and
+// punctuation, so AB 621, AB-621 and AB621 resolve to the same category.
+const websiteSkuCategories = [
+  ["Party popper", "AB 30 METALLIC|AB 30-FANCY / PVC|AB 30|AB 40 METALLIC|FANCY|AB 40- FANCY / DISPLAY|AB 40|AB 50|AB 60|AB BAT POPPER"],
+  ["Candles", "AB 225|AB 226|AB 227|AB 228|AB 229|AB 230|AB 231|AB 232|AB 205|AB 213|AB 203|AB 212"],
+  ["Cake topper", "AB 612|AB 613|AB 610|AB 611|AB 601|AB 602|AB 603|AB 604|AB 605|AB 606|AB 621|AB 622"],
+  ["Caps", "AB 442|AB 449|AB 447|AB 445|AB 441|AB 448|AB 446|AB 444|AB 451|AB 450|ABC 801|AB 472"],
+  ["Paper Banner", "AB 309|AB 321|AB 302|AB 375|AB 374|AB 307|AB 376|AB 352|AB 353|AB 303|AB 314|AB 351"],
+  ["Goggles /LED Goggles", "AB 985|AB 983|AB 982|AB 984|AB 991|AB 992|AB 993|AB 994|AB 995|AB 981|AB 988"],
+  ["Led candles", "AB 852|AB 853|AB 854|AB 855|AB 861|AB 871|AB 881|AB 863|AB 873|AB 883|AB 865|AB 875"],
+  ["Cake crown", "AB 823|AB 821|AB 822"],
+  ["Balloon pump", "AB 972|AB 971|AB 973|AB 975|AB 976"],
+  ["Metal & Paper stands", "AB 945|AB 946|AB 947|AB 941|AB 944"],
+  ["Ribbon", "AB 903|AB 902|AB 901"],
+  ["Crown & Tiaras", "AB 831|AB 832|AB 833|AB 834|AB 835|AB 836|AB 837|AB 838"],
+  ["Paper Sets /Props", "AB 514|AB 552|AB 506|AB 554|AB 558|AB 510|AB 553|AB 507|AB 513|AB 509|AB 508|AB 512"],
+  ["Party items", "AB 385|AB 386|AB 387|AB 951|AB 952|AB 953|AB 954|AB 955|AB 961|AB 956|AB 957|AB 958"],
+] as const;
+const websiteCategoryBySku = new Map(websiteSkuCategories.flatMap(([category, skus]) => skus.split("|").map((sku) => [skuKey(sku), category] as const)));
+const categoriseProduct = (item: Pick<CatalogueItem, "name" | "description" | "category" | "sku">) => {
+  const officialCategory = websiteCategoryBySku.get(skuKey(item.sku || ""));
+  if (officialCategory) return officialCategory;
+  // Party items was the old import default. Re-check it from the product name
+  // so imported candles, toppers and banners do not remain in the catch-all.
+  if ((productCategories as readonly string[]).includes(item.category) && item.category !== "Party items") return item.category;
   const text = `${item.name || ""} ${item.description || ""}`.toLowerCase();
   if (/(led|electric).*(candle)|candle.*(led|electric)/.test(text)) return "Led candles";
   if (text.includes("candle")) return "Candles";
@@ -2433,7 +2472,7 @@ function CatalogueImportReview({ drafts, pages, confirm, cancel }: { drafts: Cat
 function CategoriesPanel({ items, query, openCategory }: { items: CatalogueItem[]; query: string; openCategory: (category: string) => void }) {
   const groups = productCategories.map((category) => [category, items.filter((item) => categoriseProduct(item) === category)] as const)
     .filter(([category, products]) => `${category} ${products.map((product) => `${product.sku} ${catalogueName(product)}`).join(" ")}`.toLowerCase().includes(query.toLowerCase()));
-  return <section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT ORGANISATION</span><h2>Categories</h2><p>Every SKU is grouped below its category. Use the top search to find a category, SKU or product, then open it in the catalogue.</p></div><div className="catalogue-count"><b>{groups.length}</b><span>categories</span></div></div><section className="catalogue-grid">{groups.map(([category, products]) => <article className="catalogue-card" key={category}><div className="catalogue-image"><PackageCheck size={27}/><span>{products.length} SKU{products.length === 1 ? "" : "s"}</span></div><div className="catalogue-info"><small>CATEGORY</small><h3>{category}</h3><p>{products.slice(0, 4).map((product) => `${catalogueSku(product)} · ${catalogueName(product)}`).join(" · ")}{products.length > 4 ? ` +${products.length - 4} more` : ""}</p><button className="edit-product" type="button" onClick={() => openCategory(category)}>View products</button></div></article>)}{!groups.length && <div className="empty">No category or product matches your search.</div>}</section></section>;
+  return <section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT ORGANISATION</span><h2>Categories</h2><p>Categories and covers are aligned with the live GeeBee website. Every SKU is grouped below its category; search by category, SKU or product, then open it in the catalogue.</p></div><div className="catalogue-count"><b>{groups.length}</b><span>categories</span></div></div><section className="catalogue-grid">{groups.map(([category, products]) => <article className="catalogue-card category-card" key={category}><div className="catalogue-image">{categoryImages[category] ? <img src={categoryImages[category]} alt={`${category} category`} /> : <PackageCheck size={27}/>}<span>{products.length} SKU{products.length === 1 ? "" : "s"}</span></div><div className="catalogue-info"><small>CATEGORY</small><h3>{category}</h3><p>{products.slice(0, 4).map((product) => `${catalogueSku(product)} · ${catalogueName(product)}`).join(" · ")}{products.length > 4 ? ` +${products.length - 4} more` : ""}</p><button className="edit-product" type="button" onClick={() => openCategory(category)}>View products</button></div></article>)}{!groups.length && <div className="empty">No category or product matches your search.</div>}</section></section>;
 }
 function CataloguePanel({ items, edit, duplicate, addDrafts, setAllOpeningStock, remove, attentionOnly = false, showAll }: { items: CatalogueItem[]; edit: (item: CatalogueItem) => void; duplicate: (item: CatalogueItem) => void; addDrafts: (drafts: CatalogueItem[]) => void; setAllOpeningStock: () => void; remove: (ids: number[]) => void; attentionOnly?: boolean; showAll?: () => void }) {
   const [scanState, setScanState] = useState<"idle" | "scanning" | "ready" | "error">("idle");

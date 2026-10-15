@@ -1650,9 +1650,6 @@ function OrderTable({
             <th>CLIENT</th>
             {!compact && (
               <>
-                <th>PRODUCT</th>
-                <th>QTY</th>
-                <th>UNIT PRICE</th>
                 <th>REMARKS</th>
               </>
             )}
@@ -1681,11 +1678,6 @@ function OrderTable({
               </td>
               {!compact && (
                 <>
-                  <td>
-                    <b>{o.product}{o.products && o.products.length > 1 ? ` +${o.products.length - 1}` : ""}</b>
-                  </td>
-                  <td>{orderQuantity(o).toLocaleString("en-IN")}</td>
-                  <td>{money(o.unitPrice)}</td>
                   <td>{o.remarks || "—"}</td>
                 </>
               )}

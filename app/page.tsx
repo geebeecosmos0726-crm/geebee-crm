@@ -747,6 +747,15 @@ export default function Home() {
   const search = sectionSearches[section] || "";
   const setSearch = (value: string) => setSectionSearches((current) => ({ ...current, [section]: value }));
   const recordSnapshots = useRef<Record<string, Map<string, string>>>({});
+  // Customer records are business-critical.  They may only be removed from
+  // the cloud after an explicit delete action, never because a browser has
+  // briefly loaded an empty/stale client array while a Sheet import is running.
+  const explicitCloudDeletes = useRef<Record<string, Set<string>>>({});
+  const markForCloudDeletion = (table: string, ids: Array<string | number>) => {
+    const marked = explicitCloudDeletes.current[table] || new Set<string>();
+    ids.forEach((id) => marked.add(String(id)));
+    explicitCloudDeletes.current[table] = marked;
+  };
   const sheetSyncTimer = useRef<number | null>(null);
   const categoryMigrationCompleted = useRef(false);
   const flash = (m: string) => {
@@ -906,8 +915,14 @@ export default function Home() {
         const next = new Map(items.map((item) => [String(item.id), JSON.stringify(item)]));
         const changed = items.filter((item) => previous.get(String(item.id)) !== JSON.stringify(item)).map((item) => ({ workspace_owner_id: workspaceOwnerId, record_id: String(item.id), search_key: search(item).toLowerCase(), data: item, updated_at: new Date().toISOString() }));
         const removed = [...previous.keys()].filter((id) => !next.has(id));
+        // Clients use an explicit-delete ledger.  This avoids a transient
+        // empty React state ever being treated as an instruction to erase the
+        // entire customer master from Supabase.
+        const safeRemoved = table === "crm_clients"
+          ? removed.filter((id) => explicitCloudDeletes.current.crm_clients?.has(id))
+          : removed;
         if (changed.length) { const { error } = await cloud.from(table).upsert(changed, { onConflict: "workspace_owner_id,record_id" }); if (error) { setCloudError("A change could not be saved to the cloud. Your local copy is still safe."); return; } }
-        if (removed.length) { const { error } = await cloud.from(table).delete().eq("workspace_owner_id", workspaceOwnerId).in("record_id", removed); if (error) { setCloudError("A deleted record could not be synced to the cloud."); return; } }
+        if (safeRemoved.length) { const { error } = await cloud.from(table).delete().eq("workspace_owner_id", workspaceOwnerId).in("record_id", safeRemoved); if (error) { setCloudError("A deleted record could not be synced to the cloud."); return; } if (table === "crm_clients") safeRemoved.forEach((id) => explicitCloudDeletes.current.crm_clients?.delete(id)); }
         recordSnapshots.current[table] = next;
       }
     }, 650);
@@ -1261,7 +1276,7 @@ export default function Home() {
             edit={(c) => show("client", c)}
             view={(c) => setClientProfile(c)}
             importCustomers={async (file) => { if (!file) return; try { const rows = await readCsv(file); const now = Date.now(); const incoming = rows.filter((row) => row["business name"]).map((row, index) => ({ id: now + index, customerId: row["customer id"] || `GB-C${now + index}`, name: row["business name"], city: row.city || "", phone: row.phone || "", contact: row["contact person"] || "", credit: row["payment threshold"] || "", paymentTerms: row["payment terms"] || "", customerStatus: row.status || "Active", avatar: initials(row["business name"]), specialRates: [] } as Client)); setClients((current) => { const incomingByName = new Map(incoming.map((client) => [client.name.toLowerCase(), client])); const existing = new Set(current.map((client) => client.name.toLowerCase())); return [...current.map((client) => incomingByName.has(client.name.toLowerCase()) ? { ...client, ...incomingByName.get(client.name.toLowerCase())!, id: client.id } : client), ...incoming.filter((client) => !existing.has(client.name.toLowerCase()))]; }); logActivity("Imported customer sheet", "Customers", `${incoming.length} customer row(s)`); flash(`${incoming.length} customer row${incoming.length === 1 ? "" : "s"} imported.`); } catch { flash("Customer import failed. Use the downloaded CSV template and keep the column headings unchanged."); } }}
-            remove={(ids) => { setClients((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed client", "Clients", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} client${ids.length === 1 ? "" : "s"} removed`); }}
+            remove={(ids) => { markForCloudDeletion("crm_clients", ids); setClients((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed client", "Clients", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} client${ids.length === 1 ? "" : "s"} removed`); }}
           />
         )}{" "}
         {["Leads", "Lost Leads"].includes(section) && <LeadsPanel leads={leads.filter((lead) => section === "Lost Leads" ? lead.status === "Lost" : lead.status !== "Lost").filter((lead) => `${lead.id} ${lead.company} ${lead.contact} ${lead.city}`.toLowerCase().includes(search.toLowerCase()))} edit={(lead) => show("lead", lead)} updateStage={updateLeadStage} remove={(id) => { setLeads((current) => current.filter((lead) => lead.id !== id)); logActivity("Removed enquiry", "Enquiries", id); syncGoogleSheetAfterDelete(); flash("Enquiry removed"); }} />}{" "}
@@ -1300,7 +1315,7 @@ export default function Home() {
         {section === "Suppliers" && <SuppliersPanel suppliers={suppliers.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.country || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("supplier", item)} add={() => show("supplier")} remove={(ids) => { setSuppliers((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed supplier", "Suppliers", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} supplier${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
         {section === "Settings" && <TeamAccess members={members} requests={accessRequests} workspaceOwnerId={workspaceOwnerId} canManage={isAdmin} onChange={setMembers} onRequestsChange={setAccessRequests} onAudit={logActivity} auditEvents={auditEvents} />}{" "}
         {section === "Data Transfer" && <DataTransferPanel catalogue={catalogue} clients={clients} orders={orders} invoices={invoices} leads={leads} quotes={quotes} tasks={tasks} transporters={transporters} setCatalogue={setCatalogue} setClients={setClients} setOrders={setOrders} setInvoices={setInvoices} setLeads={setLeads} setQuotes={setQuotes} setTasks={setTasks} setTransporters={setTransporters} onAudit={logActivity} canHardDelete={isAdmin} hardDelete={(scope, ids) => { const wanted = new Set(ids.map((id) => id.trim().toLowerCase()).filter(Boolean)); if (!wanted.size) return 0; if (scope === "Customers") { const removed = clients.filter((client) => wanted.has((client.customerId || "").toLowerCase()) || wanted.has(client.name.toLowerCase())); setClients((current) => current.filter((client) => !removed.some((item) => item.id === client.id))); logActivity("Hard deleted customers from sheet", "Import / Export", removed.map((item) => item.name).join(", ")); return removed.length; } const stage = scope === "Orders" ? "Draft" : scope === "Approved Orders" ? "Confirmed" : "Dispatch plan"; const targetIds = orders.filter((order) => order.status === stage && wanted.has(order.id.toLowerCase())).map((order) => order.id); if (!targetIds.length) return 0; removeOrders(targetIds); logActivity("Hard deleted orders from sheet", "Import / Export", `${scope}: ${targetIds.join(", ")}`); return targetIds.length; }} />}{" "}
-        {section === "Recovery" && <RecoveryPanel canManage={isAdmin} session={session} clearBusinessData={() => { setOrders([]); setClients([]); setInvoices([]); setLeads([]); setQuotes([]); setTasks([]); setTransporters([]); setPurchases([]); recordSnapshots.current = {}; flash("Business records have been permanently cleared. SKU catalogue was preserved."); }} applyRestore={(data) => { setOrders(data.orders); setClients(data.clients); setInvoices(data.invoices); setCatalogue(data.catalogue); setLeads(data.leads); setQuotes(data.quotes); setTasks(data.tasks); setTransporters(data.transporters || []); logActivity("Applied Google Sheets recovery", "Data recovery", "Recovery snapshot created before restore"); flash("Backup restored. Your previous CRM state is saved as a recovery snapshot."); }} />}{" "}
+        {section === "Recovery" && <RecoveryPanel canManage={isAdmin} session={session} clearBusinessData={() => { markForCloudDeletion("crm_clients", clients.map((client) => client.id)); setOrders([]); setClients([]); setInvoices([]); setLeads([]); setQuotes([]); setTasks([]); setTransporters([]); setPurchases([]); recordSnapshots.current = {}; flash("Business records have been permanently cleared. SKU catalogue was preserved."); }} applyRestore={(data) => { setOrders(data.orders); setClients(data.clients); setInvoices(data.invoices); setCatalogue(data.catalogue); setLeads(data.leads); setQuotes(data.quotes); setTasks(data.tasks); setTransporters(data.transporters || []); logActivity("Applied Google Sheets recovery", "Data recovery", "Recovery snapshot created before restore"); flash("Backup restored. Your previous CRM state is saved as a recovery snapshot."); }} />}{" "}
         {section === "Purchase Orders" && <PurchaseOrdersPanel purchases={purchases.filter((purchase) => `${purchase.id} ${purchase.supplier} ${purchase.lines.map((line) => `${line.sku} ${line.product}`).join(" ")}`.toLowerCase().includes(search.toLowerCase()))} catalogue={catalogue} lowStockProducts={lowStockProducts} add={(product) => show("purchase", product ? { lines: [{ sku: product.sku, product: catalogueName(product), quantity: Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)), receivedQuantity: 0 }], supplier: product.supplier || "" } : null)} edit={(purchase) => show("purchase", purchase)} receive={receivePurchase} cancel={(purchase) => { if (!window.confirm(`Cancel purchase order ${purchase.id}? No stock will be changed.`)) return; setPurchases((current) => current.map((item) => item.id === purchase.id ? { ...item, status: "Cancelled" } : item)); logActivity("Cancelled purchase order", "Purchase Orders", purchase.id); flash("Purchase order cancelled."); }} remove={(purchase) => { if (!window.confirm(`Permanently delete ${purchase.id}? This does not change stock.`)) return; setPurchases((current) => current.filter((item) => item.id !== purchase.id)); logActivity("Deleted purchase order", "Purchase Orders", purchase.id); syncGoogleSheetAfterDelete(); flash("Purchase order permanently deleted."); }} />} {" "}
         {section === "Notifications" && <AutomationPanel />}{" "}
         {!(["Overview", "Orders", "Confirmed Orders", "Dispatch Plan", "Clients", "Leads", "Enquiries", "Follow-ups", "Lost Leads", "Quotations", "Backorders", "Invoices", "Catalogue", "Transporters", "Suppliers", "Purchase Orders", "Settings", "Recovery", "Data Transfer", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report"].includes(section)) && (
@@ -1953,6 +1968,7 @@ function GoogleSheetOrderFetch({ existingOrders, existingClients, addOrders, add
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [details, setDetails] = useState<string[]>([]);
+  const customerKey = (value: string) => value.toLowerCase().replace(/\bco\.?\b/g, "company").replace(/[^a-z0-9]/g, "");
   const fetchOrders = async () => {
     if (!supabase) return;
     setLoading(true); setMessage(""); setDetails([]);
@@ -1965,12 +1981,19 @@ function GoogleSheetOrderFetch({ existingOrders, existingClients, addOrders, add
       if (!response.ok) throw new Error(result.error || "Connected Sheet could not be fetched.");
       const importedOrders = (result.orders || []) as Order[];
       const importedClients = (result.clients || []) as Client[];
-      const knownOrders = new Set(existingOrders.map((order) => order.id.trim().toLowerCase()));
-      const knownClients = new Set(existingClients.map((client) => client.name.trim().toLowerCase()));
-      addOrders((current) => [...current, ...importedOrders.filter((order) => !knownOrders.has(order.id.trim().toLowerCase()))]);
-      addClients((current) => [...current, ...importedClients.filter((client) => !knownClients.has(client.name.trim().toLowerCase()))]);
+      // Use the live state inside each setter.  Props can be a moment behind
+      // after a cloud refresh, and customer master data must always merge —
+      // never be replaced — when Sheet orders are fetched.
+      addOrders((current) => {
+        const known = new Set(current.map((order) => order.id.trim().toLowerCase()));
+        return [...current, ...importedOrders.filter((order) => !known.has(order.id.trim().toLowerCase()))];
+      });
+      addClients((current) => {
+        const known = new Set(current.map((client) => customerKey(client.name.trim())));
+        return [...current, ...importedClients.filter((client) => !known.has(customerKey(client.name.trim())))];
+      });
       onAudit("Fetched connected Google Sheet orders", "Orders", `${importedOrders.length} new order(s)`);
-      setMessage(importedOrders.length ? `${importedOrders.length} new draft order${importedOrders.length === 1 ? "" : "s"} imported from Google Sheets.` : "No new orders found. Existing order IDs were skipped.");
+      setMessage(importedOrders.length ? `${importedOrders.length} new draft order${importedOrders.length === 1 ? "" : "s"} imported from Google Sheets. Your existing customer list was retained.` : "No new orders found. Existing order IDs were skipped; your customer list was unchanged.");
       setDetails((result.skipped || []).slice(0, 12));
     } catch (error) { setMessage(error instanceof Error ? error.message : "Connected Sheet could not be fetched."); }
     finally { setLoading(false); }

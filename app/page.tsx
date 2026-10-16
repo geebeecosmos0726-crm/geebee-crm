@@ -2334,10 +2334,10 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     if (i !== index) return item;
     const updated = { ...item, [key]: value };
     if (key !== "sku" && key !== "product") return updated;
-    const catalogueProduct = catalogue.find((product) => key === "sku" ? skuKey(product.sku) === skuKey(String(value)) : `${catalogueName(product)} · ${product.sku}`.toLowerCase() === String(value).trim().toLowerCase() || catalogueName(product).trim().toLowerCase() === String(value).trim().toLowerCase());
+    const catalogueProduct = catalogue.find((product) => key === "sku" ? skuKey(product.sku) === skuKey(String(value)) : [`${product.sku} · ${catalogueName(product)}`, `${catalogueName(product)} · ${product.sku}`, catalogueName(product)].some((label) => label.toLowerCase() === String(value).trim().toLowerCase()));
     const selectedSku = catalogueProduct?.sku || (key === "sku" ? String(value) : updated.sku);
     const rate = specialRate(f.client, selectedSku) ?? catalogueProduct?.unitPrice;
-    return { ...updated, sku: selectedSku, product: catalogueProduct ? `${catalogueName(catalogueProduct)} · ${catalogueProduct.sku}` : updated.product, unitPrice: rate ?? updated.unitPrice, review: catalogueProduct ? { ...updated.review, product: false } : updated.review };
+    return { ...updated, sku: selectedSku, product: catalogueProduct ? `${catalogueProduct.sku} · ${catalogueName(catalogueProduct)}` : updated.product, unitPrice: rate ?? updated.unitPrice, review: catalogueProduct ? { ...updated.review, product: false } : updated.review };
   }));
   const selectClient = (name: string) => { const client = clients.find((item) => item.name === name); setF({ ...f, client: name, city: client?.city || "", avatar: client?.avatar || initials(name) }); setProducts((current) => current.map((item) => ({ ...item, unitPrice: specialRate(name, item.sku) ?? item.unitPrice }))); };
   useEffect(() => {
@@ -2379,7 +2379,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
   }, [catalogue, clients, transporters]);
   useEffect(() => {
     const list = document.createElement("datalist"); list.id = "order-product-search";
-    catalogue.forEach((product) => { const option = document.createElement("option"); option.value = `${catalogueName(product)} · ${product.sku}`; option.label = money(specialRate(f.client, product.sku) ?? product.unitPrice); list.append(option); });
+    catalogue.forEach((product) => { const option = document.createElement("option"); option.value = `${product.sku} · ${catalogueName(product)}`; option.label = money(specialRate(f.client, product.sku) ?? product.unitPrice); list.append(option); });
     document.body.append(list);
     const productInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="Product name"]'));
     const skuInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="SKU ID"]'));
@@ -2395,7 +2395,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
       const button = document.createElement("button"); button.type = "button"; button.className = "new-product-option";
       const refresh = () => {
         const line = products[index]; const typed = line?.product.trim() || "";
-        const matched = typed && catalogue.some((product) => `${catalogueName(product)} · ${product.sku}`.toLowerCase() === typed.toLowerCase() || catalogueName(product).toLowerCase() === typed.toLowerCase());
+        const matched = typed && catalogue.some((product) => [`${product.sku} · ${catalogueName(product)}`, `${catalogueName(product)} · ${product.sku}`, catalogueName(product)].some((label) => label.toLowerCase() === typed.toLowerCase()));
         button.textContent = matched ? "Selected from catalogue" : typed ? `Create “${typed}” as new product` : "+ Create new product";
         button.disabled = Boolean(matched);
       };
@@ -2450,7 +2450,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
           // rate taking priority when one exists.
           const unitPrice = catalogueMatch ? specialRate(clientName || f.client, catalogueMatch.sku) ?? catalogueMatch.unitPrice : 0;
           return {
-            product: catalogueMatch ? `${catalogueName(catalogueMatch)} · ${catalogueMatch.sku}` : "",
+            product: catalogueMatch ? `${catalogueMatch.sku} · ${catalogueName(catalogueMatch)}` : "",
             sku: catalogueMatch?.sku || line.sku,
             quantity: line.quantity || 0,
             unitPrice,
@@ -2469,7 +2469,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
       if (!sku || !quantity) throw new Error("This image did not contain a readable order row. Please use a sharp screenshot of the item, quantity and price columns.");
       const name = text.match(/(?:product|description|item)\s*[:#-]?\s*([A-Za-z][A-Za-z0-9 /&.-]{2,50})/i)?.[1]?.trim() || file.name.replace(/\.[^.]+$/, "").replaceAll(/[-_]/g, " ");
       const catalogueMatch = catalogue.find((item) => item.sku.replaceAll("-", "").toLowerCase() === sku.replaceAll("-", "").toLowerCase());
-      const importedLine = { product: catalogueMatch?.name || name, sku: catalogueMatch?.sku || sku, quantity, unitPrice: catalogueMatch ? specialRate(matchedClient?.name || f.client, catalogueMatch.sku) ?? catalogueMatch.unitPrice : 0, review: { product: !catalogueMatch, price: !catalogueMatch } };
+      const importedLine = { product: catalogueMatch ? `${catalogueMatch.sku} · ${catalogueName(catalogueMatch)}` : name, sku: catalogueMatch?.sku || sku, quantity, unitPrice: catalogueMatch ? specialRate(matchedClient?.name || f.client, catalogueMatch.sku) ?? catalogueMatch.unitPrice : 0, review: { product: !catalogueMatch, price: !catalogueMatch } };
       setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), importedLine] : [importedLine]);
       setScanState("ready"); setScanNote(catalogueMatch ? `Matched ${catalogueMatch.sku} from your catalogue. Please confirm quantity.` : "Details were extracted. Please check the fields below before saving.");
     } catch { setScanState("error"); setScanNote("We could not read this image. You can still enter the order manually."); }

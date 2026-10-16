@@ -6,6 +6,7 @@ export const runtime = "nodejs";
 type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number };
 type ImportedOrder = { id: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string };
 type ImportedClient = { id: number; customerId: string; name: string; city: string; contact: string; phone: string; credit: string; customerStatus: string; avatar: string; specialRates: [] };
+type CustomerIdentity = { name: string; city: string };
 
 const sheetId = process.env.GOOGLE_ORDER_IMPORT_SHEET_ID;
 const key = (value: unknown) => String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -17,6 +18,47 @@ const quoteRange = (title: string) => `'${title.replace(/'/g, "''")}'!A:Z`;
 const citySuffixes = [
   "New Delhi", "Greater Noida", "Navi Mumbai", "Ahmedabad", "Bengaluru", "Bangalore", "Bhubaneswar", "Chandigarh", "Coimbatore", "Dehradun", "Ghaziabad", "Hyderabad", "Jabalpur", "Kharagpur", "Kolkata", "Calcutta", "Lucknow", "Ludhiana", "Mumbai", "Nagpur", "Patna", "Jaipur", "Indore", "Jammu", "Jamui", "Pune", "Ranchi", "Surat", "Vadodara", "Varanasi", "Kanpur", "Agra", "Bhopal", "Chennai", "Delhi", "Kochi", "Kota", "Meerut", "Mysore", "Noida", "Raipur", "Rajkot", "Siliguri", "Udaipur",
 ].sort((a, b) => b.length - a.length);
+
+const customerNoiseWords = new Set(["m", "ms", "messrs", "the", "and"]);
+const customerWordVariants: Record<string, string> = {
+  enterprises: "enterprise", traders: "trader", stores: "store", agencies: "agency", distributors: "distributor", suppliers: "supplier", brothers: "brother",
+};
+const customerTokens = (value: string, city = "") => {
+  const cityTokens = new Set(city.toLowerCase().replace(/[^a-z0-9]+/g, " ").split(/\s+/).filter(Boolean));
+  return value.toLowerCase().replace(/m\/?s\.?|m\/s\.?|messrs?\.?/g, " ").replace(/[^a-z0-9]+/g, " ").split(/\s+/).filter(Boolean)
+    .map((word) => customerWordVariants[word] || word)
+    .filter((word) => !customerNoiseWords.has(word) && !cityTokens.has(word));
+};
+const setOverlap = (left: string[], right: string[]) => left.filter((word) => right.includes(word)).length;
+
+// Match only when the relationship is clear. This deliberately does not use a
+// loose fuzzy match: two distinct businesses can share words like "trader" or
+// "store", and creating a new customer is safer than attaching an order to one.
+function bestCustomerMatch(incomingName: string, incomingCity: string, customers: CustomerIdentity[]) {
+  const incoming = customerTokens(incomingName, incomingCity);
+  const compactIncoming = incoming.join("");
+  if (!compactIncoming) return null;
+  const candidates = customers.map((customer) => {
+    const words = customerTokens(customer.name, customer.city || incomingCity);
+    const compact = words.join("");
+    const overlap = setOverlap(incoming, words);
+    const shorter = Math.min(incoming.length, words.length);
+    const longer = Math.max(incoming.length, words.length);
+    const cityMatch = Boolean(incomingCity && customer.city && key(incomingCity) === key(customer.city));
+    let score = 0;
+    if (compact && compact === compactIncoming) score = 1;
+    else if (shorter >= 2 && overlap === shorter) score = 0.94; // one or more harmless extra words
+    else if (shorter >= 2 && overlap / longer >= 0.8) score = 0.9;
+    else if (shorter >= 3 && overlap / longer >= 0.75) score = 0.84;
+    if (cityMatch) score += 0.01;
+    return { customer, score };
+  }).filter((candidate) => candidate.score > 0).sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+  const runnerUp = candidates[1];
+  // A near-tie can mean two similarly named businesses. Do not guess.
+  if (!best || best.score < 0.9 || (runnerUp && best.score - runnerUp.score < 0.04)) return null;
+  return best.customer;
+}
 
 function tabDetails(title: string) {
   const parts = title.split("|").map((part) => part.trim()).filter(Boolean);
@@ -98,10 +140,11 @@ export async function POST(request: Request) {
     ]);
     if (ordersError || clientsError || productsError) throw ordersError || clientsError || productsError;
     const knownOrderIds = new Set((existingOrders || []).map((row) => key(row.record_id)));
-    const knownClients = new Set((existingClients || []).map((row: any) => key(row.data?.name)));
+    const knownCustomers: CustomerIdentity[] = (existingClients || []).map((row: any) => ({ name: String(row.data?.name || "").trim(), city: String(row.data?.city || "").trim() })).filter((customer) => customer.name);
     const productMap = new Map((catalogue || []).map((row: any) => [key(row.data?.sku), row.data as { name?: string }]));
     const imported: ImportedOrder[] = [];
     const createdClients: ImportedClient[] = [];
+    const reusedCustomers: string[] = [];
     const skipped: string[] = [];
     for (const sheet of metadata.data.sheets || []) {
       const title = sheet.properties?.title || "";
@@ -112,12 +155,17 @@ export async function POST(request: Request) {
       const lines = readLines((result.data.values || []) as unknown[][], productMap);
       if (!lines.length) { skipped.push(`${details.id}: no ITEM and QUANTITY rows found`); continue; }
       const first = lines[0];
-      imported.push({ id: details.id, client: details.client, city: details.city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(details.client), remarks: "Imported from connected Google Sheet" });
+      const matchedCustomer = bestCustomerMatch(details.client, details.city, knownCustomers);
+      const client = matchedCustomer?.name || details.client;
+      const city = details.city || matchedCustomer?.city || "";
+      imported.push({ id: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "Imported from connected Google Sheet" });
       knownOrderIds.add(key(details.id));
-      if (!knownClients.has(key(details.client))) {
+      if (matchedCustomer) {
+        reusedCustomers.push(`${details.id}: ${details.client} → ${matchedCustomer.name}`);
+      } else {
         const id = Date.now() + createdClients.length;
-        createdClients.push({ id, customerId: `GB-C${String(id).slice(-7)}`, name: details.client, city: details.city, contact: "", phone: "", credit: "", customerStatus: "Incomplete profile", avatar: initials(details.client), specialRates: [] });
-        knownClients.add(key(details.client));
+        createdClients.push({ id, customerId: `GB-C${String(id).slice(-7)}`, name: client, city, contact: "", phone: "", credit: "", customerStatus: "Incomplete profile", avatar: initials(client), specialRates: [] });
+        knownCustomers.push({ name: client, city });
       }
     }
     if (imported.length) {
@@ -128,9 +176,9 @@ export async function POST(request: Request) {
         const { error: clientInsertError } = await db.from("crm_clients").insert(createdClients.map((client) => ({ workspace_owner_id: ownerId, record_id: String(client.id), search_key: `${client.customerId} ${client.name} ${client.city}`.toLowerCase(), data: client, created_at: now, updated_at: now })));
         if (clientInsertError) throw clientInsertError;
       }
-      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched connected Google Sheet orders", module: "Orders", details: `${imported.length} new order(s) imported; ${skipped.length} tab(s) skipped` });
+      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched connected Google Sheet orders", module: "Orders", details: `${imported.length} new order(s) imported; ${createdClients.length} new customer(s); ${reusedCustomers.length} customer match(es); ${skipped.length} tab(s) skipped` });
     }
-    return Response.json({ orders: imported, clients: createdClients, skipped, scanned: metadata.data.sheets?.length || 0 });
+    return Response.json({ orders: imported, clients: createdClients, reusedCustomers, skipped, scanned: metadata.data.sheets?.length || 0 });
   } catch (error) {
     console.error("Google order import failed:", error instanceof Error ? error.message : error);
     return Response.json({ error: error instanceof Error ? error.message : "Could not fetch the connected Google Sheet." }, { status: 400 });

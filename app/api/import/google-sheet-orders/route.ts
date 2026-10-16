@@ -21,7 +21,7 @@ const citySuffixes = [
 
 const customerNoiseWords = new Set(["m", "ms", "messrs", "the", "and"]);
 const customerWordVariants: Record<string, string> = {
-  enterprises: "enterprise", traders: "trader", stores: "store", agencies: "agency", distributors: "distributor", suppliers: "supplier", brothers: "brother",
+  co: "company", company: "company", enterprises: "enterprise", traders: "trader", stores: "store", agencies: "agency", distributors: "distributor", suppliers: "supplier", brothers: "brother",
 };
 const customerTokens = (value: string, city = "") => {
   const cityTokens = new Set(city.toLowerCase().replace(/[^a-z0-9]+/g, " ").split(/\s+/).filter(Boolean));

@@ -669,6 +669,9 @@ function AuthLayout({ children }: { children: ReactNode }) {
     <section className="auth-panel"><div className="auth-card">{children}</div></section>
   </main>;
 }
+function GoogleMark() {
+  return <svg className="google-mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M21.8 12.23c0-.72-.06-1.24-.2-1.79H12v3.66h5.64c-.11.91-.72 2.28-2.08 3.2l-.02.12 3.02 2.34.21.02c1.93-1.78 3.03-4.4 3.03-7.55Z"/><path fill="#34A853" d="M12 22c2.76 0 5.08-.91 6.77-2.47l-3.22-2.49c-.86.6-2.01 1.02-3.55 1.02-2.7 0-5-1.78-5.82-4.24l-.11.01-3.14 2.43-.04.11A10.23 10.23 0 0 0 12 22Z"/><path fill="#FBBC05" d="M6.18 13.82A6.15 6.15 0 0 1 5.85 12c0-.64.12-1.27.32-1.82v-.13L2.99 7.6l-.1.05A10.22 10.22 0 0 0 1.8 12c0 1.55.37 3.02 1.09 4.35l3.29-2.53Z"/><path fill="#EA4335" d="M12 5.94c1.94 0 3.25.84 4 1.55l2.92-2.85C17.07 2.92 14.76 2 12 2a10.23 10.23 0 0 0-9.11 5.65l3.29 2.53C7 7.72 9.3 5.94 12 5.94Z"/></svg>;
+}
 function SignInScreen({ notice = "" }: { notice?: string }) {
   const [email, setEmail] = useState("vishu108818@gmail.com");
   const [mode, setMode] = useState<"signin" | "signup">("signin");
@@ -708,7 +711,7 @@ function SignInScreen({ notice = "" }: { notice?: string }) {
     <h1>{mode === "signin" ? "Welcome back!" : "Create your account"}</h1>
     <p>{mode === "signin" ? "Sign in to your GeeBee operations workspace." : "Your administrator will approve workspace access after sign-up."}</p>
     <div className="auth-tabs"><button className={mode === "signin" ? "active" : ""} type="button" onClick={() => { setMode("signin"); setMessage(""); }}>Sign in</button><button className={mode === "signup" ? "active" : ""} type="button" onClick={() => { setMode("signup"); setMessage(""); }}>Sign up</button></div>
-    <button className="google-auth" type="button" disabled={sending} onClick={signInWithGoogle}><span>G</span>Continue with Google</button>
+    <button className="google-auth" type="button" disabled={sending} onClick={signInWithGoogle}><GoogleMark/>Continue with Google</button>
     <div className="auth-divider"><i/>or use email<i/></div>
     {mode === "signup" && <><label>Full name<input value={fullName} onChange={(event) => setFullName(event.target.value)} placeholder="Your full name" autoComplete="name"/></label><label>Phone number<input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+91 98765 43210" autoComplete="tel"/></label></>}
     <label>Work email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} onKeyDown={(event) => event.key === "Enter" && sendMagicLink()} placeholder="you@company.com" autoComplete="email"/></label>
@@ -718,19 +721,8 @@ function SignInScreen({ notice = "" }: { notice?: string }) {
   </AuthLayout>;
 }
 function SharedAccessScreen({ notice = "" }: { notice?: string }) {
-  const [passcode, setPasscode] = useState("");
   const [message, setMessage] = useState(notice);
   const [loading, setLoading] = useState(false);
-  const enter = async () => {
-    if (!passcode.trim() || loading) return;
-    setLoading(true); setMessage("");
-    try {
-      const response = await fetch("/api/auth/shared-access", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ passcode }) });
-      const result = await response.json() as { url?: string; error?: string };
-      if (!response.ok || !result.url) throw new Error(result.error || "Shared access could not be opened.");
-      window.location.assign(result.url);
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Shared access could not be opened."); setLoading(false); }
-  };
   const signInWithGoogle = async () => {
     if (!supabase || loading) return;
     setLoading(true); setMessage("");
@@ -740,13 +732,10 @@ function SharedAccessScreen({ notice = "" }: { notice?: string }) {
   return <AuthLayout>
     <span className="overline">GEEBEE CRM</span>
     <h1>Welcome back!</h1>
-    <p>Sign in with your authorised Google account or the shared internal passcode.</p>
-    <button className="google-auth" type="button" disabled={loading} onClick={signInWithGoogle}><span>G</span>Continue with Google</button>
-    <div className="auth-divider"><i/>or use passcode<i/></div>
-    <label>Shared passcode<input type="password" value={passcode} onChange={(event) => setPasscode(event.target.value)} onKeyDown={(event) => event.key === "Enter" && enter()} placeholder="Enter passcode" autoFocus/></label>
-    <button className="primary auth-submit" type="button" disabled={loading || !passcode.trim()} onClick={enter}>{loading ? "Opening workspace…" : "Open CRM"}</button>
+    <p>Use your authorised GeeBee Google account to securely enter the workspace.</p>
+    <button className="google-auth" type="button" disabled={loading} onClick={signInWithGoogle}><GoogleMark/>Continue with Google</button>
     {message && <div className="auth-message warning">{message}</div>}
-    <small>Do not share the internal passcode outside GeeBee.</small>
+    <small>Your account must be approved by a GeeBee administrator.</small>
   </AuthLayout>;
 }
 export default function Home() {

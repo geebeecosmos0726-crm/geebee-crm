@@ -19,3 +19,19 @@ header{position:sticky;top:0;z-index:5;background:rgba(248,246,244,.92);backdrop
 .product-lines{background:#fffdfc!important}.line-heading{padding-bottom:7px;border-bottom:1px solid #f0e8e5}.product-line:last-of-type{border-bottom:0}
 @media(max-width:1100px){.content{padding-right:26px!important;padding-left:26px!important}}
 @media(max-width:760px){.content{padding-left:16px!important;padding-right:16px!important}header{background:#f8f6f4!important}.page-head{margin-bottom:18px!important}.record-panel,.purchase-panel,.transfer-panel{padding:16px!important}.panel-head{flex-direction:column}.panel-head .primary{width:100%;justify-content:center}.table-wrap{border-radius:8px}.metric{box-shadow:none}}
+
+/* Compact operations-dashboard layout, aligned with the approved reference. */
+@media(min-width:761px){
+  .sidebar{width:232px!important;padding:18px 10px 14px!important;background:linear-gradient(180deg,#74172c 0%,#54101f 100%)!important}
+  .content{margin-left:232px!important;max-width:none!important;padding-left:30px!important;padding-right:30px!important}
+  .brand{padding:1px 11px 17px!important}.brand-logo{width:154px!important;margin:0 auto!important}
+  .workspace{margin:14px 4px 13px!important}.workspace-icon{width:28px!important;height:28px!important}.workspace b{font-size:11px!important}
+  .nav-group{padding:1px 0!important}.nav-group-title{padding:8px 10px!important;font-size:12px!important}.nav-group-title svg{width:15px;height:15px}
+  .nav-children{margin:0 0 3px 19px!important;padding-left:8px!important}.nav-children button{padding:6px 8px!important;font-size:11px!important}
+  header{height:63px!important;margin-bottom:22px!important}.search{height:37px!important;width:320px!important}.search input{font-size:12px!important}
+  .page-head{margin:3px 0 19px!important}.page-head h1{font-size:29px!important}.page-head p,.panel-head p{font-size:12px!important}
+  .primary{font-size:12px!important;padding:10px 15px!important}
+  .metrics{gap:12px!important;margin-bottom:16px!important}.metric{padding:15px!important;gap:11px!important}.metric-icon{height:37px!important;width:37px!important}.metric h2{font-size:22px!important}.metric p{font-size:11px!important}.metric small{font-size:10px!important}
+  .panel{border-radius:11px!important}.record-panel,.purchase-panel,.transfer-panel{padding:18px!important}.panel h2{font-size:19px!important}.panel-head{margin-bottom:15px!important}
+  .records{min-width:700px!important}.records th{padding:10px 8px!important;font-size:9px!important}.records td{padding:11px 8px!important;font-size:12px!important}.pill{font-size:9px!important;padding:4px 7px!important}
+}

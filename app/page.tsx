@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import "./product-lines.css";
 import "./catalogue.css";
 import "./catalogue-image-fit.css";
@@ -25,6 +25,7 @@ import "./purchasing.css";
 import "./order-import-review.css";
 import "./customer-transfer.css";
 import "./crm-polish.css";
+import "./auth-reference.css";
 import { supabase } from "./lib/supabase";
 import type { Session } from "@supabase/supabase-js";
 import {
@@ -653,6 +654,21 @@ function Pill({ value }: { value: string }) {
     </span>
   );
 }
+function AuthLayout({ children }: { children: ReactNode }) {
+  return <main className="auth-screen">
+    <section className="auth-showcase" aria-label="GeeBee CRM">
+      <img src="/brand/geebee-logo-transparent.png" alt="GeeBee — The Party Factory" />
+      <div className="auth-showcase-copy">
+        <span>WHOLESALE PARTY PRODUCTS</span>
+        <h1>Manage your party business, beautifully.</h1>
+        <p>Orders, customers, stock, dispatch and payments — all in one GeeBee workspace.</p>
+      </div>
+      <div className="auth-confetti one"/><div className="auth-confetti two"/><div className="auth-confetti three"/>
+      <div className="auth-orb one"/><div className="auth-orb two"/>
+    </section>
+    <section className="auth-panel"><div className="auth-card">{children}</div></section>
+  </main>;
+}
 function SignInScreen({ notice = "" }: { notice?: string }) {
   const [email, setEmail] = useState("vishu108818@gmail.com");
   const [mode, setMode] = useState<"signin" | "signup">("signin");
@@ -687,7 +703,19 @@ function SignInScreen({ notice = "" }: { notice?: string }) {
     const { error } = await supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.origin } });
     if (error) { setSending(false); setMessage(error.message.includes("provider") ? "Google sign-in has not been enabled in Supabase yet. Complete the Google setup steps below, then try again." : error.message); }
   };
-  return <main className="auth-screen"><section className="auth-card"><div className="auth-logo">G</div><span className="overline">GEEBEE IMPORTS</span><h1>Private operations workspace</h1><div className="auth-tabs"><button className={mode === "signin" ? "active" : ""} type="button" onClick={() => { setMode("signin"); setMessage(""); }}>Sign in</button><button className={mode === "signup" ? "active" : ""} type="button" onClick={() => { setMode("signup"); setMessage(""); }}>Sign up</button></div><p>{mode === "signin" ? "Use your Google work account, or request a secure email sign-in link." : "Create your secure account details. Your administrator must still grant workspace access."}</p><button className="google-auth" type="button" disabled={sending} onClick={signInWithGoogle}><span>G</span>Continue with Google</button><div className="auth-divider"><i/>or use email<i/></div>{mode === "signup" && <><label>Full name<input value={fullName} onChange={(event) => setFullName(event.target.value)} placeholder="Your full name" autoComplete="name"/></label><label>Phone number<input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+91 98765 43210" autoComplete="tel"/></label></>}<label>Work email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} onKeyDown={(event) => event.key === "Enter" && sendMagicLink()} placeholder="you@company.com" autoComplete="email"/></label><button className="primary auth-submit" type="button" disabled={sending} onClick={sendMagicLink}>{sending ? "Connecting…" : mode === "signup" ? "Create account and send link" : "Send secure sign-in link"}</button>{message && <div className={message.toLowerCase().includes("sent") ? "auth-message" : "auth-message warning"}>{message}</div>}<small>Only users granted access by a GeeBee administrator can open the CRM.</small></section></main>;
+  return <AuthLayout>
+    <span className="overline">GEEBEE CRM</span>
+    <h1>{mode === "signin" ? "Welcome back!" : "Create your account"}</h1>
+    <p>{mode === "signin" ? "Sign in to your GeeBee operations workspace." : "Your administrator will approve workspace access after sign-up."}</p>
+    <div className="auth-tabs"><button className={mode === "signin" ? "active" : ""} type="button" onClick={() => { setMode("signin"); setMessage(""); }}>Sign in</button><button className={mode === "signup" ? "active" : ""} type="button" onClick={() => { setMode("signup"); setMessage(""); }}>Sign up</button></div>
+    <button className="google-auth" type="button" disabled={sending} onClick={signInWithGoogle}><span>G</span>Continue with Google</button>
+    <div className="auth-divider"><i/>or use email<i/></div>
+    {mode === "signup" && <><label>Full name<input value={fullName} onChange={(event) => setFullName(event.target.value)} placeholder="Your full name" autoComplete="name"/></label><label>Phone number<input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+91 98765 43210" autoComplete="tel"/></label></>}
+    <label>Work email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} onKeyDown={(event) => event.key === "Enter" && sendMagicLink()} placeholder="you@company.com" autoComplete="email"/></label>
+    <button className="primary auth-submit" type="button" disabled={sending} onClick={sendMagicLink}>{sending ? "Connecting…" : mode === "signup" ? "Create account and send link" : "Send secure sign-in link"}</button>
+    {message && <div className={message.toLowerCase().includes("sent") ? "auth-message" : "auth-message warning"}>{message}</div>}
+    <small>Only GeeBee-approved users can open the CRM.</small>
+  </AuthLayout>;
 }
 function SharedAccessScreen({ notice = "" }: { notice?: string }) {
   const [passcode, setPasscode] = useState("");
@@ -709,7 +737,17 @@ function SharedAccessScreen({ notice = "" }: { notice?: string }) {
     const { error } = await supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.origin } });
     if (error) { setLoading(false); setMessage(error.message.includes("provider") ? "Google sign-in has not been enabled in Supabase yet. Complete the Google setup steps, then try again." : error.message); }
   };
-  return <main className="auth-screen"><section className="auth-card"><div className="auth-logo">G</div><span className="overline">GEEBEE IMPORTS</span><h1>Internal CRM access</h1><p>Use your authorised Google account, or enter the shared internal passcode.</p><button className="google-auth" type="button" disabled={loading} onClick={signInWithGoogle}><span>G</span>Continue with Google</button><div className="auth-divider"><i/>or<i/></div><label>Shared passcode<input type="password" value={passcode} onChange={(event) => setPasscode(event.target.value)} onKeyDown={(event) => event.key === "Enter" && enter()} placeholder="Enter passcode" autoFocus/></label><button className="primary auth-submit" type="button" disabled={loading || !passcode.trim()} onClick={enter}>{loading ? "Opening workspace…" : "Open CRM"}</button>{message && <div className="auth-message warning">{message}</div>}<small>Google users must still be granted access by a GeeBee administrator. Do not share the passcode outside GeeBee.</small></section></main>;
+  return <AuthLayout>
+    <span className="overline">GEEBEE CRM</span>
+    <h1>Welcome back!</h1>
+    <p>Sign in with your authorised Google account or the shared internal passcode.</p>
+    <button className="google-auth" type="button" disabled={loading} onClick={signInWithGoogle}><span>G</span>Continue with Google</button>
+    <div className="auth-divider"><i/>or use passcode<i/></div>
+    <label>Shared passcode<input type="password" value={passcode} onChange={(event) => setPasscode(event.target.value)} onKeyDown={(event) => event.key === "Enter" && enter()} placeholder="Enter passcode" autoFocus/></label>
+    <button className="primary auth-submit" type="button" disabled={loading || !passcode.trim()} onClick={enter}>{loading ? "Opening workspace…" : "Open CRM"}</button>
+    {message && <div className="auth-message warning">{message}</div>}
+    <small>Do not share the internal passcode outside GeeBee.</small>
+  </AuthLayout>;
 }
 export default function Home() {
   const [section, setSection] = useState("Overview"),

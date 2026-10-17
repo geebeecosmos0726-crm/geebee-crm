@@ -35,3 +35,7 @@ header{position:sticky;top:0;z-index:5;background:rgba(248,246,244,.92);backdrop
   .panel{border-radius:11px!important}.record-panel,.purchase-panel,.transfer-panel{padding:18px!important}.panel h2{font-size:19px!important}.panel-head{margin-bottom:15px!important}
   .records{min-width:700px!important}.records th{padding:10px 8px!important;font-size:9px!important}.records td{padding:11px 8px!important;font-size:12px!important}.pill{font-size:9px!important;padding:4px 7px!important}
 }
+
+/* Keep account controls reachable even when every navigation group is open. */
+.side-bottom{position:sticky!important;bottom:-14px;z-index:3;margin-top:14px!important;padding:10px 5px 14px!important;background:linear-gradient(180deg,rgba(104,29,43,0),#681d2b 22%)!important}
+.profile{flex-wrap:wrap!important;row-gap:7px}.profile>div:nth-child(2){min-width:0}.profile b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sign-out{display:flex!important;align-items:center;justify-content:center;width:100%;padding:8px 10px!important;border:1px solid rgba(255,255,255,.25)!important;border-radius:7px!important;background:rgba(255,255,255,.1)!important;color:#fff!important;font-size:11px!important;font-weight:700!important}.sign-out:hover{background:rgba(255,255,255,.18)!important}

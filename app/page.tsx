@@ -24,6 +24,7 @@ import "./dispatch-plan.css";
 import "./purchasing.css";
 import "./order-import-review.css";
 import "./customer-transfer.css";
+import "./crm-polish.css";
 import { supabase } from "./lib/supabase";
 import type { Session } from "@supabase/supabase-js";
 import {

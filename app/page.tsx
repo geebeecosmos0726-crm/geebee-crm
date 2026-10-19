@@ -2400,6 +2400,28 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     return () => option.remove();
   }, [clients, f.client]);
   useEffect(() => {
+    const clientSelect = Array.from(document.querySelectorAll<HTMLSelectElement>("select")).find((select) => select.parentElement?.textContent?.trim().startsWith("Client"));
+    const label = clientSelect?.parentElement;
+    if (!clientSelect || !label) return;
+    clientSelect.style.display = "none";
+    clientSelect.required = false;
+    const input = document.createElement("input");
+    input.value = f.client;
+    input.placeholder = "Type or correct customer name";
+    input.required = true;
+    input.setAttribute("aria-label", "Customer name");
+    const hint = document.createElement("small");
+    hint.className = "table-subtext";
+    hint.textContent = "You can correct the fetched customer name. A new customer profile is created only after Save order.";
+    input.oninput = () => {
+      const typedName = input.value;
+      const matchedClient = clients.find((client) => client.name.trim().toLowerCase() === typedName.trim().toLowerCase());
+      setF((current) => ({ ...current, client: typedName, city: matchedClient?.city || current.city, avatar: matchedClient?.avatar || initials(typedName) }));
+    };
+    label.append(input, hint);
+    return () => { input.remove(); hint.remove(); clientSelect.style.display = ""; clientSelect.required = true; };
+  }, [clients, f.client]);
+  useEffect(() => {
     const clientLabel = Array.from(document.querySelectorAll<HTMLLabelElement>("label")).find((label) => label.textContent?.trim().startsWith("Client"));
     if (!clientLabel?.parentElement) return;
     const label = document.createElement("label"); label.textContent = "Order ID";

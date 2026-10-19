@@ -8,6 +8,9 @@ export async function POST(request: Request) {
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
   if (!url || !serviceKey || !token) return Response.json({ error: "Unauthorized." }, { status: 401 });
 
+  const body = await request.json().catch(() => ({}));
+  const requestedQuantity = Number(body?.quantity);
+  const quantity = Number.isInteger(requestedQuantity) && requestedQuantity >= 0 && requestedQuantity <= 1_000_000 ? requestedQuantity : 10000;
   const db = createClient(url, serviceKey, { auth: { persistSession: false } });
   const { data: userResult, error: userError } = await db.auth.getUser(token);
   if (userError || !userResult.user?.email) return Response.json({ error: "Administrator access is required." }, { status: 403 });
@@ -21,7 +24,7 @@ export async function POST(request: Request) {
   const updates = (products || []).map((row: { record_id: string; data: Record<string, unknown> }) => ({
     workspace_owner_id: ownerId,
     record_id: row.record_id,
-    data: { ...row.data, availableQuantity: 10000, openingStock: 0, purchasedStock: 0, orderedStock: 0, damagedStock: 0, reservedStock: 0 },
+    data: { ...row.data, availableQuantity: quantity, openingStock: 0, purchasedStock: 0, orderedStock: 0, damagedStock: 0, reservedStock: 0 },
     search_key: `${row.data.sku || ""} ${row.data.name || ""} ${row.data.category || ""}`.toLowerCase(),
     updated_at: new Date().toISOString(),
   }));
@@ -29,6 +32,6 @@ export async function POST(request: Request) {
     const { error: writeError } = await db.from("crm_products").upsert(updates, { onConflict: "workspace_owner_id,record_id" });
     if (writeError) return Response.json({ error: writeError.message }, { status: 500 });
   }
-  await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: userResult.user.email, action: "Reset demo inventory", module: "Catalogue", details: `${updates.length} products set to 10,000 available units with test allocations cleared` });
-  return Response.json({ ok: true, updated: updates.length });
+  await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: userResult.user.email, action: "Reset demo inventory", module: "Catalogue", details: `${updates.length} products set to ${quantity.toLocaleString("en-IN")} available units with test allocations cleared` });
+  return Response.json({ ok: true, updated: updates.length, quantity });
 }

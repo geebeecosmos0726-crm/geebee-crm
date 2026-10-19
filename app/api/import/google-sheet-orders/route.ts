@@ -5,7 +5,6 @@ export const runtime = "nodejs";
 
 type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number };
 type ImportedOrder = { id: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string };
-type ImportedClient = { id: number; customerId: string; name: string; city: string; contact: string; phone: string; credit: string; customerStatus: string; avatar: string; specialRates: [] };
 type CustomerIdentity = { name: string; city: string };
 
 const sheetId = process.env.GOOGLE_ORDER_IMPORT_SHEET_ID;
@@ -143,8 +142,8 @@ export async function POST(request: Request) {
     const knownCustomers: CustomerIdentity[] = (existingClients || []).map((row: any) => ({ name: String(row.data?.name || "").trim(), city: String(row.data?.city || "").trim() })).filter((customer) => customer.name);
     const productMap = new Map((catalogue || []).map((row: any) => [key(row.data?.sku), row.data as { name?: string }]));
     const imported: ImportedOrder[] = [];
-    const createdClients: ImportedClient[] = [];
     const reusedCustomers: string[] = [];
+    const pendingCustomers: string[] = [];
     const skipped: string[] = [];
     for (const sheet of metadata.data.sheets || []) {
       const title = sheet.properties?.title || "";
@@ -163,22 +162,18 @@ export async function POST(request: Request) {
       if (matchedCustomer) {
         reusedCustomers.push(`${details.id}: ${details.client} → ${matchedCustomer.name}`);
       } else {
-        const id = Date.now() + createdClients.length;
-        createdClients.push({ id, customerId: `GB-C${String(id).slice(-7)}`, name: client, city, contact: "", phone: "", credit: "", customerStatus: "Incomplete profile", avatar: initials(client), specialRates: [] });
-        knownCustomers.push({ name: client, city });
+        // A Sheet fetch creates only a draft order. Its new customer becomes
+        // a profile only when someone explicitly opens and saves that order.
+        pendingCustomers.push(`${details.id}: ${client}`);
       }
     }
     if (imported.length) {
       const now = new Date().toISOString();
       const { error } = await db.from("crm_orders").insert(imported.map((order) => ({ workspace_owner_id: ownerId, record_id: order.id, search_key: `${order.id} ${order.client} ${order.city} ${order.sku}`.toLowerCase(), data: order, created_at: now, updated_at: now })));
       if (error) throw error;
-      if (createdClients.length) {
-        const { error: clientInsertError } = await db.from("crm_clients").insert(createdClients.map((client) => ({ workspace_owner_id: ownerId, record_id: String(client.id), search_key: `${client.customerId} ${client.name} ${client.city}`.toLowerCase(), data: client, created_at: now, updated_at: now })));
-        if (clientInsertError) throw clientInsertError;
-      }
-      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched connected Google Sheet orders", module: "Orders", details: `${imported.length} new order(s) imported; ${createdClients.length} new customer(s); ${reusedCustomers.length} customer match(es); ${skipped.length} tab(s) skipped` });
+      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched connected Google Sheet orders", module: "Orders", details: `${imported.length} new draft order(s) imported; ${reusedCustomers.length} customer match(es); ${pendingCustomers.length} customer profile(s) pending order save; ${skipped.length} tab(s) skipped` });
     }
-    return Response.json({ orders: imported, clients: createdClients, reusedCustomers, skipped, scanned: metadata.data.sheets?.length || 0 });
+    return Response.json({ orders: imported, clients: [], reusedCustomers, pendingCustomers, skipped, scanned: metadata.data.sheets?.length || 0 });
   } catch (error) {
     console.error("Google order import failed:", error instanceof Error ? error.message : error);
     return Response.json({ error: error instanceof Error ? error.message : "Could not fetch the connected Google Sheet." }, { status: 400 });

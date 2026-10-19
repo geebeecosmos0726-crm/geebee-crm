@@ -86,7 +86,7 @@ type Order = {
   remarks?: string;
   clientApproval?: "Approval pending" | "Approval requested" | "Approved" | "Changes requested" | "Rejected";
   cancelledFromDispatch?: boolean;
-  cancelledFromStage?: "Draft" | "Confirmed" | "Dispatch plan";
+  cancelledFromStage?: "Draft" | "Confirmed" | "Dispatch plan" | "Sent to customer" | "Received by customer";
   avatar: string;
   products?: ProductLine[];
   approvedProducts?: ProductLine[];
@@ -1012,7 +1012,7 @@ export default function Home() {
     const advanceId = `ADV-${primaryId}`;
     const primaryOrder = orders.find((item) => item.id === primaryId);
     const advanceOrder = orders.find((item) => item.id === advanceId);
-    const dispatchedLines = isAdvance ? [] : primaryOrder?.status === "Confirmed" ? (primaryOrder.approvedProducts || linesFor(primaryOrder)) : primaryOrder?.status === "Dispatch plan" ? linesFor(primaryOrder) : [];
+    const dispatchedLines = isAdvance ? [] : primaryOrder?.status === "Confirmed" ? (primaryOrder.approvedProducts || linesFor(primaryOrder)) : ["Dispatch plan", "Sent to customer", "Received by customer"].includes(primaryOrder?.status || "") ? linesFor(primaryOrder) : [];
     const reservedLines = isAdvance ? linesFor(order) : advanceOrder ? linesFor(advanceOrder) : [];
     setCatalogue((current) => current.map((product) => {
       const dispatched = dispatchedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
@@ -1023,8 +1023,8 @@ export default function Home() {
     const cancelledIds = isAdvance ? [order.id] : [primaryId, advanceId];
     setOrders((current) => current.map((item) => {
       if (!cancelledIds.includes(item.id)) return item;
-      const cancelledFromStage = item.status === "Draft" || item.status === "Confirmed" || item.status === "Dispatch plan" ? item.status : item.cancelledFromStage;
-      return { ...item, status: "Cancelled", cancelledFromDispatch: item.status === "Dispatch plan", cancelledFromStage };
+      const cancelledFromStage = ["Draft", "Confirmed", "Dispatch plan", "Sent to customer", "Received by customer"].includes(item.status) ? item.status as NonNullable<Order["cancelledFromStage"]> : item.cancelledFromStage;
+      return { ...item, status: "Cancelled", cancelledFromDispatch: ["Dispatch plan", "Sent to customer", "Received by customer"].includes(item.status), cancelledFromStage };
     }));
     setInvoices((current) => current.map((invoice) => cancelledIds.includes(invoice.order) ? { ...invoice, status: "Cancelled" } : invoice));
     logActivity("Cancelled order and released stock", "Orders", cancelledIds.join(", "));
@@ -1049,7 +1049,7 @@ export default function Home() {
     const removedIds = new Set([...primaryIds, ...advanceIds]);
     const dispatchedLines = [...primaryIds].flatMap((id) => {
       const order = orders.find((item) => item.id === id);
-      return order?.status === "Confirmed" ? (order.approvedProducts || linesFor(order)) : order?.status === "Dispatch plan" ? linesFor(order) : [];
+      return order?.status === "Confirmed" ? (order.approvedProducts || linesFor(order)) : ["Dispatch plan", "Sent to customer", "Received by customer"].includes(order?.status || "") ? linesFor(order) : [];
     });
     const reservedLines = [...advanceIds].flatMap((id) => linesFor(orders.find((item) => item.id === id) || {} as Order));
     setCatalogue((current) => current.map((product) => {
@@ -1092,6 +1092,20 @@ export default function Home() {
     setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...first, products: lines, approvedProducts: lines, status: "Confirmed" } : item));
     logActivity("Returned dispatch order to Confirmed Orders", "Dispatch Plan", order.id);
     flash(`${order.id} returned to Confirmed Orders. Inventory remains allocated.`);
+  };
+  const markOrderSentToCustomer = (order: Order) => {
+    if (order.status !== "Dispatch plan") return;
+    if (!window.confirm(`Mark ${order.id} as sent to ${order.client}?`)) return;
+    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, status: "Sent to customer" } : item));
+    logActivity("Order sent to customer", "Fulfilment", `${order.id} · ${order.client}`);
+    flash(`${order.id} is now marked as sent to customer.`);
+  };
+  const markOrderReceivedByCustomer = (order: Order) => {
+    if (order.status !== "Sent to customer") return;
+    if (!window.confirm(`Mark ${order.id} as received by ${order.client}?`)) return;
+    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, status: "Received by customer" } : item));
+    logActivity("Order received by customer", "Fulfilment", `${order.id} · ${order.client}`);
+    flash(`${order.id} is now marked as received by customer.`);
   };
   const initialiseOpeningStock = async (quantity = 10000) => {
     if (!supabase || !session) return;
@@ -1174,7 +1188,8 @@ export default function Home() {
     { label: "Sales", icon: BriefcaseBusiness, items: [{ label: "Orders", section: "Orders", module: "Orders" as CrmModule, count: String(orders.filter((order) => order.status === "Draft").length) }, { label: "Confirmed Orders", section: "Confirmed Orders", module: "Orders" as CrmModule, count: String(orders.filter((order) => order.status === "Confirmed").length) }, { label: "Backorders", section: "Backorders", module: "Orders" as CrmModule, count: String(orders.filter(isVisibleBackorder).length) }, { label: "Returns", section: "Returns", module: "Orders" as CrmModule }] },
     { label: "Products", icon: Boxes, items: [{ label: "Products / SKUs", section: "Catalogue", module: "Catalogue" as CrmModule, count: String(catalogue.length) }, { label: "Categories", section: "Categories", module: "Catalogue" as CrmModule }, { label: "Price Lists", section: "Price Lists", module: "Catalogue" as CrmModule }, { label: "Stock", section: "Stock", module: "Catalogue" as CrmModule }] },
     { label: "Inventory", icon: Warehouse, items: [{ label: "Stock Overview", section: "Stock Overview" }, { label: "Stock Movements", section: "Stock Movements" }, { label: "Low Stock", section: "Low Stock" }, { label: "Reserved Stock", section: "Reserved Stock" }, { label: "Warehouses", section: "Warehouses" }] },
-    { label: "Operations", icon: Truck, items: [{ label: "Dispatch Plan", section: "Dispatch Plan", module: "Orders" as CrmModule, count: String(orders.filter((order) => order.status === "Dispatch plan").length) }, { label: "Transporters", section: "Transporters", module: "Shipments" as CrmModule, count: String(transporters.length) }, { label: "Picking", section: "Picking" }, { label: "Packing", section: "Packing" }, { label: "Delivery", section: "Delivery" }] },
+    { label: "Operations", icon: Truck, items: [{ label: "Dispatch Plan", section: "Dispatch Plan", module: "Orders" as CrmModule, count: String(orders.filter((order) => order.status === "Dispatch plan").length) }, { label: "Transporters", section: "Transporters", module: "Shipments" as CrmModule, count: String(transporters.length) }, { label: "Picking", section: "Picking" }, { label: "Packing", section: "Packing" }] },
+    { label: "Fulfilment", icon: Truck, items: [{ label: "Sent to Customer", section: "Sent to Customer", module: "Orders" as CrmModule, count: String(orders.filter((order) => order.status === "Sent to customer").length) }, { label: "Received by Customer", section: "Received by Customer", module: "Orders" as CrmModule, count: String(orders.filter((order) => order.status === "Received by customer").length) }] },
     { label: "Billing", icon: ReceiptText, items: [{ label: "Invoices", section: "Invoices", module: "Invoices" as CrmModule, count: String(invoices.filter((i) => i.status !== "Paid").length) }, { label: "Payments", section: "Payments", module: "Payments" as CrmModule, count: "2" }, { label: "Outstanding", section: "Outstanding", module: "Payments" as CrmModule }, { label: "Ageing", section: "Ageing", module: "Payments" as CrmModule }] },
     { label: "Imports", icon: ShipWheel, items: [{ label: "Suppliers", section: "Suppliers", count: String(suppliers.length) }, { label: "Purchase Orders", section: "Purchase Orders", count: String(purchases.filter((purchase) => !["Delivered", "Cancelled"].includes(purchase.status)).length) }, { label: "Shipments", section: "Shipments", module: "Shipments" as CrmModule }, { label: "Containers", section: "Containers", module: "Shipments" as CrmModule }, { label: "Landed Cost", section: "Landed Cost", module: "Shipments" as CrmModule }] },
     { label: "Reports", icon: ChartNoAxesCombined, items: [{ label: "Sales", section: "Sales Report" }, { label: "Customers", section: "Customer Report" }, { label: "Products", section: "Product Report" }, { label: "Inventory", section: "Inventory Report" }, { label: "Payments", section: "Payment Report" }, { label: "Sales Team", section: "Sales Team Report" }] },
@@ -1186,7 +1201,7 @@ export default function Home() {
     ...auditEvents.slice(0, 4).map((event) => ({ title: event.action, detail: `${event.actor_email} · ${event.module}`, time: new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) })),
     ...invoices.filter((invoice) => invoice.status !== "Paid").slice(0, 2).map((invoice) => ({ title: `${invoice.status} invoice ${invoice.id}`, detail: `${invoice.client} · ${invoice.amount} due ${invoice.due}`, time: "Needs attention" })),
   ].slice(0, 6);
-  const liveSections = new Set(["Overview", "Clients", "Leads", "Follow-ups", "Lost Leads", "Quotations", "Orders", "Confirmed Orders", "Dispatch Plan", "Backorders", "Invoices", "Catalogue", "Categories", "Transporters", "Suppliers", "Purchase Orders", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report", "Settings", "Recovery", "Data Transfer"]);
+  const liveSections = new Set(["Overview", "Clients", "Leads", "Follow-ups", "Lost Leads", "Quotations", "Orders", "Confirmed Orders", "Dispatch Plan", "Sent to Customer", "Received by Customer", "Backorders", "Invoices", "Catalogue", "Categories", "Transporters", "Suppliers", "Purchase Orders", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report", "Settings", "Recovery", "Data Transfer"]);
   if (!authReady) return <div className="auth-screen"><div className="auth-card"><b>Opening secure workspace…</b></div></div>;
   if (!supabase) return <div className="auth-screen"><div className="auth-card"><span className="overline">GEEBEE CRM</span><h1>Cloud connection needed</h1><p>Add the Supabase environment settings to open this private workspace.</p></div></div>;
   if (session && !workspaceAccessReady) return <div className="auth-screen"><div className="auth-card"><b>Checking workspace access…</b><p>Your account is being securely verified.</p></div></div>;
@@ -1291,7 +1306,9 @@ export default function Home() {
         )}{" "}
         {section === "Orders" && <Orders orders={shown.filter((order) => order.status === "Draft")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Draft")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} confirm={confirmOrder} />}{" "}
         {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToOrders={returnConfirmedToOrders} pushToDispatch={pushToDispatchPlan} sendWhatsApp={(order) => window.open(`https://wa.me/?text=${encodeURIComponent(dispatchWhatsAppText(order))}`, "_blank", "noopener,noreferrer")} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Confirmed Orders", `${id} · ${clientApproval}`); }} confirmed />}{" "}
-        {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToConfirmed={returnDispatchToConfirmed} />}{" "}
+        {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToConfirmed={returnDispatchToConfirmed} markSent={markOrderSentToCustomer} />}{" "}
+        {section === "Sent to Customer" && <FulfilmentPanel title="Sent to customer" description="These dispatched orders have been sent to the customer. Mark each one received when delivery is confirmed." orders={orders.filter((order) => order.status === "Sent to customer")} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} advance={markOrderReceivedByCustomer} advanceLabel="Mark received" />}{" "}
+        {section === "Received by Customer" && <FulfilmentPanel title="Received by customer" description="Completed delivery records. These orders have been confirmed as received by the customer." orders={orders.filter((order) => order.status === "Received by customer")} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} />}{" "}
         {section === "Clients" && (
           <Clients
             clients={clients.filter((c) =>
@@ -1695,6 +1712,8 @@ function OrderTable({
   returnToOrders,
   returnLabel = "Return to Orders",
   confirm,
+  advance,
+  advanceLabel,
   compact = false,
 }: {
   orders: Order[];
@@ -1707,6 +1726,8 @@ function OrderTable({
   returnToOrders?: (order: Order) => void;
   returnLabel?: string;
   confirm?: (order: Order) => void;
+  advance?: (order: Order) => void;
+  advanceLabel?: string;
   compact?: boolean;
 }) {
   const [selected, setSelected] = useState<string[]>([]);
@@ -1777,7 +1798,7 @@ function OrderTable({
                 <Pill value={o.payment} />
               </td>
               <td>
-                <div className="record-actions">{confirm && o.status === "Draft" && <button className="dispatch-action" type="button" onClick={() => confirm(o)}>Confirm order</button>}{returnToOrders && (o.status === "Confirmed" || o.status === "Dispatch plan") && <button className="outline" type="button" onClick={() => returnToOrders(o)}>{returnLabel}</button>}{pushToDispatch && o.status === "Confirmed" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>{whatsAppLabel || "WA"}</button>}<button className="whatsapp-action" type="button" onClick={() => downloadOrderPdf(o)} aria-label={`Download ${o.status === "Advance order" ? "advance order" : "purchase order"} ${o.id}`}>{o.status === "Advance order" ? "AO" : "PO"}</button><button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>{cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
+                <div className="record-actions">{confirm && o.status === "Draft" && <button className="dispatch-action" type="button" onClick={() => confirm(o)}>Confirm order</button>}{returnToOrders && (o.status === "Confirmed" || o.status === "Dispatch plan") && <button className="outline" type="button" onClick={() => returnToOrders(o)}>{returnLabel}</button>}{pushToDispatch && o.status === "Confirmed" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{advance && <button className="dispatch-action" type="button" onClick={() => advance(o)}>{advanceLabel || "Continue"}</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>{whatsAppLabel || "WA"}</button>}<button className="whatsapp-action" type="button" onClick={() => downloadOrderPdf(o)} aria-label={`Download ${o.status === "Advance order" ? "advance order" : "purchase order"} ${o.id}`}>{o.status === "Advance order" ? "AO" : "PO"}</button><button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>{cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
               </td>
             </tr>
           ))}
@@ -1957,9 +1978,12 @@ function ReportsDashboard({ report, orders, clients, catalogue, leads, quotes, i
     {report === "Payment Report" && <><section className="panel"><h3>Outstanding invoices</h3><div className="report-list">{openInvoices.sort((a, b) => amount(b.amount) - amount(a.amount)).slice(0, 8).map((invoice) => <article key={invoice.id}><span>{invoice.id} · {invoice.client}</span><b>{invoice.amount}</b></article>)}{!openInvoices.length && <p className="profile-empty">No outstanding invoices.</p>}</div></section><section className="panel"><h3>Recent collections</h3><div className="report-list">{invoices.filter((invoice) => invoice.status === "Paid").slice(0, 8).map((invoice) => <article key={invoice.id}><span>{invoice.id} · {invoice.client}</span><b>{invoice.amount}</b></article>)}{!invoices.some((invoice) => invoice.status === "Paid") && <p className="profile-empty">No paid invoices recorded yet.</p>}</div></section></>}
   </div></section>;
 }
-function DispatchPlanPanel({ orders, edit, cancel, remove, returnToConfirmed }: { orders: Order[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void; returnToConfirmed: (order: Order) => void }) {
+function DispatchPlanPanel({ orders, edit, cancel, remove, returnToConfirmed, markSent }: { orders: Order[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void; returnToConfirmed: (order: Order) => void; markSent: (order: Order) => void }) {
   const [showCancelled, setShowCancelled] = useState(false); const active = orders.filter((order) => order.status === "Dispatch plan"); const cancelled = orders.filter((order) => order.status === "Cancelled" && order.cancelledFromDispatch);
-  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">OPERATIONS HANDOFF</span><h2>Dispatch Plan</h2><p>Orders reach this stage after customer approval has been sent and recorded in Confirmed Orders. Operations can now prepare, pack and dispatch them.</p></div></div><OrderTable orders={active} edit={edit} cancel={cancel} remove={remove} returnToOrders={returnToConfirmed} returnLabel="Return to Confirmed" />{cancelled.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled from Dispatch Plan <b>{cancelled.length}</b></button>{showCancelled && <OrderTable orders={cancelled} edit={edit} cancel={cancel} remove={remove} />}</section>}</section>;
+  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">OPERATIONS HANDOFF</span><h2>Dispatch Plan</h2><p>Orders reach this stage after customer approval has been sent and recorded in Confirmed Orders. Operations can now prepare, pack and dispatch them.</p></div></div><OrderTable orders={active} edit={edit} cancel={cancel} remove={remove} returnToOrders={returnToConfirmed} returnLabel="Return to Confirmed" advance={markSent} advanceLabel="Mark sent to customer" />{cancelled.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled from Dispatch Plan <b>{cancelled.length}</b></button>{showCancelled && <OrderTable orders={cancelled} edit={edit} cancel={cancel} remove={remove} />}</section>}</section>;
+}
+function FulfilmentPanel({ title, description, orders, edit, cancel, remove, advance, advanceLabel }: { title: string; description: string; orders: Order[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void; advance?: (order: Order) => void; advanceLabel?: string }) {
+  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">FULFILMENT TRACKING</span><h2>{title}</h2><p>{description}</p></div></div><OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} advance={advance} advanceLabel={advanceLabel} /></section>;
 }
 function BackordersPanel({ orders, clients, edit, cancel, remove }: { orders: Order[]; clients: Client[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void }) {
   return <section className="panel record-panel"><div className="panel-head"><div><span className="overline">BACKORDER & ADVANCE ORDER</span><h2>Advance order register</h2><p>Only quantities unavailable in free stock appear here. Each advance order is editable and has its own PDF.</p></div></div><OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} sendWhatsApp={(order) => { const client = clients.find((item) => item.name === order.client); openWhatsApp(client?.whatsapp || client?.phone || "", `Dear ${order.client}, your GeeBee advance order #${order.id} is pending future dispatch. Advance value: ${money(orderTotal(order))}.`); }} /></section>;

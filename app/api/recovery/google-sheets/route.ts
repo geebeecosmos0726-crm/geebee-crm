@@ -3,7 +3,7 @@ import { google } from "googleapis";
 
 export const runtime = "nodejs";
 
-const sheetTabs = ["Customers", "Products", "Orders", "Backorders", "Quotes", "Invoices", "Leads", "Tasks", "Transporters"] as const;
+const sheetTabs = ["Customers", "Products", "Orders", "Backorders", "Quotes", "Invoices", "Leads", "Tasks", "Transporters", "Suppliers", "Purchase Orders"] as const;
 type Tab = typeof sheetTabs[number];
 type Row = Record<string, string>;
 
@@ -61,27 +61,32 @@ async function readBackup() {
 }
 
 function restoreData(rows: Record<Tab, Row[]>) {
-  const clients = rows.Customers.map((row, index) => ({ id: number(row["Record ID"]) || Date.now() + index, customerId: row["Customer ID"], name: row["Business Name"], contact: row["Contact Person"], phone: row.Mobile, whatsapp: row.WhatsApp, email: row.Email, gstin: row.GSTIN, pan: row.PAN, businessType: row["Business Type"], customerCategory: row["Customer Category"], state: row.State, city: row.City, address: row.Address, pincode: row.Pincode, credit: row["Credit Limit"], paymentTerms: row["Payment Terms"], assignedSalesperson: row["Assigned Salesperson"], customerStatus: row["Customer Status"], specialRates: json(row["Special Rates JSON"], []), avatar: initials(row["Business Name"] || "Customer") }));
-  const catalogue = rows.Products.map((row, index) => ({ id: number(row["Record ID"]) || Date.now() + 1000 + index, sku: row.SKU, name: row["Product Name"], category: row.Category, subCategory: row["Sub-category"], brand: row.Brand, description: row.Description, cartonQty: row["Carton Qty"] || "", image: "", unit: row.Unit, packSize: row["Pack Size"], moq: number(row.MOQ), purchasePrice: number(row["Purchase Price"]), unitPrice: number(row["Selling Price"]), wholesalePrice: number(row["Wholesale Price"]), distributorPrice: number(row["Distributor Price"]), gst: number(row["GST %"]), barcode: row.Barcode, weight: row.Weight, dimensions: row.Dimensions, supplier: row.Supplier, countryOfOrigin: row["Country of Origin"], openingStock: number(row["Opening Stock"]), purchasedStock: number(row.Purchase), orderedStock: number(row.Orders), damagedStock: number(row.Damaged), reservedStock: number(row.Reserved) }));
+  const clients = rows.Customers.map((row, index) => ({ id: number(row["Record ID"]) || Date.now() + index, customerId: row["Customer ID"], name: row["Business Name"], contact: row["Contact Person"], phone: row.Mobile, whatsapp: row.WhatsApp, email: row.Email, gstin: row.GSTIN, pan: row.PAN, businessType: row["Business Type"], customerCategory: row["Customer Category"], state: row.State, city: row.City, address: row.Address, pincode: row.Pincode, credit: row["Credit Limit"], paymentTerms: row["Payment Terms"], assignedSalesperson: row["Assigned Salesperson"], customerStatus: row["Customer Status"], whatsappGroupLink: row["WhatsApp Group Link"], specialRates: json(row["Special Rates JSON"], []), avatar: initials(row["Business Name"] || "Customer") }));
+  const catalogue = rows.Products.map((row, index) => ({ id: number(row["Record ID"]) || Date.now() + 1000 + index, sku: row.SKU, name: row["Product Name"], category: row.Category, subCategory: row["Sub-category"], brand: row.Brand, description: row.Description, cartonQty: row["Carton Qty"] || row["Outer Qty"] || "", innerQty: row["Inner Qty"] || "", outerQty: row["Outer Qty"] || row["Carton Qty"] || "", image: row["Image URL"] || "", unit: row.Unit, unitPrice: number(row["Selling Price"]), availableQuantity: number(row["Available Quantity"]), reorderThreshold: number(row["Low Stock Alert"]), reservedStock: number(row.Reserved), supplier: row.Supplier }));
   const backorders = new Map<string, unknown[]>();
   rows.Backorders.forEach((row) => { const orderId = row["Order ID"]; if (!orderId) return; backorders.set(orderId, [...(backorders.get(orderId) || []), { sku: row.SKU, product: row.Product, quantity: number(row["Short Quantity"]), unitPrice: number(row["Unit Price"]) }]); });
-  const orders = rows.Orders.map((row) => { const products = json(row["Products JSON"], [] as unknown[]); const client = row.Customer || "Customer"; return { id: row["Order ID"], client: row.Customer, city: row.City, product: row.Product, sku: row.SKU, quantity: number(row.Quantity), unitPrice: number(row["Unit Price"]), eta: row.ETA, status: row.Status, payment: row["Payment Status"], products, backorders: backorders.get(row["Order ID"]), avatar: initials(client) }; });
+  const orders = rows.Orders.map((row) => { const products = json(row["Products JSON"], [] as unknown[]); const client = row.Customer || "Customer"; return { id: row["Order ID"], client: row.Customer, city: row.City, product: row.Product, sku: row.SKU, quantity: number(row.Quantity), unitPrice: number(row["Unit Price"]), eta: row.ETA, status: row.Status, payment: row["Payment Status"], transporter: row.Transporter, remarks: row.Remarks, clientApproval: row["Client Approval"], products, backorders: backorders.get(row["Order ID"]), avatar: initials(client) }; });
   const quotes = rows.Quotes.map((row) => ({ id: row["Quote Number"], customer: row.Customer, products: json(row["Products JSON"], []), gst: number(row["GST %"]), freight: number(row.Freight), validity: row.Validity, paymentTerms: row["Payment Terms"], deliveryTerms: row["Delivery Terms"], status: row.Status || "Draft", createdAt: row["Created At"] }));
   const invoices = rows.Invoices.map((row) => ({ id: row["Invoice Number"], client: row.Customer, order: row.Order, amount: row.Amount, due: row.Due, status: row.Status }));
   const leads = rows.Leads.map((row) => ({ id: row["Lead ID"], company: row.Company, contact: row["Contact Person"], mobile: row.Mobile, city: row.City, source: row.Source, salesperson: row["Assigned Salesperson"], requirement: row.Requirement, expectedValue: row["Expected Order Value"], expectedDate: row["Expected Order Date"], status: row.Status || "New", lostReason: row["Lost Reason"], createdAt: row["Created At"] }));
-  const tasks = rows.Tasks.map((row) => ({ id: row["Task ID"], title: row.Title, time: row.Time, dueDate: row["Due Date"], assignee: row.Assignee, type: row.Type || "Other", status: row.Status || "Open", relatedTo: row["Related To"] }));
-  const transporters = rows.Transporters.map((row, index) => ({ id: number(row["Record ID"]) || Date.now() + 2000 + index, name: row["Transporter Name"], contact: row["Contact Person"], phone: row.Phone, email: row.Email, city: row.City, gstin: row.GSTIN, serviceType: row["Service Type"], notes: row.Notes }));
-  return { clients, catalogue, orders, quotes, invoices, leads, tasks, transporters };
+  const tasks = rows.Tasks.map((row) => ({ id: row["Task ID"], title: row.Title, description: row.Description, time: row.Time, dueDate: row["Due Date"], assignee: row.Assignee, type: row.Type || "Other", status: row.Status || "Open", relatedTo: row["Related To"] }));
+  const transporters = rows.Transporters.map((row, index) => ({ id: number(row["Record ID"]) || Date.now() + 2000 + index, name: row["Transporter Name"], contact: row["Contact Person"], phone: row.Phone, email: row.Email, city: row.City, area: row.Area, gstin: row.GSTIN, serviceType: row["Service Type"], notes: row.Notes }));
+  const suppliers = rows.Suppliers.map((row, index) => ({ id: number(row["Record ID"]) || Date.now() + 3000 + index, name: row["Supplier Name"], contact: row["Contact Person"], phone: row.Phone, email: row.Email, city: row.City, country: row.Country, gstin: row.GSTIN, paymentTerms: row["Payment Terms"], status: row.Status, notes: row.Notes }));
+  const purchases = rows["Purchase Orders"].map((row) => ({ id: row["PO Number"], supplier: row.Supplier, status: row.Status, expectedDate: row["Expected Date"], createdAt: row["Created At"], notes: row.Notes, lines: json(row["Lines JSON"], []) }));
+  return { clients, catalogue, orders, quotes, invoices, leads, tasks, transporters, suppliers, purchases };
 }
 
 const scalableTables = [
-  ["clients", "crm_clients"], ["catalogue", "crm_products"], ["orders", "crm_orders"], ["invoices", "crm_invoices"], ["leads", "crm_leads"], ["quotes", "crm_quotes"], ["tasks", "crm_tasks"], ["transporters", "crm_transporters"],
+  ["clients", "crm_clients"], ["catalogue", "crm_stock_inventory"], ["orders", "crm_orders"], ["invoices", "crm_invoices"], ["leads", "crm_leads"], ["quotes", "crm_quotes"], ["tasks", "crm_tasks"], ["transporters", "crm_transporters"],
 ] as const;
 
 async function readLiveData(db: any, ownerId: string) {
-  const results = await Promise.all(scalableTables.map(([, table]) => db.from(table).select("data").eq("workspace_owner_id", ownerId).limit(100000)));
+  const [results, workspaceResult] = await Promise.all([
+    Promise.all(scalableTables.map(([, table]) => db.from(table).select("data").eq("workspace_owner_id", ownerId).limit(100000))),
+    db.from("crm_workspaces").select("data").eq("owner_id", ownerId).single(),
+  ]);
   if (results.every((result: any) => !result.error)) {
-    const data = Object.fromEntries(scalableTables.map(([key], index) => [key, (results[index].data || []).map((row: any) => row.data)]));
+    const data = { ...Object.fromEntries(scalableTables.map(([key], index) => [key, (results[index].data || []).map((row: any) => row.data)])), suppliers: workspaceResult.data?.data?.suppliers || [], purchases: workspaceResult.data?.data?.purchases || [] };
     return { data, normalized: true };
   }
   const { data, error } = await db.from("crm_workspaces").select("data").eq("owner_id", ownerId).single();
@@ -104,7 +109,7 @@ async function writeLiveData(db: any, ownerId: string, data: Record<string, any>
     const { error: insertError } = await db.from(table).upsert(items.map((item: any) => ({ workspace_owner_id: ownerId, record_id: String(item.id), search_key: JSON.stringify(item).toLowerCase(), data: item, updated_at: new Date().toISOString() })), { onConflict: "workspace_owner_id,record_id" });
     if (insertError) throw insertError;
   }
-  const { error: anchorError } = await db.from("crm_workspaces").update({ data: { normalizedRecords: true }, updated_at: new Date().toISOString() }).eq("owner_id", ownerId);
+  const { error: anchorError } = await db.from("crm_workspaces").update({ data: { normalizedRecords: true, suppliers: Array.isArray(data.suppliers) ? data.suppliers : [], purchases: Array.isArray(data.purchases) ? data.purchases : [] }, updated_at: new Date().toISOString() }).eq("owner_id", ownerId);
   if (anchorError) throw anchorError;
 }
 

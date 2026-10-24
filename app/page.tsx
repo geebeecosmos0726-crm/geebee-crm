@@ -26,6 +26,7 @@ import "./order-import-review.css";
 import "./customer-transfer.css";
 import "./crm-polish.css";
 import "./auth-reference.css";
+import "./inventory-reconciliation.css";
 import { supabase } from "./lib/supabase";
 import type { Session } from "@supabase/supabase-js";
 import {
@@ -40,6 +41,7 @@ import {
   ClipboardList,
   FileText,
   ImagePlus,
+  Keyboard,
   Download,
   Crop,
   Copy,
@@ -60,15 +62,28 @@ import {
   Warehouse,
   X,
 } from "lucide-react";
-type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; review?: { product?: boolean; quantity?: boolean; price?: boolean } };
+type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; masterPriceChanged?: boolean; review?: { product?: boolean; quantity?: boolean; price?: boolean } };
 type QuoteProduct = ProductLine & { discount: number };
 type CatalogueItem = { id: number; name: string; sku: string; unitPrice: number; category: string; image: string; description: string; cartonQty: string; innerQty?: string; outerQty?: string; subCategory?: string; brand?: string; unit?: string; packSize?: string; moq?: number; purchasePrice?: number; wholesalePrice?: number; distributorPrice?: number; gst?: number; barcode?: string; weight?: string; dimensions?: string; supplier?: string; countryOfOrigin?: string; availableQuantity?: number; openingStock?: number; purchasedStock?: number; orderedStock?: number; damagedStock?: number; reservedStock?: number; reorderThreshold?: number };
+type InventoryReconciliation = { sourceLabel: string; quantity: number; status: "matched" | "unmatched" | "ambiguous"; sku?: string; name?: string; currentAvailable?: number; candidates?: string[] };
 type PurchaseLine = { sku: string; product: string; quantity: number; receivedQuantity: number };
 type PurchaseOrder = { id: string; supplier: string; status: "Draft" | "Ordered" | "Part received" | "Delivered" | "Cancelled"; expectedDate: string; createdAt: string; notes: string; lines: PurchaseLine[] };
 type ClientSpecialRate = { sku: string; rate: number };
-const crmModules = ["Overview", "Clients", "Leads", "Orders", "Catalogue", "Invoices", "Payments", "Shipments"] as const;
+const crmModules = ["Dashboard", "Customers", "Enquiries", "Daily Tasks", "Sales", "Products", "Inventory", "Operations", "Fulfilment", "Billing", "Imports", "Reports", "Automation", "Settings"] as const;
 type CrmModule = typeof crmModules[number];
-type WorkspaceMember = { id: number; workspace_owner_id: string; email: string; role: "admin" | "employee"; modules: CrmModule[] };
+type ModuleAccess = "view" | "edit";
+type WorkspaceMember = { id: number; workspace_owner_id: string; email: string; role: "admin" | "employee"; modules: string[] };
+const moduleToken = (module: CrmModule, access: ModuleAccess) => `${module}:${access}`;
+const allModuleTokens = () => crmModules.map((module) => moduleToken(module, "edit"));
+const legacyModuleGroups: Record<string, CrmModule[]> = {
+  Overview: ["Dashboard"], Clients: ["Customers"], Leads: ["Enquiries", "Daily Tasks"], Orders: ["Sales", "Operations", "Fulfilment"], Catalogue: ["Products"], Invoices: ["Billing"], Payments: ["Billing"], Shipments: ["Operations", "Imports"],
+};
+const memberModuleAccess = (tokens: string[] | undefined, module: CrmModule): ModuleAccess | undefined => {
+  const saved = tokens || [];
+  if (saved.includes(moduleToken(module, "edit"))) return "edit";
+  if (saved.includes(moduleToken(module, "view"))) return "view";
+  return saved.some((token) => legacyModuleGroups[token]?.includes(module)) ? "edit" : undefined;
+};
 type AccessRequest = { user_id: string; full_name: string; phone: string; email: string; created_at: string };
 type AuditEvent = { id: number; actor_email: string; action: string; module: string; details: string; created_at: string };
 type Order = {
@@ -103,6 +118,7 @@ type Client = {
   contact: string;
   phone: string;
   whatsapp?: string;
+  whatsappGroupLink?: string;
   email?: string;
   gstin?: string;
   pan?: string;
@@ -132,6 +148,18 @@ type SalesTask = { id: string; title: string; description?: string; time: string
 type Transporter = { id: number; name: string; contact: string; phone: string; email?: string; city?: string; area?: string; gstin?: string; serviceType?: string; notes?: string };
 type Supplier = { id: number; name: string; contact: string; phone: string; email?: string; city?: string; country?: string; gstin?: string; paymentTerms?: string; notes?: string; status?: "Active" | "Inactive" };
 type ScalableRecord = { record_id: string; data: unknown };
+const productStockCacheKey = (userId: string) => `geebee-product-stock-inventory:${userId}`;
+const readProductStockCache = (userId: string): CatalogueItem[] => {
+  if (typeof window === "undefined") return [];
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(productStockCacheKey(userId)) || "[]");
+    return Array.isArray(saved) ? saved : [];
+  } catch { return []; }
+};
+const saveProductStockCache = (userId: string, products: CatalogueItem[]) => {
+  if (typeof window === "undefined") return;
+  try { window.localStorage.setItem(productStockCacheKey(userId), JSON.stringify(products)); } catch { /* Storage is optional; the cloud copy remains authoritative. */ }
+};
 const scalableTables = [
   { key: "clients", table: "crm_clients", search: (item: Client) => `${item.customerId || ""} ${item.name} ${item.contact} ${item.phone} ${item.city}` },
   { key: "catalogue", table: "crm_products", search: (item: CatalogueItem) => `${item.sku} ${item.name} ${item.category} ${item.brand || ""}` },
@@ -303,9 +331,13 @@ const displayMoney = (value: string | number) => {
 };
 const openWhatsApp = (phone: string, message: string) => window.open(`https://wa.me/${phone.replace(/\D/g, "")}?text=${encodeURIComponent(message)}`, "_blank", "noopener,noreferrer");
 const availableStock = (product: CatalogueItem) => product.availableQuantity ?? ((product.openingStock || 0) + (product.purchasedStock || 0) - (product.orderedStock || 0) - (product.damagedStock || 0));
-const freeStock = (product: CatalogueItem) => product.availableQuantity ?? (availableStock(product) - (product.reservedStock || 0));
+// Available quantity belongs to the Product Stock Inventory Sheet. CRM orders
+// only reserve part of that quantity, so the Sheet and the CRM never overwrite
+// each other between stock syncs.
+const freeStock = (product: CatalogueItem) => Math.max(0, availableStock(product) - (product.reservedStock || 0));
 const linesFor = (order: Order): ProductLine[] => order.products || [{ product: order.product, sku: order.sku, quantity: order.quantity, unitPrice: order.unitPrice }];
 const orderTotal = (order: Order) => linesFor(order).reduce((total, line) => total + line.quantity * line.unitPrice, 0);
+const orderEntrySource = (order: Order) => /imported\s+from/i.test(order.remarks || "") ? "Import" : "Manual";
 const orderQuantity = (order: Order) => linesFor(order).reduce((total, line) => total + line.quantity, 0);
 const initials = (n: string) =>
   n
@@ -765,7 +797,7 @@ export default function Home() {
     [cloudError, setCloudError] = useState(""),
     [accessNotice, setAccessNotice] = useState(""),
     [workspaceOwnerId, setWorkspaceOwnerId] = useState<string | null>(null),
-    [allowedModules, setAllowedModules] = useState<CrmModule[]>([...crmModules]),
+    [allowedModules, setAllowedModules] = useState<string[]>(allModuleTokens()),
     [isAdmin, setIsAdmin] = useState(false),
     [members, setMembers] = useState<WorkspaceMember[]>([]),
     [accessRequests, setAccessRequests] = useState<AccessRequest[]>([]),
@@ -773,12 +805,28 @@ export default function Home() {
     [clientProfile, setClientProfile] = useState<Client | null>(null),
     [catalogueAttentionOnly, setCatalogueAttentionOnly] = useState(false),
     [notificationsOpen, setNotificationsOpen] = useState(false),
+    [shortcutsOpen, setShortcutsOpen] = useState(false),
     [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({ Customers: true, "Leads & Enquiries": true, Sales: true, Products: true, Inventory: true, Operations: true, Billing: true, Imports: true, Reports: true, Automation: true, Settings: true }),
     [modal, setModal] = useState<"order" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | null>(null),
     [editing, setEditing] = useState<any>(null),
     [toast, setToast] = useState("");
+  const [dashboardClock, setDashboardClock] = useState<number | null>(null);
+  useEffect(() => {
+    const refreshClock = () => setDashboardClock(Date.now());
+    refreshClock();
+    const timer = window.setInterval(refreshClock, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const dashboardGreeting = useMemo(() => {
+    if (!dashboardClock) return "Welcome";
+    const hour = Number(new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", hour: "numeric", hourCycle: "h23" }).format(new Date(dashboardClock)));
+    if (hour < 12) return "Good morning";
+    if (hour < 17) return "Good afternoon";
+    return "Good evening";
+  }, [dashboardClock]);
   const search = sectionSearches[section] || "";
   const setSearch = (value: string) => setSectionSearches((current) => ({ ...current, [section]: value }));
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const recordSnapshots = useRef<Record<string, Map<string, string>>>({});
   // Customer records are business-critical.  They may only be removed from
   // the cloud after an explicit delete action, never because a browser has
@@ -790,7 +838,6 @@ export default function Home() {
     explicitCloudDeletes.current[table] = marked;
   };
   const sheetSyncTimer = useRef<number | null>(null);
-  const categoryMigrationCompleted = useRef(false);
   const flash = (m: string) => {
       setToast(m);
       setTimeout(() => setToast(""), 2600);
@@ -799,6 +846,37 @@ export default function Home() {
       setEditing(d || null);
       setModal(k);
     };
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setModal(null);
+        setEditing(null);
+        setClientProfile(null);
+        setNotificationsOpen(false);
+        setShortcutsOpen(false);
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      const isTyping = target?.matches("input, textarea, select, [contenteditable='true']");
+      if (isTyping || modal || clientProfile) return;
+      if ((event.metaKey || event.ctrlKey) && event.code === "KeyK") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        return;
+      }
+      if (event.shiftKey && event.code === "Slash") {
+        event.preventDefault();
+        setShortcutsOpen((current) => !current);
+        return;
+      }
+      if (event.altKey === false || event.ctrlKey || event.metaKey) return;
+      if (event.code === "KeyO") { event.preventDefault(); show("order"); }
+      if (event.code === "KeyC") { event.preventDefault(); show("client"); }
+      if (event.code === "KeyT") { event.preventDefault(); show("task"); }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [modal, clientProfile]);
   // The regular automated backup still runs every 12 hours. For deletions we
   // also request a short, authenticated backup after the cloud record sync has
   // completed, so the Google Sheet does not retain removed records.
@@ -866,10 +944,10 @@ export default function Home() {
       // by a hard-coded email address. This allows GeeBee to change its
       // official email without ever disconnecting the stored CRM data.
       const { data: ownedWorkspace } = await cloud.from("crm_workspaces").select("owner_id").eq("owner_id", session.user.id).maybeSingle();
-      if (ownedWorkspace) { setWorkspaceOwnerId(session.user.id); setAllowedModules([...crmModules]); setIsAdmin(true); setWorkspaceAccessReady(true); return; }
+      if (ownedWorkspace) { setWorkspaceOwnerId(session.user.id); setAllowedModules(allModuleTokens()); setIsAdmin(true); setWorkspaceAccessReady(true); return; }
       const { data } = await cloud.from("crm_workspace_members").select("id, workspace_owner_id, email, role, modules").ilike("email", email).maybeSingle();
       if (!data) { setAccessNotice("Your access request has been sent to the GeeBee administrator. You can sign in once your account is approved."); setWorkspaceAccessReady(true); await cloud.auth.signOut(); return; }
-      const member = data as WorkspaceMember; setWorkspaceOwnerId(member.workspace_owner_id); setAllowedModules(member.modules || ["Overview"]); setIsAdmin(member.role === "admin"); setWorkspaceAccessReady(true);
+      const member = data as WorkspaceMember; setWorkspaceOwnerId(member.workspace_owner_id); setAllowedModules(member.modules || [moduleToken("Dashboard", "view")]); setIsAdmin(member.role === "admin"); setWorkspaceAccessReady(true);
     };
     void resolveWorkspaceAccess();
   }, [session?.user.id]);
@@ -917,31 +995,29 @@ export default function Home() {
     return () => { cancelled = true; };
   }, [authReady, session, storageReady, workspaceOwnerId, isAdmin]);
   useEffect(() => {
-    const cloud = supabase;
-    if (!cloud || !cloudReady || !workspaceOwnerId || catalogueHydrated) return;
+    if (!cloudReady || !session?.access_token || catalogueHydrated) return;
     let cancelled = false;
     const timer = window.setTimeout(async () => {
-      const { data, error } = await cloud.from("crm_products").select("record_id, data").eq("workspace_owner_id", workspaceOwnerId).order("updated_at", { ascending: false }).limit(50000);
-      if (cancelled) return;
-      if (error) { setCloudError("Catalogue could not be loaded yet. Please refresh once your connection is stable."); return; }
-      const rows = (data || []) as ScalableRecord[];
-      setCatalogue(rows.map((row) => ({ ...(row.data as CatalogueItem), name: catalogueName(row.data as CatalogueItem) })));
-      recordSnapshots.current.crm_products = new Map(rows.map((row) => [row.record_id, JSON.stringify(row.data)]));
-      setCatalogueHydrated(true);
+      try {
+        const response = await fetch("/api/import/google-product-master", { headers: { Authorization: `Bearer ${session.access_token}` } });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Product / SKU master could not be loaded.");
+        if (cancelled) return;
+        const products = (result.products || []) as CatalogueItem[];
+        setCatalogue(products.map((product) => ({ ...product, name: catalogueName(product) })));
+        setCatalogueHydrated(true);
+      } catch (error) {
+        if (!cancelled) setCloudError(error instanceof Error ? error.message : "Product / SKU master could not be loaded.");
+      }
     }, 300);
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [cloudReady, workspaceOwnerId, catalogueHydrated]);
-  useEffect(() => {
-    if (!catalogueHydrated || categoryMigrationCompleted.current) return;
-    categoryMigrationCompleted.current = true;
-    setCatalogue((current) => current.map((item) => ({ ...item, category: categoriseProduct(item) })));
-  }, [catalogueHydrated]);
+  }, [cloudReady, session?.access_token, catalogueHydrated]);
   useEffect(() => {
     const cloud = supabase;
     if (!cloud || !session || !cloudReady || !workspaceOwnerId) return;
     const collections: Array<{ table: string; items: any[]; search: (item: any) => string }> = [
       { table: "crm_clients", items: clients, search: scalableTables[0].search }, { table: "crm_products", items: catalogue, search: scalableTables[1].search }, { table: "crm_orders", items: orders, search: scalableTables[2].search }, { table: "crm_invoices", items: invoices, search: scalableTables[3].search }, { table: "crm_leads", items: leads, search: scalableTables[4].search }, { table: "crm_quotes", items: quotes, search: scalableTables[5].search }, { table: "crm_tasks", items: tasks, search: scalableTables[6].search }, { table: "crm_transporters", items: transporters, search: scalableTables[7].search },
-    ].filter((collection) => collection.table !== "crm_products" || catalogueHydrated);
+    ].filter((collection) => collection.table !== "crm_products");
     const syncTimer = window.setTimeout(async () => {
       for (const { table, items, search } of collections) {
         const previous = recordSnapshots.current[table] || new Map<string, string>();
@@ -994,21 +1070,20 @@ export default function Home() {
   );
   const lowStockProducts = catalogue.filter((product) => (product.reorderThreshold || 0) > 0 && availableStock(product) <= (product.reorderThreshold || 0));
   const incompleteCatalogueProducts = catalogue.filter(isProductProfileIncomplete);
-  const taskViewer = `${session?.user.user_metadata?.full_name || ""} ${session?.user.email || ""}`.trim().toLowerCase();
-  const visibleTasks = isAdmin ? tasks : tasks.filter((task) => { const assignee = task.assignee.trim().toLowerCase(); return Boolean(assignee) && (assignee === taskViewer || taskViewer.includes(assignee)); });
+  const taskViewer = String(session?.user.email || "").trim().toLowerCase();
+  const signedInName = String(session?.user.user_metadata?.full_name || session?.user.user_metadata?.name || session?.user.email?.split("@")[0] || "GeeBee user").trim();
+  // Daily tasks are private to their creator. Administrators retain visibility
+  // of the full task list for supervision.
+  const visibleTasks = isAdmin ? tasks : tasks.filter((task) => task.assignee.trim().toLowerCase() === taskViewer);
   const activeTasks = visibleTasks.filter((task) => task.status === "Open");
   const receivePurchase = (purchase: PurchaseOrder) => {
     if (purchase.status === "Cancelled" || purchase.status === "Delivered") return;
     const remaining = purchase.lines.filter((line) => Math.max(0, line.quantity - line.receivedQuantity) > 0);
     if (!remaining.length) return;
     if (!window.confirm(`Receive the remaining ${remaining.reduce((sum, line) => sum + line.quantity - line.receivedQuantity, 0).toLocaleString("en-IN")} unit(s) for ${purchase.id}? This will add them to available SKU stock.`)) return;
-    setCatalogue((current) => current.map((product) => {
-      const delivered = remaining.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity - line.receivedQuantity, 0);
-      return delivered ? { ...product, availableQuantity: availableStock(product) + delivered, purchasedStock: (product.purchasedStock || 0) + delivered } : product;
-    }));
     setPurchases((current) => current.map((item) => item.id === purchase.id ? { ...item, status: "Delivered", lines: item.lines.map((line) => ({ ...line, receivedQuantity: line.quantity })) } : item));
-    logActivity("Received purchase order", "Purchase Orders", `${purchase.id} · ${remaining.length} SKU line(s) added to available inventory`);
-    flash(`${purchase.id} delivered. Available quantities have been updated.`);
+    logActivity("Received purchase order", "Purchase Orders", `${purchase.id} · ${remaining.length} SKU line(s) awaiting Product Stock Inventory sync`);
+    flash(`${purchase.id} marked delivered. Refresh Product Stock Inventory after Tally/Sheet stock is updated.`);
   };
   const cancelOrder = (order: Order) => {
     if (!window.confirm(`Cancel ${order.id}? Its allocated stock will be released back to available inventory.`)) return;
@@ -1023,7 +1098,7 @@ export default function Home() {
       const dispatched = dispatchedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       const reserved = reservedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       if (!dispatched && !reserved) return product;
-      return { ...product, availableQuantity: availableStock(product) + dispatched, reservedStock: Math.max(0, (product.reservedStock || 0) - reserved) };
+      return { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - dispatched - reserved) };
     }));
     const cancelledIds = isAdvance ? [order.id] : [primaryId, advanceId];
     setOrders((current) => current.map((item) => {
@@ -1061,7 +1136,7 @@ export default function Home() {
       const dispatched = dispatchedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       const reserved = reservedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       if (!dispatched && !reserved) return product;
-      return { ...product, availableQuantity: availableStock(product) + dispatched, reservedStock: Math.max(0, (product.reservedStock || 0) - reserved) };
+      return { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - dispatched - reserved) };
     }));
     setOrders((current) => current.filter((item) => !removedIds.has(item.id)));
     setInvoices((current) => current.filter((invoice) => !removedIds.has(invoice.order)));
@@ -1080,7 +1155,7 @@ export default function Home() {
     setCatalogue((current) => current.map((product) => {
       const released = confirmedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       const unreserved = shortageLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      return !released && !unreserved ? product : { ...product, availableQuantity: availableStock(product) + released, reservedStock: Math.max(0, (product.reservedStock || 0) - unreserved) };
+      return !released && !unreserved ? product : { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - released - unreserved) };
     }));
     const first = restoredLines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
     setOrders((current) => current.filter((item) => item.id !== advanceId).map((item) => item.id === order.id ? { ...item, ...first, products: restoredLines, approvedProducts: undefined, backorders: undefined, clientApproval: undefined, status: "Draft" } : item));
@@ -1119,10 +1194,10 @@ export default function Home() {
     if (order.status !== "Draft" || isBackorderRecord(order)) return;
     const requestedLines = linesFor(order);
     if (!requestedLines.length) { flash("Add at least one product line before confirming this order."); return; }
-    if (!window.confirm(`Confirm ${order.id}? Available quantity will be reserved now and shortages will be made into backorders.`)) return;
+    if (!window.confirm(`Confirm ${order.id}? CRM will reserve Sheet stock now and shortages will be made into backorders.`)) return;
     const shortages: ProductLine[] = [];
     const dispatchLines: ProductLine[] = [];
-    const remainingStock = new Map(catalogue.map((product) => [skuKey(product.sku), availableStock(product)]));
+    const remainingStock = new Map(catalogue.map((product) => [skuKey(product.sku), freeStock(product)]));
     requestedLines.forEach((line) => {
       const key = skuKey(line.sku); const available = remainingStock.get(key) || 0;
       const dispatchNow = Math.max(0, Math.min(line.quantity, available)); const short = Math.max(0, line.quantity - dispatchNow);
@@ -1133,7 +1208,7 @@ export default function Home() {
     setCatalogue((current) => current.map((product) => {
       const dispatched = dispatchLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       const short = shortages.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      return !dispatched && !short ? product : { ...product, availableQuantity: Math.max(0, availableStock(product) - dispatched), reservedStock: (product.reservedStock || 0) + short };
+      return !dispatched && !short ? product : { ...product, reservedStock: (product.reservedStock || 0) + dispatched + short };
     }));
     const firstDispatch = dispatchLines[0] || requestedLines[0];
     const confirmedOrder: Order = { ...order, product: firstDispatch.product, sku: firstDispatch.sku, quantity: firstDispatch.quantity, unitPrice: firstDispatch.unitPrice, products: dispatchLines, approvedProducts: dispatchLines, status: "Confirmed", backorders: shortages };
@@ -1145,7 +1220,7 @@ export default function Home() {
       setTasks((current) => [...current, { id: `TASK-${Date.now()}`, title: `Arrange future dispatch for advance order ${advanceOrder.id}`, time: "10:00", dueDate: new Date().toISOString().slice(0, 10), assignee: "Rahul", type: "Follow-up", status: "Open", relatedTo: advanceOrder.id }]);
     }
     logActivity("Confirmed order and reserved inventory", "Orders", shortages.length ? `${order.id} · ${shortages.length} shortage line(s) moved to backorder` : order.id);
-    flash(shortages.length ? `${order.id} confirmed; available quantity reserved and shortage created as backorder.` : `${order.id} confirmed and available quantity reserved.`);
+    flash(shortages.length ? `${order.id} confirmed; CRM reserved Sheet stock and created a backorder.` : `${order.id} confirmed and CRM stock reserved.`);
   };
   const pushToDispatchPlan = (order: Order) => {
     if (order.status !== "Confirmed") return;
@@ -1168,38 +1243,47 @@ export default function Home() {
       const releasedQuantity = Math.max(0, approved.quantity - dispatchQuantity);
       if (releasedQuantity) releasedLines.push({ ...approved, quantity: releasedQuantity });
     });
-    if (!window.confirm(`Send ${order.id} to Dispatch Plan? Any quantity reduced by Operations will be returned to available stock.`)) return;
+    if (!window.confirm(`Send ${order.id} to Dispatch Plan? Any quantity reduced by Operations will be released from CRM reservation.`)) return;
     setCatalogue((current) => current.map((product) => {
       const released = releasedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      return released ? { ...product, availableQuantity: availableStock(product) + released } : product;
+      return released ? { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - released) } : product;
     }));
     const first = dispatchLines[0] || approvedLines[0];
     setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, status: "Dispatch plan" } : item));
-    logActivity("Sent confirmed order to Dispatch Plan", "Dispatch Plan", releasedLines.length ? `${order.id} · reduced quantity returned to available stock` : order.id);
-    flash(releasedLines.length ? `${order.id} sent to Dispatch Plan; reduced quantities were returned to available stock.` : `${order.id} sent to Dispatch Plan for Operations.`);
+    logActivity("Sent confirmed order to Dispatch Plan", "Dispatch Plan", releasedLines.length ? `${order.id} · reduced CRM reservation released` : order.id);
+    flash(releasedLines.length ? `${order.id} sent to Dispatch Plan; reduced quantities were released from CRM reservation.` : `${order.id} sent to Dispatch Plan for Operations.`);
   };
   const navigationGroups = [
-    { label: "Dashboard", icon: LayoutDashboard, items: [{ label: "Dashboard", section: "Overview", module: "Overview" as CrmModule }] },
-    { label: "Customers", icon: Users, items: [{ label: "All Customers", section: "Clients", module: "Clients" as CrmModule, count: String(clients.length) }, { label: "New Customers", section: "New Customers", module: "Clients" as CrmModule }, { label: "Customer Groups", section: "Customer Groups", module: "Clients" as CrmModule }, { label: "Customer Activity", section: "Customer Activity", module: "Clients" as CrmModule }] },
-    { label: "Enquiries", icon: Target, items: [{ label: "Enquiries", section: "Leads", module: "Leads" as CrmModule, count: String(leads.filter((lead) => lead.status !== "Lost" && lead.status !== "Order Created").length) }, { label: "Lost Leads", section: "Lost Leads", module: "Leads" as CrmModule }] },
-    { label: "Daily Tasks", icon: ClipboardList, items: [{ label: "Daily Tasks", section: "Follow-ups", module: "Leads" as CrmModule, count: String(activeTasks.length) }] },
-    { label: "Sales", icon: BriefcaseBusiness, items: [{ label: "Orders", section: "Orders", module: "Orders" as CrmModule, count: String(orders.filter((order) => order.status === "Draft").length) }, { label: "Confirmed Orders", section: "Confirmed Orders", module: "Orders" as CrmModule, count: String(orders.filter((order) => order.status === "Confirmed").length) }, { label: "Backorders", section: "Backorders", module: "Orders" as CrmModule, count: String(orders.filter(isVisibleBackorder).length) }, { label: "Returns", section: "Returns", module: "Orders" as CrmModule }] },
-    { label: "Products", icon: Boxes, items: [{ label: "Products / SKUs", section: "Catalogue", module: "Catalogue" as CrmModule, count: String(catalogue.length) }, { label: "Categories", section: "Categories", module: "Catalogue" as CrmModule }, { label: "Price Lists", section: "Price Lists", module: "Catalogue" as CrmModule }, { label: "Stock", section: "Stock", module: "Catalogue" as CrmModule }] },
-    { label: "Inventory", icon: Warehouse, items: [{ label: "Stock Overview", section: "Stock Overview" }, { label: "Stock Movements", section: "Stock Movements" }, { label: "Low Stock", section: "Low Stock" }, { label: "Reserved Stock", section: "Reserved Stock" }, { label: "Warehouses", section: "Warehouses" }] },
-    { label: "Operations", icon: Truck, items: [{ label: "Dispatch Plan", section: "Dispatch Plan", module: "Orders" as CrmModule, count: String(orders.filter((order) => order.status === "Dispatch plan").length) }, { label: "Transporters", section: "Transporters", module: "Shipments" as CrmModule, count: String(transporters.length) }, { label: "Picking", section: "Picking" }, { label: "Packing", section: "Packing" }] },
-    { label: "Fulfilment", icon: Truck, items: [{ label: "Sent to Customer", section: "Sent to Customer", module: "Orders" as CrmModule, count: String(orders.filter((order) => order.status === "Sent to customer").length) }] },
-    { label: "Billing", icon: ReceiptText, items: [{ label: "Invoices", section: "Invoices", module: "Invoices" as CrmModule, count: String(invoices.filter((i) => i.status !== "Paid").length) }, { label: "Payments", section: "Payments", module: "Payments" as CrmModule, count: "2" }, { label: "Outstanding", section: "Outstanding", module: "Payments" as CrmModule }, { label: "Ageing", section: "Ageing", module: "Payments" as CrmModule }] },
-    { label: "Imports", icon: ShipWheel, items: [{ label: "Suppliers", section: "Suppliers", count: String(suppliers.length) }, { label: "Purchase Orders", section: "Purchase Orders", count: String(purchases.filter((purchase) => !["Delivered", "Cancelled"].includes(purchase.status)).length) }, { label: "Shipments", section: "Shipments", module: "Shipments" as CrmModule }, { label: "Containers", section: "Containers", module: "Shipments" as CrmModule }, { label: "Landed Cost", section: "Landed Cost", module: "Shipments" as CrmModule }] },
-    { label: "Reports", icon: ChartNoAxesCombined, items: [{ label: "Sales", section: "Sales Report" }, { label: "Customers", section: "Customer Report" }, { label: "Products", section: "Product Report" }, { label: "Inventory", section: "Inventory Report" }, { label: "Payments", section: "Payment Report" }, { label: "Sales Team", section: "Sales Team Report" }] },
-    { label: "Automation", icon: Bot, items: [{ label: "Rules", section: "Rules" }, { label: "Notifications", section: "Notifications" }, { label: "Templates", section: "Templates" }] },
-    { label: "Settings", icon: Settings, items: [{ label: "Users", section: "Settings" }, { label: "Roles", section: "Settings" }, { label: "Import / Export", section: "Data Transfer" }, { label: "Data recovery", section: "Recovery" }, { label: "GST", section: "GST" }, { label: "Warehouses", section: "Warehouses" }, { label: "WhatsApp", section: "WhatsApp" }, { label: "Integrations", section: "Integrations" }] },
+    { label: "Dashboard", module: "Dashboard" as CrmModule, icon: LayoutDashboard, items: [{ label: "Dashboard", section: "Overview" }] },
+    { label: "Customers", module: "Customers" as CrmModule, icon: Users, items: [{ label: "All Customers", section: "Clients", count: String(clients.length) }, { label: "New Customers", section: "New Customers" }, { label: "Customer Groups", section: "Customer Groups" }, { label: "Customer Activity", section: "Customer Activity" }] },
+    { label: "Enquiries", module: "Enquiries" as CrmModule, icon: Target, items: [{ label: "Enquiries", section: "Leads", count: String(leads.filter((lead) => lead.status !== "Lost" && lead.status !== "Order Created").length) }, { label: "Lost Leads", section: "Lost Leads" }] },
+    { label: "Daily Tasks", module: "Daily Tasks" as CrmModule, icon: ClipboardList, items: [{ label: "Daily Tasks", section: "Follow-ups", count: String(activeTasks.length) }] },
+    { label: "Sales", module: "Sales" as CrmModule, icon: BriefcaseBusiness, items: [{ label: "Orders", section: "Orders", count: String(orders.filter((order) => order.status === "Draft").length) }, { label: "Fetch Orders", section: "Fetch Orders" }, { label: "Confirmed Orders", section: "Confirmed Orders", count: String(orders.filter((order) => order.status === "Confirmed").length) }, { label: "Backorders", section: "Backorders", count: String(orders.filter(isVisibleBackorder).length) }, { label: "Returns", section: "Returns" }] },
+    { label: "Products", module: "Products" as CrmModule, icon: Boxes, items: [{ label: "Products / SKUs", section: "Product Stock Inventory" }, { label: "Categories", section: "Categories" }, { label: "Price Lists", section: "Price Lists" }] },
+    { label: "Inventory", module: "Inventory" as CrmModule, icon: Warehouse, items: [{ label: "Stock Overview", section: "Stock Overview" }, { label: "Stock Movements", section: "Stock Movements" }, { label: "Low Stock", section: "Low Stock" }, { label: "Reserved Stock", section: "Reserved Stock" }, { label: "Warehouses", section: "Warehouses" }] },
+    { label: "Operations", module: "Operations" as CrmModule, icon: Truck, items: [{ label: "Dispatch Plan", section: "Dispatch Plan", count: String(orders.filter((order) => order.status === "Dispatch plan").length) }, { label: "Transporters", section: "Transporters", count: String(transporters.length) }, { label: "Picking", section: "Picking" }, { label: "Packing", section: "Packing" }] },
+    { label: "Fulfilment", module: "Fulfilment" as CrmModule, icon: Truck, items: [{ label: "Sent to Customer", section: "Sent to Customer", count: String(orders.filter((order) => order.status === "Sent to customer").length) }] },
+    { label: "Billing", module: "Billing" as CrmModule, icon: ReceiptText, items: [{ label: "Invoices", section: "Invoices", count: String(invoices.filter((i) => i.status !== "Paid").length) }, { label: "Payments", section: "Payments", count: "2" }, { label: "Outstanding", section: "Outstanding" }, { label: "Ageing", section: "Ageing" }] },
+    { label: "Imports", module: "Imports" as CrmModule, icon: ShipWheel, items: [{ label: "Suppliers", section: "Suppliers", count: String(suppliers.length) }, { label: "Purchase Orders", section: "Purchase Orders", count: String(purchases.filter((purchase) => !["Delivered", "Cancelled"].includes(purchase.status)).length) }, { label: "Shipments", section: "Shipments" }, { label: "Containers", section: "Containers" }, { label: "Landed Cost", section: "Landed Cost" }] },
+    { label: "Reports", module: "Reports" as CrmModule, icon: ChartNoAxesCombined, items: [{ label: "Sales", section: "Sales Report" }, { label: "Customers", section: "Customer Report" }, { label: "Products", section: "Product Report" }, { label: "Inventory", section: "Inventory Report" }, { label: "Payments", section: "Payment Report" }, { label: "Sales Team", section: "Sales Team Report" }] },
+    { label: "Automation", module: "Automation" as CrmModule, icon: Bot, items: [{ label: "Rules", section: "Rules" }, { label: "Notifications", section: "Notifications" }, { label: "Templates", section: "Templates" }] },
+    { label: "Settings", module: "Settings" as CrmModule, icon: Settings, items: [{ label: "Users", section: "Settings" }, { label: "Roles", section: "Settings" }, { label: "Import / Export", section: "Data Transfer" }, { label: "Data recovery", section: "Recovery" }, { label: "GST", section: "GST" }, { label: "Warehouses", section: "Warehouses" }, { label: "WhatsApp", section: "WhatsApp" }, { label: "Integrations", section: "Integrations" }] },
   ];
   const notifications = [
     ...lowStockProducts.map((product) => ({ title: `Low stock: ${catalogueName(product)}`, detail: `${catalogueSku(product)} · ${availableStock(product).toLocaleString("en-IN")} available / alert at ${(product.reorderThreshold || 0).toLocaleString("en-IN")}`, time: "Create a purchase order" })),
     ...auditEvents.slice(0, 4).map((event) => ({ title: event.action, detail: `${event.actor_email} · ${event.module}`, time: new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) })),
     ...invoices.filter((invoice) => invoice.status !== "Paid").slice(0, 2).map((invoice) => ({ title: `${invoice.status} invoice ${invoice.id}`, detail: `${invoice.client} · ${displayMoney(invoice.amount)} due ${invoice.due}`, time: "Needs attention" })),
   ].slice(0, 6);
-  const liveSections = new Set(["Overview", "Clients", "Leads", "Follow-ups", "Lost Leads", "Quotations", "Orders", "Confirmed Orders", "Dispatch Plan", "Sent to Customer", "Backorders", "Invoices", "Catalogue", "Categories", "Transporters", "Suppliers", "Purchase Orders", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report", "Settings", "Recovery", "Data Transfer"]);
+  const liveSections = new Set(["Overview", "Clients", "Leads", "Follow-ups", "Lost Leads", "Quotations", "Orders", "Confirmed Orders", "Dispatch Plan", "Sent to Customer", "Backorders", "Invoices", "Catalogue", "Categories", "Product Stock Inventory", "Fetch Orders", "Transporters", "Suppliers", "Purchase Orders", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report", "Settings", "Recovery", "Data Transfer"]);
+  const activeModule = navigationGroups.find((group) => group.items.some((item) => item.section === section))?.module || "Dashboard";
+  const currentModuleAccess = isAdmin ? "edit" : memberModuleAccess(allowedModules, activeModule);
+  const isViewOnly = currentModuleAccess === "view";
+  const blockViewOnlyChange = (event: React.SyntheticEvent<HTMLElement>) => {
+    if (!isViewOnly) return;
+    const target = event.target as HTMLElement;
+    if (target.closest(".search")) return;
+    if (target.closest("button, input, select, textarea")) { event.preventDefault(); event.stopPropagation(); flash("You have view-only access to this module. Ask an administrator for edit access."); }
+  };
   if (!authReady) return <div className="auth-screen"><div className="auth-card"><b>Opening secure workspace…</b></div></div>;
   if (!supabase) return <div className="auth-screen"><div className="auth-card"><span className="overline">GEEBEE CRM</span><h1>Cloud connection needed</h1><p>Add the Supabase environment settings to open this private workspace.</p></div></div>;
   if (session && !workspaceAccessReady) return <div className="auth-screen"><div className="auth-card"><b>Checking workspace access…</b><p>Your account is being securely verified.</p></div></div>;
@@ -1220,7 +1304,7 @@ export default function Home() {
         </div>
         <nav>
           {navigationGroups.map((group) => {
-            const permitted = group.items.filter((item) => liveSections.has(item.section) && (!item.module || isAdmin || allowedModules.includes(item.module)));
+            const permitted = group.items.filter((item) => liveSections.has(item.section) && (isAdmin || Boolean(memberModuleAccess(allowedModules, group.module))));
             if (!permitted.length) return null;
             const Icon = group.icon;
             const active = permitted.some((item) => section === item.section);
@@ -1229,39 +1313,46 @@ export default function Home() {
         </nav>
         <div className="side-bottom">
           <div className="profile">
-            <div className="avatar">RM</div>
+            <div className="avatar">{initials(signedInName)}</div>
             <div>
-              <b>{session.user.email}</b>
+              <b>{signedInName}</b>
+              <span>{session.user.email}</span>
               <span>{cloudReady ? "Cloud workspace synced" : "Connecting to cloud…"}</span>
             </div>
             <button className="sign-out" type="button" onClick={() => supabase?.auth.signOut()}>Sign out</button>
           </div>
         </div>
       </aside>
-      <section className="content">
+      <section className="content" onClickCapture={blockViewOnlyChange} onKeyDownCapture={blockViewOnlyChange}>
         <header>
           <div className="mobile-brand">GeeBee</div>
           <div className="search">
             <Search size={18} />
             <input
+              ref={searchInputRef}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder={`Search ${section === "Catalogue" ? "SKU or product" : section === "Clients" ? "customers" : section === "Orders" || section === "Confirmed Orders" || section === "Dispatch Plan" ? "orders" : section.toLowerCase()}...`}
             />
           </div>
+          <button className="shortcut-trigger" type="button" aria-label="Open keyboard shortcuts" onClick={() => setShortcutsOpen((current) => !current)}>
+            <Keyboard size={17}/><span>Shortcuts</span>
+          </button>
           <button className="icon-btn" type="button" aria-label="Open notifications" onClick={() => setNotificationsOpen((current) => !current)}>
             <Bell size={19} />
             {notifications.length > 0 && <i />}
           </button>
           {notificationsOpen && <section className="notification-popover"><div className="notification-head"><div><b>Notifications</b><span>Latest workspace updates</span></div><button type="button" onClick={() => setNotificationsOpen(false)}>Close</button></div>{notifications.length ? notifications.map((notification, index) => <article className="notification-item" key={`${notification.title}-${index}`}><span className="notification-dot"/><div><b>{notification.title}</b><p>{notification.detail}</p><small>{notification.time}</small></div></article>) : <p className="notification-empty">You are all caught up.</p>}</section>}
-          <div className="header-avatar">RM</div>
+          {shortcutsOpen && <section className="shortcuts-popover" aria-label="Keyboard shortcuts"><div><b>Quick shortcuts</b><button type="button" onClick={() => setShortcutsOpen(false)} aria-label="Close shortcuts"><X size={16}/></button></div><p><kbd>⌘/Ctrl</kbd><kbd>K</kbd><span>Search this section</span></p><p><kbd>Alt</kbd><kbd>O</kbd><span>New order</span></p><p><kbd>Alt</kbd><kbd>C</kbd><span>New customer</span></p><p><kbd>Alt</kbd><kbd>T</kbd><span>New daily task</span></p><p><kbd>Esc</kbd><span>Close any open window</span></p><small>Shortcuts do not run while you are typing in a field.</small></section>}
+          <div className="header-avatar" title={session.user.email}>{initials(signedInName)}</div>
         </header>
         {cloudError && <div className="cloud-warning">{cloudError}</div>}
+        {isViewOnly && <div className="cloud-warning">View-only access: you can review this module, but only an administrator can grant permission to make changes.</div>}
         {(activeTasks.length > 0 || lowStockProducts.length > 0 || incompleteCatalogueProducts.length > 0) && <div className="crm-alert-strip" role="status">{activeTasks.length > 0 && <button type="button" onClick={() => setSection("Follow-ups")}><ClipboardList size={15}/><b>{activeTasks.length} active task{activeTasks.length === 1 ? "" : "s"}</b><span>Review today’s work</span></button>}{lowStockProducts.length > 0 && <button type="button" onClick={() => setSection("Purchase Orders")}><PackageCheck size={15}/><b>{lowStockProducts.length} low-stock item{lowStockProducts.length === 1 ? "" : "s"}</b><span>Create purchase orders</span></button>}{incompleteCatalogueProducts.length > 0 && <button type="button" onClick={() => { setSearch(""); setCatalogueAttentionOnly(true); setSection("Catalogue"); }}><PackageCheck size={15}/><b>{incompleteCatalogueProducts.length} incomplete product{incompleteCatalogueProducts.length === 1 ? "" : "s"}</b><span>Complete SKU details</span></button>}</div>}
         <div className="page-head">
           <div>
             <div className="eyebrow">MONDAY, 15 SEPTEMBER 2026</div>
-            <h1>{section === "Overview" ? "Good morning, Rahul" : section}</h1>
+            <h1>{section === "Overview" ? `${dashboardGreeting}, ${signedInName}` : section}</h1>
             <p>
               {section === "Overview"
                 ? "Here’s what’s happening with your import business."
@@ -1303,7 +1394,7 @@ export default function Home() {
           />
         )}{" "}
         {section === "Orders" && <Orders orders={shown.filter((order) => order.status === "Draft")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Draft")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} confirm={confirmOrder} />}{" "}
-        {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToOrders={returnConfirmedToOrders} pushToDispatch={pushToDispatchPlan} sendWhatsApp={(order) => window.open(`https://wa.me/?text=${encodeURIComponent(dispatchWhatsAppText(order))}`, "_blank", "noopener,noreferrer")} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Confirmed Orders", `${id} · ${clientApproval}`); }} confirmed />}{" "}
+        {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToOrders={returnConfirmedToOrders} pushToDispatch={pushToDispatchPlan} sendWhatsApp={(order) => { const client = clients.find((item) => item.name.trim().toLowerCase() === order.client.trim().toLowerCase()); const groupLink = client?.whatsappGroupLink?.trim(); if (groupLink) { try { const url = new URL(groupLink); if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "chat.whatsapp.com") throw new Error("invalid"); window.open(url.toString(), "_blank", "noopener,noreferrer"); logActivity("Opened customer WhatsApp group", "Confirmed Orders", `${order.id} · ${client?.name || order.client}`); return; } catch { window.alert("The saved WhatsApp group link is not valid. Use a link beginning with https://chat.whatsapp.com/ in the customer profile."); return; } } window.open(`https://wa.me/?text=${encodeURIComponent(dispatchWhatsAppText(order))}`, "_blank", "noopener,noreferrer"); logActivity("Opened WhatsApp approval", "Confirmed Orders", `${order.id} · no customer group link saved`); }} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Confirmed Orders", `${id} · ${clientApproval}`); }} confirmed />}{" "}
         {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToConfirmed={returnDispatchToConfirmed} markSent={markOrderSentToCustomer} />}{" "}
         {section === "Sent to Customer" && <FulfilmentPanel title="Sent to customer" description="These dispatched orders have been sent to the customer. This is the final fulfilment stage in the CRM." orders={orders.filter((order) => order.status === "Sent to customer" || order.status === "Received by customer")} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} />}{" "}
         {section === "Clients" && (
@@ -1315,7 +1406,7 @@ export default function Home() {
             )}
             edit={(c) => show("client", c)}
             view={(c) => setClientProfile(c)}
-            importCustomers={async (file) => { if (!file) return; try { const rows = await readCsv(file); const now = Date.now(); const incoming = rows.filter((row) => row["business name"]).map((row, index) => ({ id: now + index, customerId: row["customer id"] || `GB-C${now + index}`, name: row["business name"], city: row.city || "", phone: row.phone || "", contact: row["contact person"] || "", credit: row["payment threshold"] || "", paymentTerms: row["payment terms"] || "", customerStatus: row.status || "Active", avatar: initials(row["business name"]), specialRates: [] } as Client)); setClients((current) => { const incomingByName = new Map(incoming.map((client) => [client.name.toLowerCase(), client])); const existing = new Set(current.map((client) => client.name.toLowerCase())); return [...current.map((client) => incomingByName.has(client.name.toLowerCase()) ? { ...client, ...incomingByName.get(client.name.toLowerCase())!, id: client.id } : client), ...incoming.filter((client) => !existing.has(client.name.toLowerCase()))]; }); logActivity("Imported customer sheet", "Customers", `${incoming.length} customer row(s)`); flash(`${incoming.length} customer row${incoming.length === 1 ? "" : "s"} imported.`); } catch { flash("Customer import failed. Use the downloaded CSV template and keep the column headings unchanged."); } }}
+            importCustomers={async (file) => { if (!file) return; try { const rows = await readCsv(file); const now = Date.now(); const incoming = rows.filter((row) => row["business name"]).map((row, index) => ({ id: now + index, customerId: row["customer id"] || `GB-C${now + index}`, name: row["business name"], city: row.city || "", phone: row.phone || "", contact: row["contact person"] || "", whatsappGroupLink: row["whatsapp group link"] || "", credit: row["payment threshold"] || "", paymentTerms: row["payment terms"] || "", customerStatus: row.status || "Active", avatar: initials(row["business name"]), specialRates: [] } as Client)); setClients((current) => { const incomingByName = new Map(incoming.map((client) => [client.name.toLowerCase(), client])); const existing = new Set(current.map((client) => client.name.toLowerCase())); return [...current.map((client) => incomingByName.has(client.name.toLowerCase()) ? { ...client, ...incomingByName.get(client.name.toLowerCase())!, id: client.id } : client), ...incoming.filter((client) => !existing.has(client.name.toLowerCase()))]; }); logActivity("Imported customer sheet", "Customers", `${incoming.length} customer row(s)`); flash(`${incoming.length} customer row${incoming.length === 1 ? "" : "s"} imported.`); } catch { flash("Customer import failed. Use the downloaded CSV template and keep the column headings unchanged."); } }}
             remove={(ids) => { markForCloudDeletion("crm_clients", ids); setClients((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed client", "Clients", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} client${ids.length === 1 ? "" : "s"} removed`); }}
           />
         )}{" "}
@@ -1349,8 +1440,9 @@ export default function Home() {
             remove={(ids) => { setCatalogue((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed catalogue product", "Catalogue", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} product${ids.length === 1 ? "" : "s"} removed from catalogue`); }}
           />
         )}{" "}
-        {section === "Categories" && <CategoriesPanel items={catalogue} query={search} openCategory={(category) => { setSection("Catalogue"); setSectionSearches((current) => ({ ...current, Catalogue: category })); }} />}{" "}
-        {section === "Data Transfer" && <GoogleSheetOrderFetch existingOrders={orders} addOrders={setOrders} onAudit={logActivity} />}{" "}
+        {section === "Product Stock Inventory" && <ProductStockInventoryPanel session={session} canApply={isAdmin} onAudit={logActivity} query={search} onProductsSynced={setCatalogue} />}{" "}
+        {section === "Categories" && <ProductStockCategoriesPanel session={session} query={search} openCategory={(category) => { setSection("Product Stock Inventory"); setSectionSearches((current) => ({ ...current, "Product Stock Inventory": category })); }} />}{" "}
+        {section === "Fetch Orders" && <GoogleSheetOrderFetch existingOrders={orders} addOrders={setOrders} onAudit={logActivity} />}{" "}
         {section === "Transporters" && <TransportersPanel transporters={transporters.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.area || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("transporter", item)} add={() => show("transporter")} remove={(ids) => { setTransporters((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed transporter", "Transporters", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} transporter${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
         {section === "Suppliers" && <SuppliersPanel suppliers={suppliers.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.country || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("supplier", item)} add={() => show("supplier")} remove={(ids) => { setSuppliers((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed supplier", "Suppliers", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} supplier${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
         {section === "Settings" && <TeamAccess members={members} requests={accessRequests} workspaceOwnerId={workspaceOwnerId} canManage={isAdmin} onChange={setMembers} onRequestsChange={setAccessRequests} onAudit={logActivity} auditEvents={auditEvents} />}{" "}
@@ -1358,7 +1450,7 @@ export default function Home() {
         {section === "Recovery" && <RecoveryPanel canManage={isAdmin} session={session} clearBusinessData={() => { markForCloudDeletion("crm_clients", clients.map((client) => client.id)); setOrders([]); setClients([]); setInvoices([]); setLeads([]); setQuotes([]); setTasks([]); setTransporters([]); setPurchases([]); recordSnapshots.current = {}; flash("Business records have been permanently cleared. SKU catalogue was preserved."); }} applyRestore={(data) => { setOrders(data.orders); setClients(data.clients); setInvoices(data.invoices); setCatalogue(data.catalogue); setLeads(data.leads); setQuotes(data.quotes); setTasks(data.tasks); setTransporters(data.transporters || []); logActivity("Applied Google Sheets recovery", "Data recovery", "Recovery snapshot created before restore"); flash("Backup restored. Your previous CRM state is saved as a recovery snapshot."); }} />}{" "}
         {section === "Purchase Orders" && <PurchaseOrdersPanel purchases={purchases.filter((purchase) => `${purchase.id} ${purchase.supplier} ${purchase.lines.map((line) => `${line.sku} ${line.product}`).join(" ")}`.toLowerCase().includes(search.toLowerCase()))} catalogue={catalogue} lowStockProducts={lowStockProducts} add={(product) => show("purchase", product ? { lines: [{ sku: product.sku, product: catalogueName(product), quantity: Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)), receivedQuantity: 0 }], supplier: product.supplier || "" } : null)} edit={(purchase) => show("purchase", purchase)} receive={receivePurchase} cancel={(purchase) => { if (!window.confirm(`Cancel purchase order ${purchase.id}? No stock will be changed.`)) return; setPurchases((current) => current.map((item) => item.id === purchase.id ? { ...item, status: "Cancelled" } : item)); logActivity("Cancelled purchase order", "Purchase Orders", purchase.id); flash("Purchase order cancelled."); }} remove={(purchase) => { if (!window.confirm(`Permanently delete ${purchase.id}? This does not change stock.`)) return; setPurchases((current) => current.filter((item) => item.id !== purchase.id)); logActivity("Deleted purchase order", "Purchase Orders", purchase.id); syncGoogleSheetAfterDelete(); flash("Purchase order permanently deleted."); }} />} {" "}
         {section === "Notifications" && <AutomationPanel />}{" "}
-        {!(["Overview", "Orders", "Confirmed Orders", "Dispatch Plan", "Clients", "Leads", "Enquiries", "Follow-ups", "Lost Leads", "Quotations", "Backorders", "Invoices", "Catalogue", "Transporters", "Suppliers", "Purchase Orders", "Settings", "Recovery", "Data Transfer", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report"].includes(section)) && (
+        {!(["Overview", "Orders", "Confirmed Orders", "Dispatch Plan", "Clients", "Leads", "Enquiries", "Follow-ups", "Lost Leads", "Quotations", "Backorders", "Invoices", "Catalogue", "Product Stock Inventory", "Categories", "Fetch Orders", "Transporters", "Suppliers", "Purchase Orders", "Settings", "Recovery", "Data Transfer", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report"].includes(section)) && (
           <section className="panel coming">
             <div className="modal-mark">
               <ClipboardList size={22} />
@@ -1471,7 +1563,7 @@ export default function Home() {
       )}
       {modal === "lead" && <LeadModal lead={editing} close={() => setModal(null)} save={(lead) => { setLeads((current) => editing ? current.map((item) => item.id === editing.id ? lead : item) : [...current, lead]); setModal(null); logActivity(editing ? "Updated lead" : "Created lead", "Leads", `${lead.id} · ${lead.company}`); flash(editing ? "Lead updated" : "New lead created"); }} />}
       {modal === "quote" && <QuoteModal quote={editing} clients={clients} catalogue={catalogue} close={() => setModal(null)} save={(quote) => { setQuotes((current) => editing ? current.map((item) => item.id === editing.id ? quote : item) : [...current, quote]); setModal(null); logActivity(editing ? "Updated quotation" : "Created quotation", "Quotations", `${quote.id} · ${quote.customer}`); flash(editing ? "Quotation updated" : "Quotation created"); }} />}
-      {modal === "task" && <TaskModal task={editing} close={() => setModal(null)} save={(task) => { setTasks((current) => editing ? current.map((item) => item.id === editing.id ? task : item) : [...current, task]); setModal(null); logActivity(editing ? "Updated task" : "Created task", "Follow-ups", task.title); flash(editing ? "Task updated" : "Task created"); }} />}
+      {modal === "task" && <TaskModal task={editing} owner={session.user.email || signedInName} close={() => setModal(null)} save={(task) => { const savedTask = editing ? task : { ...task, assignee: session.user.email || signedInName }; setTasks((current) => editing ? current.map((item) => item.id === editing.id ? savedTask : item) : [...current, savedTask]); setModal(null); logActivity(editing ? "Updated task" : "Created task", "Daily Tasks", savedTask.title); flash(editing ? "Task updated" : "Task created"); }} />}
       {modal === "transporter" && <TransporterModal transporter={editing} close={() => setModal(null)} save={(transporter) => { setTransporters((current) => editing ? current.map((item) => item.id === editing.id ? transporter : item) : [...current, transporter]); setModal(null); logActivity(editing ? "Updated transporter" : "Added transporter", "Transporters", transporter.name); flash(editing ? "Transporter updated" : "Transporter added"); }} />}
       {modal === "supplier" && <SupplierModal supplier={editing} close={() => setModal(null)} save={(supplier) => { setSuppliers((current) => editing ? current.map((item) => item.id === editing.id ? supplier : item) : [...current, supplier]); setModal(null); logActivity(editing ? "Updated supplier" : "Added supplier", "Suppliers", supplier.name); flash(editing ? "Supplier updated" : "Supplier added"); }} />}
       {modal === "purchase" && <PurchaseOrderModal purchase={editing?.id ? editing as PurchaseOrder : null} draft={editing?.lines ? editing : null} catalogue={catalogue} suppliers={suppliers} close={() => setModal(null)} save={(purchase) => { if (purchase.supplier.trim()) setSuppliers((current) => current.some((supplier) => supplier.name.trim().toLowerCase() === purchase.supplier.trim().toLowerCase()) ? current : [...current, { id: Date.now(), name: purchase.supplier.trim(), contact: "", phone: "", email: "", city: "", country: "", gstin: "", paymentTerms: "", notes: "", status: "Active" }]); setPurchases((current) => editing?.id ? current.map((item) => item.id === purchase.id ? purchase : item) : [...current, purchase]); setModal(null); logActivity(editing?.id ? "Updated purchase order" : "Created purchase order", "Purchase Orders", purchase.id); flash(editing?.id ? "Purchase order updated." : "Purchase order created. Stock will change only when it is received."); }} />}
@@ -1746,15 +1838,11 @@ function OrderTable({
             {selectable && <th><input className="record-check" type="checkbox" checked={orders.length > 0 && orders.every((order) => selected.includes(order.id))} onChange={() => setSelected(selected.length === orders.length ? [] : orders.map((order) => order.id))} aria-label="Select all orders" /></th>}
             <th>ORDER</th>
             <th>CLIENT</th>
-            {!compact && (
-              <>
-                <th>REMARKS</th>
-              </>
-            )}
             <th>VALUE</th>
             <th>ETA</th>
             <th>STATUS</th>
             <th>PAYMENT</th>
+            {!compact && <th>ENTRY</th>}
             <th />
           </tr>
         </thead>
@@ -1774,11 +1862,6 @@ function OrderTable({
                   </div>
                 </div>
               </td>
-              {!compact && (
-                <>
-                  <td>{o.remarks || "—"}</td>
-                </>
-              )}
               <td>
                 <b>{money(orderTotal(o))}</b>
               </td>
@@ -1794,6 +1877,7 @@ function OrderTable({
               <td>
                 <Pill value={o.payment} />
               </td>
+              {!compact && <td><span className="order-entry-source" title={o.remarks || "Entered manually"}>{orderEntrySource(o)}</span></td>}
               <td>
                 <div className="record-actions">{confirm && o.status === "Draft" && <button className="dispatch-action" type="button" onClick={() => confirm(o)}>Confirm order</button>}{returnToOrders && (o.status === "Confirmed" || o.status === "Dispatch plan") && <button className="outline" type="button" onClick={() => returnToOrders(o)}>{returnLabel}</button>}{pushToDispatch && o.status === "Confirmed" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{advance && <button className="dispatch-action" type="button" onClick={() => advance(o)}>{advanceLabel || "Continue"}</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>{whatsAppLabel || "WA"}</button>}<button className="whatsapp-action" type="button" onClick={() => downloadOrderPdf(o)} aria-label={`Download ${o.status === "Advance order" ? "advance order" : "purchase order"} ${o.id}`}>{o.status === "Advance order" ? "AO" : "PO"}</button><button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>{cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
               </td>
@@ -1830,7 +1914,7 @@ function Clients({
           <h2>Client directory</h2>
           <p>Edit contacts, cities and payment thresholds.</p>
         </div>
-        <div className="panel-head-actions"><button className="outline" type="button" onClick={() => csvDownload("geebee-customers-template.csv", ["Customer ID", "Business Name", "Contact Person", "City", "Phone", "Payment Terms", "Payment Threshold", "Status"], [["GB-C001", "Example Party Store", "Amit Shah", "Delhi", "9876543210", "30 days", "50000", "Active"]])}>Download customer template</button><button className="outline" type="button" onClick={() => csvDownload("geebee-customers-export.csv", ["Customer ID", "Business Name", "Contact Person", "City", "Phone", "Payment Terms", "Payment Threshold", "Status"], clients.map((client) => [client.customerId || "", client.name, client.contact || "", client.city || "", client.phone || "", client.paymentTerms || "", client.credit || "", client.customerStatus || "Active"]))}>Export customers</button><button className="outline" type="button" onClick={() => importRef.current?.click()}>Import customer sheet</button><input ref={importRef} className="visually-hidden" type="file" accept=".csv,text/csv" onChange={(event) => { importCustomers(event.target.files?.[0]); event.currentTarget.value = ""; }}/></div>
+        <div className="panel-head-actions"><button className="outline" type="button" onClick={() => csvDownload("geebee-customers-template.csv", ["Customer ID", "Business Name", "Contact Person", "City", "Phone", "WhatsApp Group Link", "Payment Terms", "Payment Threshold", "Status"], [["GB-C001", "Example Party Store", "Amit Shah", "Delhi", "9876543210", "https://chat.whatsapp.com/example", "30 days", "50000", "Active"]])}>Download customer template</button><button className="outline" type="button" onClick={() => csvDownload("geebee-customers-export.csv", ["Customer ID", "Business Name", "Contact Person", "City", "Phone", "WhatsApp Group Link", "Payment Terms", "Payment Threshold", "Status"], clients.map((client) => [client.customerId || "", client.name, client.contact || "", client.city || "", client.phone || "", client.whatsappGroupLink || "", client.paymentTerms || "", client.credit || "", client.customerStatus || "Active"]))}>Export customers</button><button className="outline" type="button" onClick={() => importRef.current?.click()}>Import customer sheet</button><input ref={importRef} className="visually-hidden" type="file" accept=".csv,text/csv" onChange={(event) => { importCustomers(event.target.files?.[0]); event.currentTarget.value = ""; }}/></div>
       </div>
       <div className="record-bulk-bar"><span>Select clients to manage them together.</span>{selected.length > 0 && <button type="button" className="bulk-delete" onClick={removeSelected}><Trash2 size={14}/> Remove {selected.length} selected</button>}</div><div className="table-wrap">
         <table className="records">
@@ -1935,7 +2019,7 @@ function TasksDashboard({ tasks, leads, quotes, invoices, orders, toggle, edit, 
     ...leads.filter((lead) => ["New", "Contacted", "Requirement Received", "Quotation Sent", "Negotiation"].includes(lead.status)).map((lead) => `Enquiry pending: ${lead.id} · ${lead.company}`),
     ...orders.filter((order) => order.status === "In transit" || order.status === "Customs clearance").map((order) => `Track delivery: ${order.id} · ${order.client}`),
   ].slice(0, 6);
-  return <section className="tasks-workspace"><div className="task-day-card"><div><span className="overline">DAILY TASKS</span><h2>Tasks & follow-ups</h2><p>Each follow-up is its own task. Completed tasks stay visible today with a strike-through.</p></div><b>{openTaskCount} open</b></div><div className="tasks-grid"><section className="panel task-list"><h3>Today & overdue</h3>{dueTasks.sort((a, b) => `${a.dueDate}${a.time}`.localeCompare(`${b.dueDate}${b.time}`)).map((task) => <article key={task.id} className={task.status === "Done" ? "done" : ""}><time>{task.dueDate === today ? task.time : `${task.dueDate.slice(5)} ${task.time}`}</time><button type="button" className="task-check" onClick={() => toggle(task.id)}>{task.status === "Done" ? "✓" : ""}</button><div><b>{task.title}</b><span>{task.type} · {task.assignee}{task.relatedTo ? ` · ${task.relatedTo}` : ""}{task.description ? ` · ${task.description}` : ""}</span></div><button className="edit-btn" type="button" onClick={() => edit(task)}><Pencil size={14}/></button>{task.status !== "Done" && <button className="row-delete" type="button" onClick={() => remove(task.id)} aria-label={`Delete ${task.title}`}><Trash2 size={14}/></button>}</article>)}{!dueTasks.length && <p className="profile-empty">No active tasks for today.</p>}</section><section className="panel reminder-list"><h3>Automatic reminders</h3><p>Generated from CRM records needing attention.</p>{reminders.map((reminder) => <article key={reminder}><span>!</span>{reminder}</article>)}{!reminders.length && <p className="profile-empty">No reminders need attention.</p>}</section></div></section>;
+  return <section className="tasks-workspace"><div className="task-day-card"><div><span className="overline">DAILY TASKS</span><h2>My tasks & follow-ups</h2><p>These are your private tasks. Completed tasks stay visible today with a strike-through.</p></div><b>{openTaskCount} open</b></div><div className="tasks-grid"><section className="panel task-list"><h3>Today & overdue</h3>{dueTasks.sort((a, b) => `${a.dueDate}${a.time}`.localeCompare(`${b.dueDate}${b.time}`)).map((task) => <article key={task.id} className={task.status === "Done" ? "done" : ""}><time>{task.dueDate === today ? task.time : `${task.dueDate.slice(5)} ${task.time}`}</time><button type="button" className="task-check" onClick={() => toggle(task.id)}>{task.status === "Done" ? "✓" : ""}</button><div><b>{task.title}</b><span>{task.type}{task.relatedTo ? ` · ${task.relatedTo}` : ""}{task.description ? ` · ${task.description}` : ""}</span></div><button className="edit-btn" type="button" onClick={() => edit(task)}><Pencil size={14}/></button>{task.status !== "Done" && <button className="row-delete" type="button" onClick={() => remove(task.id)} aria-label={`Delete ${task.title}`}><Trash2 size={14}/></button>}</article>)}{!dueTasks.length && <p className="profile-empty">No active tasks for today.</p>}</section><section className="panel reminder-list"><h3>Automatic reminders</h3><p>Generated from CRM records needing attention.</p>{reminders.map((reminder) => <article key={reminder}><span>!</span>{reminder}</article>)}{!reminders.length && <p className="profile-empty">No reminders need attention.</p>}</section></div></section>;
 }
 function SalesTeamDashboard({ leads, quotes, orders, invoices }: { leads: Lead[]; quotes: Quote[]; orders: Order[]; invoices: Invoice[] }) {
   const businessOrders = orders.filter((order) => !["Advance order", "Backorder", "Cancelled"].includes(order.status)); const totalSales = businessOrders.reduce((total, order) => total + orderTotal(order), 0); const collections = invoices.filter((invoice) => invoice.status === "Paid").reduce((total, invoice) => total + (Number(invoice.amount.replace(/[^0-9.]/g, "")) || 0), 0); const outstanding = invoices.filter((invoice) => invoice.status !== "Paid" && invoice.status !== "Cancelled").reduce((total, invoice) => total + (Number(invoice.amount.replace(/[^0-9.]/g, "")) || 0), 0); const activeLeads = leads.filter((lead) => lead.status !== "Lost"); const conversion = activeLeads.length ? Math.round((businessOrders.length / activeLeads.length) * 100) : 0; const team = [...new Set(leads.map((lead) => lead.salesperson).filter(Boolean))];
@@ -2001,7 +2085,7 @@ function ClientProfile({ client, orders, invoices, catalogue, auditEvents, close
   const rateName = (sku: string) => catalogue.find((item) => item.sku === sku)?.name || "Catalogue product";
   return <Shell close={close}>
     <div className="client-profile-head"><div className="profile-avatar-large">{client.avatar || initials(client.name)}</div><div><span className="overline">CLIENT ACCOUNT</span><h2>{client.name}</h2><p>{client.city} · {client.contact}</p></div><button className="edit-profile-btn" type="button" onClick={edit}><Pencil size={14}/> Edit client</button></div>
-    <div className="client-contact-grid"><div><span>Customer ID</span><b>{client.customerId || `GB-C${String(client.id).padStart(4, "0")}`}</b></div><div><span>Primary contact</span><b>{client.contact || "—"}</b></div><div><span>Mobile</span><b>{client.phone || "—"}</b></div><div><span>WhatsApp</span><b>{client.whatsapp || client.phone || "—"}</b></div><div><span>Email</span><b>{client.email || "—"}</b></div><div><span>Customer category</span><b>{client.customerCategory || "—"}</b></div></div>
+    <div className="client-contact-grid"><div><span>Customer ID</span><b>{client.customerId || `GB-C${String(client.id).padStart(4, "0")}`}</b></div><div><span>Primary contact</span><b>{client.contact || "—"}</b></div><div><span>Mobile</span><b>{client.phone || "—"}</b></div><div><span>WhatsApp</span><b>{client.whatsapp || client.phone || "—"}</b></div><div><span>WhatsApp group</span>{client.whatsappGroupLink ? <a href={client.whatsappGroupLink} target="_blank" rel="noreferrer">Open group</a> : <b>—</b>}</div><div><span>Email</span><b>{client.email || "—"}</b></div><div><span>Customer category</span><b>{client.customerCategory || "—"}</b></div></div>
     <section className="profile-section"><div className="profile-section-head"><h3>Business information</h3><span>{client.customerStatus || "Active"}</span></div><div className="customer-details-grid"><div><span>Business type</span><b>{client.businessType || "—"}</b></div><div><span>GSTIN</span><b>{client.gstin || "—"}</b></div><div><span>PAN</span><b>{client.pan || "—"}</b></div><div><span>State</span><b>{client.state || "—"}</b></div><div><span>City</span><b>{client.city || "—"}</b></div><div><span>Pincode</span><b>{client.pincode || "—"}</b></div><div className="customer-address"><span>Address</span><b>{client.address || "—"}</b></div></div></section>
     <div className="client-stat-grid"><div><span>Total billing</span><b>{money(billed)}</b><small>{clientInvoices.length} invoice{clientInvoices.length === 1 ? "" : "s"}</small></div><div><span>Paid</span><b>{money(paid)}</b><small>{clientInvoices.filter((invoice) => invoice.status === "Paid").length} settled</small></div><div><span>Outstanding</span><b className={outstanding ? "attention" : ""}>{money(outstanding)}</b><small>{clientInvoices.filter((invoice) => invoice.status !== "Paid").length} open invoice{clientInvoices.filter((invoice) => invoice.status !== "Paid").length === 1 ? "" : "s"}</small></div><div><span>Total order value</span><b>{money(clientOrders.reduce((total, order) => total + orderTotal(order), 0))}</b><small>{clientOrders.length} order{clientOrders.length === 1 ? "" : "s"}</small></div></div>
     <section className="profile-section"><div className="profile-section-head"><h3>Commercial information</h3><span>{client.assignedSalesperson || "No salesperson assigned"}</span></div><div className="customer-details-grid"><div><span>Credit limit</span><b>{client.credit || "—"}</b></div><div><span>Payment terms</span><b>{client.paymentTerms || "—"}</b></div><div><span>Average order value</span><b>{money(averageOrder)}</b></div><div><span>Last order date</span><b>{lastOrder ? new Date(lastOrder.eta).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—"}</b></div><div><span>Assigned salesperson</span><b>{client.assignedSalesperson || "—"}</b></div><div><span>Customer status</span><b>{client.customerStatus || "Active"}</b></div></div></section>
@@ -2042,11 +2126,146 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit }: { existin
   return <section className="panel transfer-panel"><div className="panel-head"><div><span className="overline">CONNECTED ORDER SHEET</span><h2>Fetch new orders from Google Sheets</h2><p>Reads your existing order tabs, such as <b>E-404 SHYAM BALLOON PATNA</b> or <b>E-269 (OR) SHYAM BALLOON STORE, PATNA</b>. Only order IDs not already in the CRM are imported, always as Draft orders. Unmatched customer names stay on the draft only until it is saved.</p></div><button className="primary" type="button" onClick={fetchOrders} disabled={loading}>{loading ? "Fetching orders…" : "Fetch new orders"}</button></div>{message && <p className="transfer-message">{message}</p>}{details.length > 0 && <div className="transfer-fields"><b>Skipped tabs</b><br/>{details.join(" · ")}</div>}</section>;
 }
 
+function ProductStockInventoryPanel({ session, canApply, onAudit, query, onProductsSynced }: { session: Session; canApply: boolean; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>> }) {
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState("");
+  const [items, setItems] = useState<CatalogueItem[]>(() => readProductStockCache(session.user.id));
+  const [editing, setEditing] = useState<CatalogueItem | null>(null);
+  const visibleItems = items.filter((item) => `${item.sku} ${item.name} ${item.category}`.toLowerCase().includes(query.toLowerCase()) || skuKey(item.sku).includes(skuKey(query)));
+  const replaceItems = (products: CatalogueItem[]) => {
+    setItems(products);
+    saveProductStockCache(session.user.id, products);
+    onProductsSynced(products);
+  };
+  const load = async () => {
+    setLoading(true); setMessage("");
+    try {
+      const response = await fetch("/api/import/google-product-master", { headers: { Authorization: `Bearer ${session.access_token}` } });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Product Stock Inventory could not be loaded.");
+      replaceItems(result.products || []);
+      setMessage("Showing the last saved CRM copy. If the Google Sheet has changed, press Sync Google Sheet now to update this inventory.");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Product Stock Inventory could not be loaded."); }
+    finally { setLoading(false); }
+  };
+  const sync = async (mode: "sync" | "setup", background = false) => {
+    if (!background) { setLoading(true); setMessage(""); }
+    try {
+      const response = await fetch("/api/import/google-product-master", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ mode }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Product Stock Inventory could not be updated.");
+      if (mode === "setup") { setMessage(result.message || "Blank Sheet headers and test rows are ready."); await load(); return; }
+      replaceItems(result.products || []);
+      const skipped = Array.isArray(result.skippedRows) ? result.skippedRows.length : 0;
+      if (!background) {
+        setMessage(`${result.scanned || 0} Sheet SKU(s) processed: ${result.updated || 0} updated, ${result.added || 0} added to the separate test inventory.${skipped ? ` ${skipped} incomplete row${skipped === 1 ? " needs" : "s need"} review.` : ""}`);
+        onAudit("Synced test Product Stock Inventory", "Products", `${result.updated || 0} updated · ${result.added || 0} added`);
+      }
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Product Stock Inventory could not be updated."); }
+    finally { if (!background) setLoading(false); }
+  };
+  // Opening this section reads only its saved CRM copy. Google Sheets is
+  // deliberately refreshed only when an administrator presses Sync.
+  useEffect(() => { void load(); }, [session.access_token]);
+  const saveEdit = async (item: CatalogueItem) => {
+    setLoading(true); setMessage("");
+    try {
+      const response = await fetch("/api/import/google-product-master", { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ item }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Product could not be updated.");
+      setItems((current) => {
+        const next = current.map((entry) => entry.id === result.item.id ? result.item : entry);
+        saveProductStockCache(session.user.id, next);
+        return next;
+      }); setEditing(null); setMessage(`${result.item.sku} updated. Available Stock remains controlled by the Google Sheet.`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Product could not be updated."); }
+    finally { setLoading(false); }
+  };
+  return <><section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT MASTER</span><h2>Products / SKUs</h2><p>Your Google Sheet inventory is the product master for this section. Sync it only when the sheet has changed.</p></div><div className="catalogue-count"><b>{items.length}</b><span>SKUs</span></div></div><section className="catalogue-actions"><div className="catalogue-tip"><b>Google Sheet product master</b><p>Fields: SKU ID, Product Name, Category, Unit, Inner Qty, Outer Qty, Selling Price, Available Stock, Low Stock Alert, Image URL.</p></div><div className="button-row">{canApply && <button className="outline" type="button" disabled={loading} onClick={() => sync("setup")}>Set up blank sheet + test rows</button>}<button className="primary" type="button" disabled={loading} onClick={() => sync("sync")}>{loading ? "Syncing…" : "Sync Google Sheet now"}</button></div></section>{message && <p className="inventory-recon-message success">{message}</p>}<section className="catalogue-grid">{visibleItems.map((item) => <article className="catalogue-card" key={item.id} onClick={() => canApply && setEditing(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={item.name} onError={(event) => { event.currentTarget.style.display = "none"; }}/> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><small title={item.sku}>{item.sku}</small><h3 title={item.name}>{item.name}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / ${item.unit || "pc"}` : "Price to be added"}</p><p className="catalogue-stock">Available: <b>{availableStock(item).toLocaleString("en-IN")}</b></p><p className="catalogue-stock">Low alert: <b>{item.reorderThreshold ?? 0}</b></p>{canApply && <button className="edit-product" type="button" onClick={(event) => { event.stopPropagation(); setEditing(item); }}><Pencil size={13}/> Edit product</button>}</div></article>)}{!loading && !visibleItems.length && <div className="empty">No products match this search. Sync Google Sheet if the product master has changed.</div>}</section></section>{editing && <StockInventoryModal item={editing} close={() => setEditing(null)} save={saveEdit}/>}</>;
+}
+
+function ProductStockCategoriesPanel({ session, query, openCategory }: { session: Session; query: string; openCategory: (category: string) => void }) {
+  const [items, setItems] = useState<CatalogueItem[]>(() => readProductStockCache(session.user.id));
+  const [loading, setLoading] = useState(false);
+  useEffect(() => {
+    const load = async () => {
+      setLoading(true);
+      try {
+        const response = await fetch("/api/import/google-product-master", { headers: { Authorization: `Bearer ${session.access_token}` } });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Could not load product categories.");
+        const products = (result.products || []) as CatalogueItem[];
+        setItems(products); saveProductStockCache(session.user.id, products);
+      } catch { /* Keep the last saved local product master visible. */ }
+      finally { setLoading(false); }
+    };
+    void load();
+  }, [session.access_token, session.user.id]);
+  const groups = Array.from(new Set(items.map((item) => item.category?.trim() || "Uncategorised"))).sort((a, b) => a.localeCompare(b)).map((category) => [category, items.filter((item) => (item.category?.trim() || "Uncategorised") === category)] as const)
+    .filter(([category, products]) => `${category} ${products.map((product) => `${product.sku} ${product.name}`).join(" ")}`.toLowerCase().includes(query.toLowerCase()));
+  return <section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT MASTER</span><h2>Categories</h2><p>Categories are read directly from your Product / SKU Google Sheet inventory.</p></div><div className="catalogue-count"><b>{groups.length}</b><span>categories</span></div></div><section className="catalogue-grid">{groups.map(([category, products]) => { const image = categoryImages[category as keyof typeof categoryImages]; return <article className="catalogue-card category-card" key={category}><div className="catalogue-image">{image ? <img src={image} alt={`${category} category`} /> : <PackageCheck size={27}/>}<span>{products.length} SKU{products.length === 1 ? "" : "s"}</span></div><div className="catalogue-info"><small>CATEGORY</small><h3>{category}</h3><p>{products.slice(0, 4).map((product) => `${product.sku} · ${product.name}`).join(" · ")}{products.length > 4 ? ` +${products.length - 4} more` : ""}</p><button className="edit-product" type="button" onClick={() => openCategory(category)}>View products</button></div></article>; })}{!loading && !groups.length && <div className="empty">No categories have been added to Product / SKUs yet.</div>}</section></section>;
+}
+
+function StockInventoryModal({ item, close, save }: { item: CatalogueItem; close: () => void; save: (item: CatalogueItem) => void }) {
+  const [form, setForm] = useState(item);
+  const update = <K extends keyof CatalogueItem>(key: K, value: CatalogueItem[K]) => setForm((current) => ({ ...current, [key]: value }));
+  return <Shell close={close}><div className="order-modal-head"><div className="modal-mark"><PackageCheck size={22}/></div><div><span className="overline">TEST STOCK INVENTORY</span><h2>Edit product details</h2><p>Available Stock is locked here because it is updated only from the Google Sheet.</p></div></div><div className="modal-section-title">Product details</div><div className="form-row"><label>Product name<input value={form.name} onChange={(event) => update("name", event.target.value)} required/></label><label>SKU ID<input value={form.sku} onChange={(event) => update("sku", event.target.value.toUpperCase())} required/></label></div><div className="form-row"><label>Category<input value={form.category} onChange={(event) => update("category", event.target.value)}/></label><label>Unit<input value={form.unit || ""} onChange={(event) => update("unit", event.target.value)} placeholder="Piece"/></label></div><div className="form-row"><label>Inner qty<input value={form.innerQty || ""} onChange={(event) => update("innerQty", event.target.value)}/></label><label>Outer qty<input value={form.outerQty || ""} onChange={(event) => update("outerQty", event.target.value)}/></label></div><div className="form-row"><label>Selling price (₹)<input type="number" min="0" value={form.unitPrice || ""} onChange={(event) => update("unitPrice", Number(event.target.value))}/></label><label>Low-stock alert<input type="number" min="0" value={form.reorderThreshold ?? ""} onChange={(event) => update("reorderThreshold", Number(event.target.value))}/></label></div><label>Image URL<input value={form.image || ""} onChange={(event) => update("image", event.target.value)} placeholder="https://…"/></label><div className="stock-calculation"><span>Available stock <b>{availableStock(item).toLocaleString("en-IN")}</b></span><span>Controlled by Google Sheet</span></div><button className="primary modal-submit" type="button" onClick={() => save(form)}>Save product details</button></Shell>;
+}
+
+function InventoryReconciliationPanel({ catalogue, session, canApply, apply, syncMaster, onAudit }: { catalogue: CatalogueItem[]; session: Session; canApply: boolean; apply: (matches: InventoryReconciliation[]) => void; syncMaster: (products: CatalogueItem[]) => void; onAudit: (action: string, module: string, details: string) => void }) {
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState("");
+  const [matches, setMatches] = useState<InventoryReconciliation[]>([]);
+  const [panelOnly, setPanelOnly] = useState<Array<{ sku: string; name: string; currentAvailable: number }>>([]);
+  const [masterMessage, setMasterMessage] = useState("");
+  const [masterOnly, setMasterOnly] = useState<Array<{ sku: string; name: string }>>([]);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const syncProductMaster = async (mode: "sync" | "setup") => {
+    setLoading(true); setMasterMessage(""); setMasterOnly([]);
+    try {
+      const response = await fetch("/api/import/google-product-master", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ mode }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Product master could not be read.");
+      if (mode === "setup") { setMasterMessage(result.message || "Product Stock Inventory sheet is ready. You can now edit the test rows and sync it."); return; }
+      const products = (result.products || []) as CatalogueItem[];
+      syncMaster(products); setMasterOnly(result.crmOnly || []);
+      setMasterMessage(`${result.scanned || products.length} sheet SKU(s) checked: ${result.updated || 0} updated and ${result.added || 0} added. Available stock now comes from this Sheet.`);
+      onAudit("Synced Product Stock Inventory", "Products", `${result.updated || 0} updated · ${result.added || 0} added from Google Sheet`);
+    } catch (error) { setMasterMessage(error instanceof Error ? error.message : "Product master could not be read."); }
+    finally { setLoading(false); }
+  };
+  const reconcile = async (file?: File) => {
+    if (!file) return;
+    setLoading(true); setMessage(""); setMatches([]); setPanelOnly([]);
+    try {
+      const form = new FormData(); form.append("file", file);
+      form.append("catalogue", JSON.stringify(catalogue.map((product) => ({ sku: product.sku, name: catalogueName(product), availableQuantity: availableStock(product) }))));
+      const response = await fetch("/api/inventory/reconcile", { method: "POST", headers: { Authorization: `Bearer ${session.access_token}` }, body: form });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Stock sheet could not be reconciled.");
+      const resultMatches = (result.matches || []) as InventoryReconciliation[];
+      setMatches(resultMatches); setPanelOnly(result.panelOnly || []);
+      const matched = resultMatches.filter((item) => item.status === "matched").length;
+      setMessage(`${matched} sheet row${matched === 1 ? "" : "s"} matched. Review unmatched rows before applying quantities.`);
+      onAudit("Reviewed inventory stock sheet", "Inventory", `${matched} matched · ${resultMatches.filter((item) => item.status !== "matched").length} need review`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Stock sheet could not be reconciled."); }
+    finally { setLoading(false); if (inputRef.current) inputRef.current.value = ""; }
+  };
+  const matched = matches.filter((item) => item.status === "matched");
+  const unresolved = matches.filter((item) => item.status !== "matched");
+  const applyQuantities = () => {
+    if (!matched.length) return;
+    if (!window.confirm(`Update available quantity for ${matched.length} matched SKU${matched.length === 1 ? "" : "s"}? Unmatched sheet rows will not change any CRM stock.`)) return;
+    apply(matched); setMessage(`${matched.length} matched available quantities applied. Unmatched rows remain unchanged for manual review.`);
+  };
+  return <section className="inventory-reconciliation"><section className="panel inventory-recon-list"><div className="panel-head"><div><span className="overline">GOOGLE SHEET MASTER</span><h2>Product Stock Inventory</h2><p>Your shared Sheet is the stock master. Sync updates matching SKU data and stock, adds new valid SKUs, and never deletes CRM-only products.</p></div><div className="button-row">{canApply && <button className="outline" type="button" onClick={() => syncProductMaster("setup")} disabled={loading}>Set up blank sheet + test rows</button>}<button className="primary" type="button" onClick={() => syncProductMaster("sync")} disabled={loading}>{loading ? "Syncing…" : "Fetch product master"}</button></div></div><p className="inventory-recon-message">Required columns: SKU ID, Product Name, Category, Unit, Inner Qty, Outer Qty, Selling Price, Available Stock, Low Stock Alert, Image URL.</p>{masterMessage && <p className="inventory-recon-message success">{masterMessage}</p>}{masterOnly.length > 0 && <div className="table-wrap"><table><thead><tr><th>CRM-only SKU</th><th>Product</th></tr></thead><tbody>{masterOnly.slice(0, 200).map((item) => <tr key={item.sku}><td><b>{item.sku}</b></td><td>{item.name}</td></tr>)}</tbody></table></div>}</section><div className="inventory-recon-hero"><div><span className="overline">MANUAL FALLBACK</span><h2>Reconcile available inventory</h2><p>For a one-off Excel stock file, upload it here. Unmatched rows are shown for review and are never applied automatically.</p></div><button className="primary" type="button" onClick={() => inputRef.current?.click()} disabled={loading}>{loading ? "Reading stock sheet…" : "Upload stock sheet"}</button><input ref={inputRef} className="visually-hidden" type="file" accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" onChange={(event) => reconcile(event.target.files?.[0])}/></div>{message && <p className={`inventory-recon-message ${matches.length ? "success" : ""}`}>{message}</p>}{matches.length > 0 && <><div className="inventory-recon-summary"><article><b>{matched.length}</b><span>Matched rows</span></article><article><b>{unresolved.length}</b><span>Need review</span></article><article><b>{panelOnly.length}</b><span>CRM-only SKUs</span></article></div><section className="panel inventory-recon-list"><div className="panel-head"><div><h2>Matched inventory</h2><p>These rows update only the live available quantity.</p></div>{canApply && <button className="primary" type="button" onClick={applyQuantities}>Apply {matched.length} quantities</button>}</div><div className="table-wrap"><table><thead><tr><th>Sheet product</th><th>Matched SKU</th><th>CRM product</th><th>Sheet qty</th><th>Current qty</th></tr></thead><tbody>{matched.slice(0, 500).map((item, index) => <tr key={`${item.sourceLabel}-${index}`}><td>{item.sourceLabel}</td><td><b>{item.sku}</b></td><td>{item.name}</td><td><b>{item.quantity.toLocaleString("en-IN")}</b></td><td>{(item.currentAvailable || 0).toLocaleString("en-IN")}</td></tr>)}</tbody></table></div></section>{unresolved.length > 0 && <section className="panel inventory-recon-list warning"><div className="panel-head"><div><h2>Unmapped or unclear sheet rows</h2><p>These rows are excluded from the update. Match or add them in Products / SKUs, then upload the sheet again.</p></div></div><div className="table-wrap"><table><thead><tr><th>Sheet product</th><th>Quantity</th><th>Reason</th><th>Possible matches</th></tr></thead><tbody>{unresolved.map((item, index) => <tr key={`${item.sourceLabel}-${index}`}><td><b>{item.sourceLabel}</b></td><td>{item.quantity.toLocaleString("en-IN")}</td><td><Pill value={item.status === "ambiguous" ? "Multiple matches" : "Not in CRM"}/></td><td>{item.candidates?.join(" · ") || "Add or correct this SKU in Products / SKUs"}</td></tr>)}</tbody></table></div></section>}{panelOnly.length > 0 && <section className="panel inventory-recon-list muted"><div className="panel-head"><div><h2>Products in CRM but absent from this sheet</h2><p>These records will not be changed.</p></div></div><div className="table-wrap"><table><thead><tr><th>SKU</th><th>CRM product</th><th>Current available qty</th></tr></thead><tbody>{panelOnly.slice(0, 500).map((item) => <tr key={item.sku}><td><b>{item.sku}</b></td><td>{item.name}</td><td>{item.currentAvailable.toLocaleString("en-IN")}</td></tr>)}</tbody></table></div></section>}</>}</section>;
+}
+
 function DataTransferPanel({ catalogue, clients, orders, invoices, leads, quotes, tasks, transporters, setCatalogue, setClients, setOrders, setInvoices, setLeads, setQuotes, setTasks, setTransporters, onAudit, canHardDelete, hardDelete }: { catalogue: CatalogueItem[]; clients: Client[]; orders: Order[]; invoices: Invoice[]; leads: Lead[]; quotes: Quote[]; tasks: SalesTask[]; transporters: Transporter[]; setCatalogue: any; setClients: any; setOrders: any; setInvoices: any; setLeads: any; setQuotes: any; setTasks: any; setTransporters: any; onAudit: (action: string, module: string, details: string) => void; canHardDelete: boolean; hardDelete: (scope: "Customers" | "Orders" | "Approved Orders" | "Dispatch Plan", ids: string[]) => number }) {
   const [module, setModule] = useState("Products / SKUs"); const [message, setMessage] = useState(""); const inputRef = useRef<HTMLInputElement>(null); const hardDeleteInputRef = useRef<HTMLInputElement>(null); const [deleteScope, setDeleteScope] = useState<"Customers" | "Orders" | "Approved Orders" | "Dispatch Plan">("Customers");
   const configs: Record<string, { headers: string[]; rows: () => unknown[][]; example: unknown[] }> = {
     "Products / SKUs": { headers: ["SKU", "Product Name", "Category", "Description", "Selling Price", "Available Quantity", "Reorder Threshold", "Inner Qty", "Outer Qty", "Image URL"], rows: () => catalogue.map((item) => [item.sku, item.name, item.category, item.description, item.unitPrice, availableStock(item), item.reorderThreshold || "", item.innerQty || "", item.outerQty || item.cartonQty || "", item.image || ""]), example: ["GB-BAL-001", "Birthday Balloon Set", "Balloons", "Assorted party balloons", "25", "1000", "100", "12", "144", "https://example.com/product-image.jpg"] },
-    Customers: { headers: ["Customer ID", "Business Name", "City", "Phone", "Payment Terms", "Payment Threshold", "Status"], rows: () => clients.map((item) => [item.customerId || "", item.name, item.city, item.phone || "", item.paymentTerms || "", item.credit || "", item.customerStatus || ""]), example: ["GB-C001", "Example Party Store", "Delhi", "9876543210", "30 days", "50000", "Active"] },
+    Customers: { headers: ["Customer ID", "Business Name", "City", "Phone", "WhatsApp Group Link", "Payment Terms", "Payment Threshold", "Status"], rows: () => clients.map((item) => [item.customerId || "", item.name, item.city, item.phone || "", item.whatsappGroupLink || "", item.paymentTerms || "", item.credit || "", item.customerStatus || ""]), example: ["GB-C001", "Example Party Store", "Delhi", "9876543210", "https://chat.whatsapp.com/example", "30 days", "50000", "Active"] },
     Orders: { headers: ["Order ID", "Customer", "City", "SKU", "Product", "Quantity", "Unit Price", "ETA", "Status", "Payment Status", "Transporter", "Remarks"], rows: () => orders.flatMap((order) => linesFor(order).map((line) => [order.id, order.client, order.city, line.sku, line.product, line.quantity, line.unitPrice, order.eta, order.status, order.payment, order.transporter || "", order.remarks || ""])), example: ["GB-10001", "Example Party Store", "Delhi", "GB-BAL-001", "Birthday Balloon Set", "100", "25", "2026-10-20", "Draft", "Partial", "Example Transport", ""] },
     Invoices: { headers: ["Invoice Number", "Customer", "Order", "Amount", "Due", "Status"], rows: () => invoices.map((item) => [item.id, item.client, item.order, item.amount, item.due, item.status]), example: ["INV-1001", "Example Party Store", "GB-10001", "2500", "2026-10-30", "Pending"] },
     Enquiries: { headers: ["Lead ID", "Company", "Contact Person", "Mobile", "City", "Source", "Assigned Salesperson", "Requirement", "Expected Order Value", "Expected Order Date", "Status"], rows: () => leads.map((item) => [item.id, item.company, item.contact, item.mobile, item.city, item.source, item.salesperson, item.requirement, item.expectedValue, item.expectedDate, item.status]), example: ["LEAD-1001", "Example Party Store", "Amit Shah", "9876543210", "Delhi", "WhatsApp", "Rahul", "Balloons", "25000", "2026-10-20", "New"] },
@@ -2057,7 +2276,7 @@ function DataTransferPanel({ catalogue, clients, orders, invoices, leads, quotes
   const config = configs[module];
   const download = (template = false) => csvDownload(`geebee-${module.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-")}-${template ? "template" : "export"}.csv`, config.headers, template ? [config.example] : config.rows());
   const importFile = async (file?: File) => { if (!file) return; try { const rows = await readCsv(file); if (!rows.length) throw new Error("The uploaded sheet has no data rows."); const now = Date.now(); if (module === "Products / SKUs") setCatalogue((current: CatalogueItem[]) => { const incoming = rows.filter((row) => row.sku).map((row, index) => ({ id: now + index, sku: row.sku, name: row["product name"] || "", category: row.category || "", description: row.description || "", unitPrice: csvNumber(row["selling price"]), availableQuantity: csvNumber(row["available quantity"]), reorderThreshold: csvNumber(row["reorder threshold"]), innerQty: row["inner qty"] || "", outerQty: row["outer qty"] || "", cartonQty: row["outer qty"] || "", image: row["image url"] || "" } as CatalogueItem)); const map = new Map(incoming.map((item) => [skuKey(item.sku), item])); const present = new Set(current.map((item) => skuKey(item.sku))); return [...current.map((item) => map.has(skuKey(item.sku)) ? { ...item, ...map.get(skuKey(item.sku))!, id: item.id } : item), ...incoming.filter((item) => !present.has(skuKey(item.sku)))]; });
-      else if (module === "Customers") setClients((current: Client[]) => { const incoming = rows.filter((row) => row["business name"]).map((row, index) => ({ id: now + index, customerId: row["customer id"] || `GB-C${now + index}`, name: row["business name"], city: row.city || "", phone: row.phone || "", contact: "", credit: row["payment threshold"] || "", paymentTerms: row["payment terms"] || "", customerStatus: row.status || "Active", avatar: initials(row["business name"]), specialRates: [] } as Client)); const map = new Map(incoming.map((item) => [item.name.toLowerCase(), item])); const present = new Set(current.map((item) => item.name.toLowerCase())); return [...current.map((item) => map.has(item.name.toLowerCase()) ? { ...item, ...map.get(item.name.toLowerCase())!, id: item.id } : item), ...incoming.filter((item) => !present.has(item.name.toLowerCase()))]; });
+      else if (module === "Customers") setClients((current: Client[]) => { const incoming = rows.filter((row) => row["business name"]).map((row, index) => ({ id: now + index, customerId: row["customer id"] || `GB-C${now + index}`, name: row["business name"], city: row.city || "", phone: row.phone || "", contact: "", whatsappGroupLink: row["whatsapp group link"] || "", credit: row["payment threshold"] || "", paymentTerms: row["payment terms"] || "", customerStatus: row.status || "Active", avatar: initials(row["business name"]), specialRates: [] } as Client)); const map = new Map(incoming.map((item) => [item.name.toLowerCase(), item])); const present = new Set(current.map((item) => item.name.toLowerCase())); return [...current.map((item) => map.has(item.name.toLowerCase()) ? { ...item, ...map.get(item.name.toLowerCase())!, id: item.id } : item), ...incoming.filter((item) => !present.has(item.name.toLowerCase()))]; });
       else if (module === "Orders") setOrders((current: Order[]) => { const grouped = new Map<string, typeof rows>(); rows.filter((row) => row["order id"]).forEach((row) => grouped.set(row["order id"], [...(grouped.get(row["order id"]) || []), row])); const incoming = [...grouped.entries()].map(([id, lines]) => { const first = lines[0]; const products = lines.map((row) => ({ sku: row.sku, product: row.product || `Product ${row.sku}`, quantity: csvNumber(row.quantity), unitPrice: csvNumber(row["unit price"]) })); return { id, client: first.customer || "Customer", city: first.city || "", product: products[0]?.product || "", sku: products[0]?.sku || "", quantity: products[0]?.quantity || 0, unitPrice: products[0]?.unitPrice || 0, products, eta: first.eta || "", status: first.status || "Draft", payment: first["payment status"] || "Partial", transporter: first.transporter || "", remarks: first.remarks || "", avatar: initials(first.customer || "Customer") } as Order; }); const map = new Map(incoming.map((item) => [item.id, item])); const present = new Set(current.map((item) => item.id)); return [...current.map((item) => map.get(item.id) || item), ...incoming.filter((item) => !present.has(item.id))]; });
       else if (module === "Invoices") setInvoices((current: Invoice[]) => { const incoming = rows.filter((row) => row["invoice number"]).map((row) => ({ id: row["invoice number"], client: row.customer || "", order: row.order || "", amount: row.amount || "0", due: row.due || "", status: row.status || "Pending" } as Invoice)); const map = new Map(incoming.map((item) => [item.id, item])); const present = new Set(current.map((item) => item.id)); return [...current.map((item) => map.get(item.id) || item), ...incoming.filter((item) => !present.has(item.id))]; });
       else if (module === "Enquiries") setLeads((current: Lead[]) => { const incoming = rows.filter((row) => row["lead id"]).map((row) => ({ id: row["lead id"], company: row.company || "", contact: row["contact person"] || "", mobile: row.mobile || "", city: row.city || "", source: row.source || "Other", salesperson: row["assigned salesperson"] || "", requirement: row.requirement || "", expectedValue: row["expected order value"] || "", expectedDate: row["expected order date"] || "", status: row.status || "New", createdAt: new Date().toISOString() } as Lead)); const map = new Map(incoming.map((item) => [item.id, item])); const present = new Set(current.map((item) => item.id)); return [...current.map((item) => map.get(item.id) || item), ...incoming.filter((item) => !present.has(item.id))]; });
@@ -2096,14 +2315,16 @@ function RecoveryPanel({ canManage, session, applyRestore, clearBusinessData }: 
 function TeamAccess({ members, requests, workspaceOwnerId, canManage, onChange, onRequestsChange, onAudit, auditEvents }: { members: WorkspaceMember[]; requests: AccessRequest[]; workspaceOwnerId: string | null; canManage: boolean; onChange: (members: WorkspaceMember[]) => void; onRequestsChange: (requests: AccessRequest[]) => void; onAudit: (action: string, module: string, details: string) => void; auditEvents: AuditEvent[] }) {
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<"admin" | "employee">("employee");
-  const [modules, setModules] = useState<CrmModule[]>(["Overview"]);
+  const [modules, setModules] = useState<string[]>([moduleToken("Dashboard", "view")]);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [message, setMessage] = useState("");
-  const toggle = (module: CrmModule) => setModules((current) => current.includes(module) ? current.filter((item) => item !== module) : [...current, module]);
-  const reset = () => { setEmail(""); setRole("employee"); setModules(["Overview"]); setEditingId(null); };
+  const [selectedActivityUser, setSelectedActivityUser] = useState("");
+  const setModuleAccess = (module: CrmModule, access: ModuleAccess | "") => setModules((current) => [...current.filter((token) => !token.startsWith(`${module}:`) && !legacyModuleGroups[token]?.includes(module)), ...(access ? [moduleToken(module, access)] : [])]);
+  const toggle = (module: CrmModule) => setModuleAccess(module, memberModuleAccess(modules, module) ? "" : "edit");
+  const reset = () => { setEmail(""); setRole("employee"); setModules([moduleToken("Dashboard", "view")]); setEditingId(null); };
   const save = async () => {
     if (!supabase || !workspaceOwnerId || !email.trim()) return;
-    const payload = { workspace_owner_id: workspaceOwnerId, email: email.trim().toLowerCase(), role, modules: role === "admin" ? [...crmModules] : modules };
+    const payload = { workspace_owner_id: workspaceOwnerId, email: email.trim().toLowerCase(), role, modules: role === "admin" ? allModuleTokens() : modules };
     const { data: sessionData } = await supabase.auth.getSession(); const token = sessionData.session?.access_token;
     if (!token) { setMessage("Sign in again to approve access."); return; }
     const response = await fetch("/api/admin/access-requests", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -2115,7 +2336,17 @@ function TeamAccess({ members, requests, workspaceOwnerId, canManage, onChange, 
   const remove = async (member: WorkspaceMember) => { if (member.id === 0) return; if (!supabase || !window.confirm(`Remove ${member.email} from this workspace?`)) return; const { error } = await supabase.from("crm_workspace_members").delete().eq("id", member.id); if (error) { setMessage(error.message); return; } onChange(members.filter((item) => item.id !== member.id)); onAudit("Removed employee access", "Team access", member.email); };
   const reject = async (request: AccessRequest) => { if (!supabase || !window.confirm(`Reject access request from ${request.email}? They may submit a new request later.`)) return; const { data: sessionData } = await supabase.auth.getSession(); const token = sessionData.session?.access_token; if (!token) { setMessage("Sign in again to reject this request."); return; } const response = await fetch("/api/admin/access-requests", { method: "DELETE", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ userId: request.user_id }) }); const result = await response.json(); if (!response.ok) { setMessage(result.error || "Could not reject this request."); return; } onRequestsChange(requests.filter((item) => item.user_id !== request.user_id)); onAudit("Rejected access request", "Team access", request.email); setMessage("Access request rejected."); };
   const transferOwner = async () => { if (!supabase) return; if (window.prompt("Type TRANSFER WORKSPACE to move all GeeBee CRM data to geebeecosmos0726@gmail.com and remove the old workspace owner.") !== "TRANSFER WORKSPACE") return; const { data } = await supabase.auth.getSession(); const token = data.session?.access_token; if (!token) { setMessage("Sign in again before transferring ownership."); return; } setMessage("Transferring workspace safely…"); const response = await fetch("/api/admin/transfer-workspace", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ confirm: "TRANSFER WORKSPACE", targetEmail: "geebeecosmos0726@gmail.com" }) }); const result = await response.json(); if (!response.ok) { setMessage(result.error || "Workspace ownership could not be transferred."); return; } setMessage("Ownership transferred. Please sign in again as geebeecosmos0726@gmail.com."); await supabase.auth.signOut(); };
+  const activityByUser = Array.from(new Set([...members.map((member) => member.email.toLowerCase()), ...auditEvents.map((event) => event.actor_email.toLowerCase())])).filter(Boolean).map((email) => ({ email, events: auditEvents.filter((event) => event.actor_email.toLowerCase() === email) }));
+  const activeActivityUser = activityByUser.find((user) => user.email === selectedActivityUser) || activityByUser[0];
   if (!canManage) return <section className="panel coming"><div className="modal-mark"><Settings size={22}/></div><h2>Workspace access</h2><p>Your administrator controls which modules you can use.</p></section>;
+  return <section className="panel team-access">
+    <div className="panel-head"><div><h2>Team access</h2><p>Choose what every employee can see and change in each left-side CRM header.</p></div></div>
+    {requests.length > 0 && <section className="access-request-list"><div><b>Pending access requests</b><small>Approve a user, then choose their access for each module.</small></div>{requests.map((request) => <article key={request.user_id}><div><b>{request.full_name || request.email}</b><small>{request.email}{request.phone ? ` · ${request.phone}` : ""} · requested {new Date(request.created_at).toLocaleDateString("en-IN")}</small></div><div className="access-request-actions"><button type="button" onClick={() => { setEditingId(null); setEmail(request.email); setRole("employee"); setModules([moduleToken("Dashboard", "view")]); setMessage("Choose View or Edit access for each header, then approve."); }}>Approve & assign</button><button className="reject" type="button" onClick={() => reject(request)}>Reject</button></div></article>)}</section>}
+    <div className="team-grid"><div className="team-form"><b>{editingId ? "Edit employee access" : "Add employee"}</b><label>Employee email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="employee@company.com"/></label><label>Role<select value={role} onChange={(event) => setRole(event.target.value as "admin" | "employee")}><option value="employee">Employee</option><option value="admin">Administrator — full edit access</option></select></label>{role === "employee" && <div className="module-picker"><span>Module access</span><small>View lets the employee read records. Edit lets them add, change and remove records.</small>{crmModules.map((module) => <label key={module}><span>{module}</span><select value={memberModuleAccess(modules, module) || ""} onChange={(event) => setModuleAccess(module, event.target.value as ModuleAccess | "")}><option value="">No access</option><option value="view">View only</option><option value="edit">View and edit</option></select></label>)}</div>}<div className="team-buttons"><button className="primary" type="button" onClick={save}>{editingId ? "Save access" : "Grant access"}</button>{editingId && <button type="button" className="text-btn" onClick={reset}>Cancel</button>}</div>{message && <p className="team-message">{message}</p>}</div>
+    <div className="member-list"><b>Current team · {members.length}</b>{!members.length && <p>No active members yet.</p>}{members.map((member) => <article className="member-card" key={member.id}><div><b>{member.email}</b><small>{member.id === 0 || member.role === "admin" ? "Administrator — full edit access" : crmModules.filter((module) => memberModuleAccess(member.modules, module)).map((module) => `${module} (${memberModuleAccess(member.modules, module)})`).join(", ") || "No module access"}</small></div>{member.id !== 0 && <div><button type="button" onClick={() => editMember(member)}>Edit</button><button type="button" onClick={() => remove(member)}>Remove</button></div>}</article>)}</div></div>
+    <section className="transfer-owner"><div><b>Transfer workspace ownership</b><p>Move all CRM records to <b>geebeecosmos0726@gmail.com</b> and remove the current owner from this workspace.</p></div><button className="bulk-delete" type="button" onClick={transferOwner}>Transfer to official GeeBee account</button></section>
+    <section className="audit-trail"><div className="audit-toolbar"><div><h3>User activity</h3><p>Select a user to review their recorded CRM changes. Only administrators can view this log.</p></div>{activityByUser.length > 0 && <label>View activity for<select value={activeActivityUser?.email || ""} onChange={(event) => setSelectedActivityUser(event.target.value)}>{activityByUser.map((user) => <option key={user.email} value={user.email}>{user.email} · {user.events.length} activity{user.events.length === 1 ? "" : "ies"}</option>)}</select></label>}</div>{!activeActivityUser && <p className="audit-empty">Changes made after this update will appear here.</p>}{activeActivityUser && <section className="user-activity-group"><div className="user-activity-heading"><b>{activeActivityUser.email}</b><span>{activeActivityUser.events.length} recorded activit{activeActivityUser.events.length === 1 ? "y" : "ies"}</span></div>{!activeActivityUser.events.length && <p className="audit-empty">No recorded activity yet.</p>}{activeActivityUser.events.map((event) => <article className="audit-event" key={event.id}><div className="audit-dot"/><div><b>{event.action}</b><span>{event.module}{event.details ? ` · ${event.details}` : ""}</span></div><time>{new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</time></article>)}</section>}</section>
+  </section>;
   return <section className="panel team-access"><div className="panel-head"><div><h2>Team access</h2><p>Review access requests, then assign the correct role and modules.</p></div></div>{requests.length > 0 && <section className="access-request-list"><div><b>Pending access requests</b><small>These people signed in but cannot enter the CRM until you approve them.</small></div>{requests.map((request) => <article key={request.user_id}><div><b>{request.full_name || request.email}</b><small>{request.email}{request.phone ? ` · ${request.phone}` : ""} · requested {new Date(request.created_at).toLocaleDateString("en-IN")}</small></div><div className="access-request-actions"><button type="button" onClick={() => { setEditingId(null); setEmail(request.email); setRole("employee"); setModules(["Overview"]); setMessage("Choose role and modules, then approve access."); }}>Approve & assign</button><button className="reject" type="button" onClick={() => reject(request)}>Reject</button></div></article>)}</section>}<div className="team-grid"><div className="team-form"><b>{editingId ? "Edit employee access" : "Add employee"}</b><label>Employee email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="employee@company.com"/></label><label>Role<select value={role} onChange={(event) => setRole(event.target.value as "admin" | "employee")}><option value="employee">Employee</option><option value="admin">Administrator</option></select></label>{role === "employee" && <div className="module-picker"><span>Allowed modules</span>{crmModules.map((module) => <label key={module}><input type="checkbox" checked={modules.includes(module)} onChange={() => toggle(module)}/>{module}</label>)}</div>}<div className="team-buttons"><button className="primary" type="button" onClick={save}>{editingId ? "Save access" : "Grant access"}</button>{editingId && <button type="button" className="text-btn" onClick={reset}>Cancel</button>}</div>{message && <p className="team-message">{message}</p>}</div><div className="member-list"><b>Current team · {members.length}</b>{!members.length && <p>No active members yet.</p>}{members.map((member) => <article className="member-card" key={member.id}><div><b>{member.email}</b><small>{member.id === 0 ? "Workspace owner — all modules" : member.role === "admin" ? "Administrator — all modules" : member.modules.join(", ")}</small></div>{member.id !== 0 && <div><button type="button" onClick={() => editMember(member)}>Edit</button><button type="button" onClick={() => remove(member)}>Remove</button></div>}</article>)}</div></div><section className="transfer-owner"><div><b>Transfer workspace ownership</b><p>Move all CRM records to <b>geebeecosmos0726@gmail.com</b> and remove the current owner from this workspace. The old login is not deleted from Google or Supabase.</p></div><button className="bulk-delete" type="button" onClick={transferOwner}>Transfer to official GeeBee account</button></section><div className="audit-trail"><div><h3>Recent activity</h3><p>Only administrators can see this log.</p></div>{!auditEvents.length && <p className="audit-empty">Changes made after this update will appear here.</p>}{auditEvents.map((event) => <article className="audit-event" key={event.id}><div className="audit-dot"/><div><b>{event.action}</b><span>{event.actor_email} · {event.module}{event.details ? ` · ${event.details}` : ""}</span></div><time>{new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</time></article>)}</div></section>;
 }
 function Invoices({
@@ -2185,13 +2416,15 @@ function Invoices({
 function Shell({
   children,
   close,
+  wide = false,
 }: {
   children: React.ReactNode;
   close: () => void;
+  wide?: boolean;
 }) {
   return (
     <div className="modal-backdrop" onMouseDown={close}>
-      <form className="modal" onMouseDown={(e) => e.stopPropagation()}>
+      <form className={`modal${wide ? " modal-wide" : ""}`} onMouseDown={(e) => e.stopPropagation()}>
         <button type="button" className="close" onClick={close}>
           <X size={19} />
         </button>
@@ -2375,11 +2608,33 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     if (i !== index) return item;
     const updated = { ...item, [key]: value };
     if (key !== "sku" && key !== "product") return updated;
-    const catalogueProduct = catalogue.find((product) => key === "sku" ? skuKey(product.sku) === skuKey(String(value)) : [`${product.sku} · ${catalogueName(product)}`, `${catalogueName(product)} · ${product.sku}`, catalogueName(product)].some((label) => label.toLowerCase() === String(value).trim().toLowerCase()));
+    const typed = String(value).trim();
+    const typedSku = typed.split("·")[0]?.trim() || "";
+    // A fetched order line always contains its SKU. Resolve that exact SKU
+    // before considering a product name, because names can legitimately repeat.
+    const catalogueProduct = catalogue.find((product) => key === "sku" ? skuKey(product.sku) === skuKey(typed) : skuKey(product.sku) === skuKey(typedSku)) || catalogue.find((product) => [`${product.sku} · ${catalogueName(product)}`, `${catalogueName(product)} · ${product.sku}`, catalogueName(product)].some((label) => label.toLowerCase() === typed.toLowerCase()));
     const selectedSku = catalogueProduct?.sku || (key === "sku" ? String(value) : updated.sku);
     const rate = specialRate(f.client, selectedSku) ?? catalogueProduct?.unitPrice;
-    return { ...updated, sku: selectedSku, product: catalogueProduct ? `${catalogueProduct.sku} · ${catalogueName(catalogueProduct)}` : updated.product, unitPrice: rate ?? updated.unitPrice, review: catalogueProduct ? { ...updated.review, product: false } : updated.review };
+    const masterPriceChanged = Boolean(catalogueProduct && rate !== undefined && updated.unitPrice > 0 && Math.abs(updated.unitPrice - rate) > 0.0001);
+    return { ...updated, sku: selectedSku, product: catalogueProduct ? `${catalogueProduct.sku} · ${catalogueName(catalogueProduct)}` : updated.product, unitPrice: rate ?? updated.unitPrice, masterPriceChanged, review: catalogueProduct ? { ...updated.review, product: false } : updated.review };
   }));
+  const useProductListPrice = (lineIndex: number) => {
+    const line = products[lineIndex];
+    const product = line && catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));
+    if (!product) { window.alert("This product does not yet match a Product / SKU master record."); return; }
+    const price = specialRate(f.client, product.sku) ?? product.unitPrice;
+    if (!window.confirm(`Replace this line’s price with the current Product / SKU price (${money(price)})? Client special rates take priority.`)) return;
+    setProducts((current) => current.map((item, index) => index === lineIndex ? { ...item, sku: product.sku, product: `${product.sku} · ${catalogueName(product)}`, unitPrice: price, masterPriceChanged: true, review: { ...item.review, product: false, price: false } } : item));
+  };
+  useEffect(() => {
+    if (!catalogue.length) return;
+    setProducts((current) => current.map((line) => {
+      const product = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));
+      // SKU remains the source of truth for the product label. This never
+      // changes an imported sheet price; rate replacement is user-triggered.
+      return product ? { ...line, sku: product.sku, product: `${product.sku} · ${catalogueName(product)}`, review: { ...line.review, product: false } } : line;
+    }));
+  }, [catalogue]);
   const selectClient = (name: string) => { const client = clients.find((item) => item.name === name); setF({ ...f, client: name, city: client?.city || "", avatar: client?.avatar || initials(name) }); setProducts((current) => current.map((item) => ({ ...item, unitPrice: specialRate(name, item.sku) ?? item.unitPrice }))); };
   useEffect(() => {
     const productLines = document.querySelector(".product-lines");
@@ -2410,17 +2665,26 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     input.placeholder = "Type or correct customer name";
     input.required = true;
     input.setAttribute("aria-label", "Customer name");
+    input.setAttribute("list", "order-customer-search");
+    const list = document.createElement("datalist");
+    list.id = "order-customer-search";
+    clients.forEach((client) => list.append(new Option(client.name, client.name)));
+    document.body.append(list);
     const hint = document.createElement("small");
     hint.className = "table-subtext";
-    hint.textContent = "You can correct the fetched customer name. A new customer profile is created only after Save order.";
+    hint.textContent = "Search and select an existing customer, or type a new/corrected name. A new customer profile is created only after Save order.";
     input.oninput = () => {
       const typedName = input.value;
       const matchedClient = clients.find((client) => client.name.trim().toLowerCase() === typedName.trim().toLowerCase());
       setF((current) => ({ ...current, client: typedName, city: matchedClient?.city || current.city, avatar: matchedClient?.avatar || initials(typedName) }));
     };
     label.append(input, hint);
-    return () => { input.remove(); hint.remove(); clientSelect.style.display = ""; clientSelect.required = true; };
-  }, [clients, f.client]);
+    return () => { input.remove(); hint.remove(); list.remove(); clientSelect.style.display = ""; clientSelect.required = true; };
+  }, [clients]);
+  useEffect(() => {
+    const input = document.querySelector<HTMLInputElement>('input[aria-label="Customer name"]');
+    if (input && document.activeElement !== input) input.value = f.client;
+  }, [f.client]);
   useEffect(() => {
     const clientLabel = Array.from(document.querySelectorAll<HTMLLabelElement>("label")).find((label) => label.textContent?.trim().startsWith("Client"));
     if (!clientLabel?.parentElement) return;
@@ -2450,6 +2714,35 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     skuInputs.forEach((input) => { input.style.display = "none"; input.required = false; });
     return () => { productInputs.forEach((input) => input.removeAttribute("list")); skuInputs.forEach((input) => { input.style.display = ""; input.required = true; }); list.remove(); };
   }, [catalogue, f.client]);
+  useEffect(() => {
+    const productLines = Array.from(document.querySelectorAll<HTMLElement>(".product-line"));
+    const buttons: HTMLButtonElement[] = [];
+    const removeButtons: HTMLButtonElement[] = [];
+    productLines.forEach((productLine, index) => {
+      // Existing multi-line orders already render their own remove button.
+      // Add the same control for a one-line order, where it clears the line
+      // instead of leaving the editor without any product input.
+      if (!productLine.querySelector(".remove-line")) {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "remove-line";
+        remove.textContent = "×";
+        remove.title = "Remove this product line";
+        remove.onclick = () => setProducts((current) => current.length === 1 ? [{ product: "", sku: "", quantity: 0, unitPrice: 0 }] : current.filter((_, lineIndex) => lineIndex !== index));
+        productLine.append(remove);
+        removeButtons.push(remove);
+      }
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "outline inventory-price-action";
+      button.textContent = "PLP";
+      button.title = "Use Product List Price for this product only. Imported order-sheet prices remain unchanged unless you click this.";
+      button.onclick = () => useProductListPrice(index);
+      productLine.append(button);
+      buttons.push(button);
+    });
+    return () => { buttons.forEach((button) => button.remove()); removeButtons.forEach((button) => button.remove()); };
+  }, [catalogue, products, f.client]);
   useEffect(() => {
     const productInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="Product name"]'));
     const controls: HTMLButtonElement[] = [];
@@ -2483,6 +2776,18 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     applyReview('input[aria-label="Product name"]', "product", "Please verify this product: the SKU was repaired from OCR or could not be matched exactly.");
     applyReview('input[aria-label="Quantity"]', "quantity", "Please verify this quantity: it was unclear in the uploaded image.");
     applyReview('input[aria-label="Unit price"]', "price", "Please verify this price: it was unclear in the uploaded image.");
+    Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="Unit price"]')).forEach((input, index) => {
+      const line = input.closest(".product-line");
+      line?.querySelector(".master-price-note")?.remove();
+      if (products[index]?.masterPriceChanged) {
+        input.classList.add("import-review");
+        input.title = "This rate was applied manually from the current Product / SKU master.";
+        const note = document.createElement("small");
+        note.className = "master-price-note";
+        note.textContent = "Price applied from Product / SKU master";
+        line?.append(note);
+      }
+    });
   }, [products]);
   const scanDocument = async (file: File, append = false) => {
     setPreview((file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) ? "" : URL.createObjectURL(file)); setScanState("scanning"); setScanNote("Reading document and finding product lines…");
@@ -2582,6 +2887,18 @@ function CataloguePanel({ items, edit, duplicate, addDrafts, setAllOpeningStock,
     if (!window.confirm(`Remove ${item.sku} — ${item.name} from the catalogue?`)) return;
     remove([item.id]); setSelected((current) => current.filter((id) => id !== item.id));
   };
+  const downloadProductExcel = async () => {
+    const XLSX = await import("xlsx");
+    const rows = items.map((item) => ({
+      "Product Name": catalogueName(item),
+      "SKU ID": catalogueSku(item),
+      "Inner Qty": item.innerQty || "",
+      "Outer Qty": item.outerQty || item.cartonQty || "",
+    }));
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), "Products & SKUs");
+    XLSX.writeFile(workbook, "geebee-products-skus.xlsx");
+  };
   const importCatalogueImage = async (file?: File) => {
     if (!file) return;
     setScanState("scanning"); setNotice("Reading SKU IDs from your catalogue document…");
@@ -2618,7 +2935,7 @@ function CataloguePanel({ items, edit, duplicate, addDrafts, setAllOpeningStock,
     } catch (error) { setScanState("error"); setNotice(error instanceof Error ? error.message : "The catalogue file could not be read."); }
   };
   if (pendingPdf) return <CatalogueImportReview drafts={pendingPdf.drafts} pages={pendingPdf.pages} confirm={() => { addDrafts(pendingPdf.drafts); setPendingPdf(null); setNotice("Catalogue import confirmed. Matching SKUs were updated and missing SKUs were added."); }} cancel={() => { setPendingPdf(null); setScanState("idle"); setNotice(""); }} />;
-  return <section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT LIBRARY</span><h2>Your catalogue, ready for order matching.</h2><p>Upload individual product photos, or scan a complete catalogue image or PDF to create SKU drafts quickly.</p></div><div className="catalogue-count"><b>{items.length}</b><span>active SKUs</span></div></div><section className="catalogue-actions"><label className="catalogue-scan"><div className="scan-orb"><ScanText size={20}/></div><div><b>Scan catalogue image or PDF</b><p>Read SKU IDs from a complete catalogue page.</p></div><span className="scan-cta">Upload file <ImagePlus size={14}/></span><input type="file" accept="image/*,application/pdf" onChange={(e) => importCatalogueImage(e.target.files?.[0])} disabled={scanState === "scanning"}/></label><div className="catalogue-tip"><b>How it works</b><p>Catalogue SKUs are matched automatically when you scan an incoming order image or PDF.</p></div></section>{scanState !== "idle" && <div className={`catalogue-notice ${scanState}`}><ScanText size={16}/>{notice}</div>}<div className="catalogue-toolbar"><div><h3>Products</h3><span>{items.length} shown</span></div><div className="catalogue-toolbar-actions"><button type="button" className="bulk-delete" onClick={() => setAllOpeningStock(10000)}>Set all available: 10,000</button><button type="button" className="bulk-delete" onClick={() => setAllOpeningStock(20000)}>Set all available: 20,000</button>{selected.length > 0 && <button type="button" className="bulk-delete" onClick={removeSelected}><Trash2 size={14}/> Remove {selected.length} selected</button>}<span>Click a product to edit it, duplicate it, or select products to remove.</span></div></div><section className="catalogue-grid">{items.map((item) => <article className="catalogue-card" key={item.id} onClick={() => edit(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={catalogueName(item)} onError={(event) => { event.currentTarget.style.display = "none"; }} /> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><div className="catalogue-card-heading"><label className="catalogue-select" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected.includes(item.id)} onChange={() => toggleSelected(item.id)} aria-label={`Select ${catalogueName(item)}`}/><span>Select</span></label><small title={catalogueSku(item)}>{catalogueSku(item)}</small></div><h3 title={catalogueName(item)}>{catalogueName(item)}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / pc` : "Price to be added"}</p><p className="catalogue-stock">Available: <b>{availableStock(item).toLocaleString("en-IN")}</b></p><div className="catalogue-card-actions"><button type="button" className="edit-product"><Pencil size={13}/> Edit product</button><button type="button" className="edit-product" onClick={(event) => { event.stopPropagation(); duplicate(item); }}><Copy size={13}/> Duplicate</button><button type="button" className="delete-product" onClick={(event) => { event.stopPropagation(); removeOne(item); }}><Trash2 size={13}/> Remove</button></div></div></article>)}{!items.length && <div className="empty">No catalogue products match your search.</div>}</section></section>;
+  return <section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT LIBRARY</span><h2>Your catalogue, ready for order matching.</h2><p>Upload individual product photos, or scan a complete catalogue image or PDF to create SKU drafts quickly.</p></div><div className="catalogue-count"><b>{items.length}</b><span>active SKUs</span></div></div><section className="catalogue-actions"><label className="catalogue-scan"><div className="scan-orb"><ScanText size={20}/></div><div><b>Scan catalogue image or PDF</b><p>Read SKU IDs from a complete catalogue page.</p></div><span className="scan-cta">Upload file <ImagePlus size={14}/></span><input type="file" accept="image/*,application/pdf" onChange={(e) => importCatalogueImage(e.target.files?.[0])} disabled={scanState === "scanning"}/></label><div className="catalogue-tip"><b>How it works</b><p>Catalogue SKUs are matched automatically when you scan an incoming order image or PDF.</p></div></section>{scanState !== "idle" && <div className={`catalogue-notice ${scanState}`}><ScanText size={16}/>{notice}</div>}<div className="catalogue-toolbar"><div><h3>Products</h3><span>{items.length} shown</span></div><div className="catalogue-toolbar-actions"><button type="button" className="bulk-delete" onClick={downloadProductExcel}><Download size={14}/> Download Excel</button><button type="button" className="bulk-delete" onClick={() => setAllOpeningStock(10000)}>Set all available: 10,000</button><button type="button" className="bulk-delete" onClick={() => setAllOpeningStock(20000)}>Set all available: 20,000</button>{selected.length > 0 && <button type="button" className="bulk-delete" onClick={removeSelected}><Trash2 size={14}/> Remove {selected.length} selected</button>}<span>Click a product to edit it, duplicate it, or select products to remove.</span></div></div><section className="catalogue-grid">{items.map((item) => <article className="catalogue-card" key={item.id} onClick={() => edit(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={catalogueName(item)} onError={(event) => { event.currentTarget.style.display = "none"; }} /> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><div className="catalogue-card-heading"><label className="catalogue-select" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected.includes(item.id)} onChange={() => toggleSelected(item.id)} aria-label={`Select ${catalogueName(item)}`}/><span>Select</span></label><small title={catalogueSku(item)}>{catalogueSku(item)}</small></div><h3 title={catalogueName(item)}>{catalogueName(item)}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / pc` : "Price to be added"}</p><p className="catalogue-stock">Available: <b>{availableStock(item).toLocaleString("en-IN")}</b></p><div className="catalogue-card-actions"><button type="button" className="edit-product"><Pencil size={13}/> Edit product</button><button type="button" className="edit-product" onClick={(event) => { event.stopPropagation(); duplicate(item); }}><Copy size={13}/> Duplicate</button><button type="button" className="delete-product" onClick={(event) => { event.stopPropagation(); removeOne(item); }}><Trash2 size={13}/> Remove</button></div></div></article>)}{!items.length && <div className="empty">No catalogue products match your search.</div>}</section></section>;
 }
 function CatalogueModal({ item, close, save }: { item: CatalogueItem | null; close: () => void; save: (item: CatalogueItem) => void }) {
   const initial: CatalogueItem = item || { id: Date.now(), name: "", sku: "", unitPrice: 0, category: "Party items", image: "", description: "", cartonQty: "", subCategory: "", brand: "GeeBee", unit: "Piece", packSize: "", moq: 0, purchasePrice: 0, wholesalePrice: 0, distributorPrice: 0, gst: 18, barcode: "", weight: "", dimensions: "", supplier: "", countryOfOrigin: "", availableQuantity: 10000, reservedStock: 0, reorderThreshold: 0 };
@@ -2652,6 +2969,7 @@ function ClientModal({
     contact: "",
     phone: "",
     whatsapp: "",
+    whatsappGroupLink: "",
     email: "",
     gstin: "",
     pan: "",
@@ -2668,7 +2986,7 @@ function ClientModal({
   const set = (k: keyof Client, v: string) => setF({ ...f, [k]: v });
   const setRate = (sku: string, rate: number) => setF({ ...f, specialRates: [...(f.specialRates || []).filter((item) => item.sku !== sku), { sku, rate }] });
   const removeRate = (sku: string) => setF({ ...f, specialRates: (f.specialRates || []).filter((item) => item.sku !== sku) });
-  return <Shell close={close}><div className="modal-mark"><Users size={22}/></div><h2>{client ? "Edit client" : "New client"}</h2><p>Only the customer details required for day-to-day orders and collections.</p><div className="form-row"><label>Business name<input value={f.name} onChange={(e) => set("name", e.target.value)} required/></label><label>City<input value={f.city} onChange={(e) => set("city", e.target.value)} required/></label></div><div className="form-row"><label>Primary contact<input value={f.contact || ""} onChange={(e) => set("contact", e.target.value)} placeholder="Contact person name"/></label><label>Phone number<input value={f.phone} onChange={(e) => set("phone", e.target.value)} required/></label></div><div className="form-row"><label>Payment threshold<input value={f.credit} onChange={(e) => set("credit", e.target.value)} placeholder="₹ 0" required/></label><label>Payment terms<select value={f.paymentTerms || ""} onChange={(e) => set("paymentTerms", e.target.value)}><option value="">Select payment terms</option>{["Advance", "7 days", "15 days", "30 days", "45 days", "60 days"].map((value) => <option key={value}>{value}</option>)}</select></label></div><label>Status<select value={f.customerStatus || "Active"} onChange={(e) => set("customerStatus", e.target.value)}>{["Active", "On hold", "Inactive", "Prospect", "Blocked"].map((value) => <option key={value}>{value}</option>)}</select></label><button className="primary modal-submit" type="button" onClick={() => save({ ...f, customerId: f.customerId || `GB-C${String(f.id).slice(-4)}`, contact: (f.contact || "").trim(), avatar: f.avatar || initials(f.name) })}>Save client</button></Shell>;
+  return <Shell close={close}><div className="modal-mark"><Users size={22}/></div><h2>{client ? "Edit client" : "New client"}</h2><p>Only the customer details required for day-to-day orders and collections.</p><div className="form-row"><label>Business name<input value={f.name} onChange={(e) => set("name", e.target.value)} required/></label><label>City<input value={f.city} onChange={(e) => set("city", e.target.value)} required/></label></div><div className="form-row"><label>Primary contact<input value={f.contact || ""} onChange={(e) => set("contact", e.target.value)} placeholder="Contact person name"/></label><label>Phone number<input value={f.phone} onChange={(e) => set("phone", e.target.value)} required/></label></div><div className="form-row"><label>Payment threshold<input value={f.credit} onChange={(e) => set("credit", e.target.value)} placeholder="₹ 0" required/></label><label>Payment terms<select value={f.paymentTerms || ""} onChange={(e) => set("paymentTerms", e.target.value)}><option value="">Select payment terms</option>{["Advance", "7 days", "15 days", "30 days", "45 days", "60 days"].map((value) => <option key={value}>{value}</option>)}</select></label></div><label>WhatsApp group link<input type="url" value={f.whatsappGroupLink || ""} onChange={(e) => set("whatsappGroupLink", e.target.value)} placeholder="https://chat.whatsapp.com/..."/><small>Optional. Confirmed orders will open this customer group directly.</small></label><label>Status<select value={f.customerStatus || "Active"} onChange={(e) => set("customerStatus", e.target.value)}>{["Active", "On hold", "Inactive", "Prospect", "Blocked"].map((value) => <option key={value}>{value}</option>)}</select></label><button className="primary modal-submit" type="button" onClick={() => save({ ...f, customerId: f.customerId || `GB-C${String(f.id).slice(-4)}`, contact: (f.contact || "").trim(), avatar: f.avatar || initials(f.name) })}>Save client</button></Shell>;
   return (
     <Shell close={close}>
       <div className="modal-mark">
@@ -2748,11 +3066,11 @@ function QuoteModal({ quote, clients, catalogue, close, save }: { quote: Quote |
   const subtotal = quoteSubtotal(form); const total = quoteTotal(form);
   return <Shell close={close}><div className="modal-mark"><FileText size={22}/></div><h2>{quote ? "Edit quotation" : "New quotation"}</h2><p>Create a customer-ready quote, then share or convert it into an order.</p><div className="form-row"><label>Quote number<input value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value.toUpperCase() })}/></label><label>Customer<select value={form.customer} onChange={(event) => setForm({ ...form, customer: event.target.value })}><option value="">Select customer</option>{clients.map((client) => <option key={client.id}>{client.name}</option>)}</select></label></div><div className="modal-section-title">Products & pricing</div><div className="quote-lines">{form.products.map((line, index) => <div className="quote-line" key={index}><select value={line.sku} onChange={(event) => updateLine(index, "sku", event.target.value)}><option value="">Select SKU</option>{catalogue.map((product) => <option key={product.id} value={product.sku}>{product.sku} — {product.name}</option>)}</select><input aria-label="Quantity" type="number" min="1" value={line.quantity} onChange={(event) => updateLine(index, "quantity", Number(event.target.value))}/><input aria-label="Rate" type="number" min="0" value={line.unitPrice} onChange={(event) => updateLine(index, "unitPrice", Number(event.target.value))}/><input aria-label="Discount percent" type="number" min="0" max="100" value={line.discount} onChange={(event) => updateLine(index, "discount", Number(event.target.value))}/><b>{money(line.quantity * line.unitPrice * (1 - line.discount / 100))}</b>{form.products.length > 1 && <button type="button" onClick={() => setForm({ ...form, products: form.products.filter((_, itemIndex) => itemIndex !== index) })}>×</button>}</div>)}</div><button type="button" className="add-line" onClick={() => setForm({ ...form, products: [...form.products, { product: "", sku: "", quantity: 1, unitPrice: 0, discount: 0 }] })}><Plus size={15}/> Add product</button><div className="quote-total-box"><span>Subtotal <b>{money(subtotal)}</b></span><span>GST<input type="number" min="0" value={form.gst} onChange={(event) => setForm({ ...form, gst: Number(event.target.value) })}/>%</span><span>Freight<input type="number" min="0" value={form.freight} onChange={(event) => setForm({ ...form, freight: Number(event.target.value) })}/></span><strong>Total {money(total)}</strong></div><div className="form-row"><label>Validity<input type="date" value={form.validity} onChange={(event) => setForm({ ...form, validity: event.target.value })}/></label><label>Status<select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as Quote["status"] })}>{["Draft", "Sent", "Accepted", "Converted"].map((status) => <option key={status}>{status}</option>)}</select></label></div><label>Payment terms<input value={form.paymentTerms} onChange={(event) => setForm({ ...form, paymentTerms: event.target.value })} placeholder="e.g. 30 days from invoice"/></label><label>Delivery terms<input value={form.deliveryTerms} onChange={(event) => setForm({ ...form, deliveryTerms: event.target.value })} placeholder="e.g. Ex-warehouse, Mumbai"/></label><button className="primary modal-submit" type="button" onClick={() => save(form)}>Save quotation</button></Shell>;
 }
-function TaskModal({ task, close, save }: { task: SalesTask | null; close: () => void; save: (task: SalesTask) => void }) {
-  const initial: SalesTask = task || { id: `TASK-${String(Date.now()).slice(-6)}`, title: "", time: "10:00", dueDate: new Date().toISOString().slice(0, 10), assignee: "Rahul", type: "Follow-up", status: "Open", relatedTo: "" };
+function TaskModal({ task, owner, close, save }: { task: SalesTask | null; owner: string; close: () => void; save: (task: SalesTask) => void }) {
+  const initial: SalesTask = task || { id: `TASK-${String(Date.now()).slice(-6)}`, title: "", time: "10:00", dueDate: new Date().toISOString().slice(0, 10), assignee: owner, type: "Follow-up", status: "Open", relatedTo: "" };
   const [form, setForm] = useState<SalesTask>(initial);
   const set = (key: keyof SalesTask, value: string) => setForm({ ...form, [key]: value });
-  return <Shell close={close}><div className="modal-mark"><ClipboardList size={22}/></div><h2>{task ? "Edit task" : "New task"}</h2><p>Assign a timed action to a salesperson.</p><label>Task<input value={form.title} onChange={(event) => set("title", event.target.value)} placeholder="e.g. Follow-up customer" required/></label><label>Task description<textarea value={form.description || ""} onChange={(event) => set("description", event.target.value)} placeholder="Write the purpose, discussion points or next action"/></label><div className="form-row"><label>Date<input type="date" value={form.dueDate} onChange={(event) => set("dueDate", event.target.value)}/></label><label>Time<input type="time" value={form.time} onChange={(event) => set("time", event.target.value)}/></label></div><div className="form-row"><label>Task type<select value={form.type} onChange={(event) => set("type", event.target.value)}>{["Call", "Follow-up", "Payment", "Quotation", "Enquiry", "Other"].map((type) => <option key={type}>{type}</option>)}</select></label><label>Assigned salesperson<input value={form.assignee} onChange={(event) => set("assignee", event.target.value)} placeholder="Employee name"/></label></div><label>Related record<input value={form.relatedTo || ""} onChange={(event) => set("relatedTo", event.target.value)} placeholder="Optional: invoice, quote, lead or order ID"/></label><button className="primary modal-submit" type="button" onClick={() => save(form)}>Save task</button></Shell>;
+  return <Shell close={close}><div className="modal-mark"><ClipboardList size={22}/></div><h2>{task ? "Edit task" : "New task"}</h2><p>This is your personal Daily Task. Only you and administrators can view it.</p><label>Task<input value={form.title} onChange={(event) => set("title", event.target.value)} placeholder="e.g. Follow-up customer" required/></label><label>Task description<textarea value={form.description || ""} onChange={(event) => set("description", event.target.value)} placeholder="Write the purpose, discussion points or next action"/></label><div className="form-row"><label>Date<input type="date" value={form.dueDate} onChange={(event) => set("dueDate", event.target.value)}/></label><label>Time<input type="time" value={form.time} onChange={(event) => set("time", event.target.value)}/></label></div><label>Task type<select value={form.type} onChange={(event) => set("type", event.target.value)}>{["Call", "Follow-up", "Payment", "Quotation", "Enquiry", "Other"].map((type) => <option key={type}>{type}</option>)}</select></label><label>Related record<input value={form.relatedTo || ""} onChange={(event) => set("relatedTo", event.target.value)} placeholder="Optional: invoice, quote, lead or order ID"/></label><button className="primary modal-submit" type="button" onClick={() => save(form)}>Save task</button></Shell>;
 }
 function LeadModal({ lead, close, save }: { lead: Lead | null; close: () => void; save: (lead: Lead) => void }) {
   const initial: Lead = lead || { id: `LEAD-${String(Date.now()).slice(-6)}`, company: "", contact: "", mobile: "", city: "", source: "WhatsApp", salesperson: "", requirement: "", expectedValue: "", expectedDate: "", status: "New", lostReason: "", createdAt: new Date().toISOString().slice(0, 10) };

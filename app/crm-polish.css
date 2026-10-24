@@ -39,3 +39,33 @@ header{position:sticky;top:0;z-index:5;background:rgba(248,246,244,.92);backdrop
 /* Keep account controls reachable even when every navigation group is open. */
 .side-bottom{position:sticky!important;bottom:-14px;z-index:3;margin-top:14px!important;padding:10px 5px 14px!important;background:linear-gradient(180deg,rgba(104,29,43,0),#681d2b 22%)!important}
 .profile{flex-wrap:wrap!important;row-gap:7px}.profile>div:nth-child(2){min-width:0}.profile b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sign-out{display:flex!important;align-items:center;justify-content:center;width:100%;padding:8px 10px!important;border:1px solid rgba(255,255,255,.25)!important;border-radius:7px!important;background:rgba(255,255,255,.1)!important;color:#fff!important;font-size:11px!important;font-weight:700!important}.sign-out:hover{background:rgba(255,255,255,.18)!important}
+
+/* CRM forms must always sit above the sticky top search/header. */
+.modal-backdrop{z-index:1000!important}
+.toast{z-index:1001!important}
+
+/* The order workspace has many product lines, so it deserves more room than
+   the smaller edit dialogs.  It remains full-screen friendly on phones. */
+.modal:has(.document-capture){
+  width:min(1180px,calc(100vw - 56px))!important;
+  max-width:1180px!important;
+  max-height:calc(100vh - 40px)!important;
+}
+.modal:has(.document-capture) .product-lines{max-height:48vh;overflow:auto}
+@media(max-width:760px){
+  .modal:has(.document-capture){width:calc(100vw - 16px)!important;max-height:calc(100vh - 16px)!important}
+  .modal:has(.document-capture) .product-lines{max-height:44vh}
+}
+
+/* Administrator activity log, organised by the person who made the change. */
+.user-activity-group{margin-top:14px;border:1px solid #eee1e3;border-radius:12px;overflow:hidden;background:#fff}
+.user-activity-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 14px;background:#fff7f5;color:#6c1c2a}
+.user-activity-heading b{font-size:13px;overflow-wrap:anywhere}.user-activity-heading span{font-size:11px;font-weight:700;white-space:nowrap;color:#8b5e66}
+.user-activity-group .audit-event{margin:0 14px}.user-activity-group .audit-event:last-child{border-bottom:0}
+.audit-toolbar{display:flex;align-items:end;justify-content:space-between;gap:18px}.audit-toolbar label{display:grid;gap:5px;min-width:250px;font-size:11px;font-weight:700;color:#77545b}.audit-toolbar select{height:36px;padding:0 10px;border:1px solid #e7dadd;border-radius:8px;background:#fff;color:#4a2029;font:inherit}@media(max-width:720px){.audit-toolbar{align-items:stretch;flex-direction:column}.audit-toolbar label{min-width:0;width:100%}}
+
+/* Header quick actions stay compact, while the guide makes discoverability easy. */
+.shortcut-trigger{display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 10px;border:1px solid #eadde0;border-radius:8px;background:#fff;color:#682033;font-size:11px;font-weight:700;white-space:nowrap}.shortcut-trigger:hover{border-color:#c996a2;background:#fff8f8}.shortcuts-popover{position:absolute;top:53px;right:86px;z-index:1002;width:270px;padding:14px;border:1px solid #eadde0;border-radius:12px;background:#fff;box-shadow:0 18px 40px #30101c24}.shortcuts-popover>div{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;color:#632033}.shortcuts-popover>div button{display:grid;place-items:center;border:0;background:transparent;color:#8b6670;cursor:pointer}.shortcuts-popover p{display:grid;grid-template-columns:auto auto 1fr;align-items:center;gap:5px;margin:8px 0;font-size:12px;color:#5a444b}.shortcuts-popover p:nth-of-type(5){grid-template-columns:auto 1fr}.shortcuts-popover kbd{min-width:23px;padding:3px 5px;border:1px solid #ddcfd2;border-bottom-width:2px;border-radius:5px;background:#fff8f7;color:#772038;font:700 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;text-align:center}.shortcuts-popover small{display:block;margin-top:11px;padding-top:9px;border-top:1px solid #f1e8e9;color:#8c7479;font-size:10px;line-height:1.4}@media(max-width:760px){.shortcut-trigger span{display:none}.shortcut-trigger{width:34px;justify-content:center;padding:0}.shortcuts-popover{right:52px;width:min(270px,calc(100vw - 70px))}}
+
+/* Imported-sheet pricing is preserved unless a user explicitly chooses the inventory rate. */
+.inventory-price-action{display:inline-flex!important;align-items:center;justify-content:center;align-self:center;width:36px;min-width:36px;height:27px;margin-left:7px;padding:0!important;font-size:9px!important;font-weight:900;letter-spacing:.15px}.order-entry-source{display:inline-flex;align-items:center;padding:4px 7px;border-radius:999px;background:#f6eef0;color:#7b4050;font-size:10px;font-weight:800;white-space:nowrap}

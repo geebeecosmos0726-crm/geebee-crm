@@ -6,15 +6,15 @@ export const runtime = "nodejs";
 type Workspace = { owner_id: string; data: Record<string, unknown>; updated_at: string };
 
 const headers = {
-  Customers: ["Record ID", "Customer ID", "Business Name", "Contact Person", "Mobile", "WhatsApp", "Email", "GSTIN", "PAN", "Business Type", "Customer Category", "State", "City", "Address", "Pincode", "Credit Limit", "Payment Terms", "Assigned Salesperson", "Customer Status", "Special Rates JSON"],
-  Products: ["Record ID", "SKU", "Product Name", "Category", "Sub-category", "Brand", "Description", "Carton Qty", "Unit", "Pack Size", "MOQ", "Purchase Price", "Selling Price", "Wholesale Price", "Distributor Price", "GST %", "Barcode", "Weight", "Dimensions", "Supplier", "Country of Origin", "Opening Stock", "Purchase", "Orders", "Damaged", "Reserved"],
-  Orders: ["Order ID", "Customer", "City", "Product", "SKU", "Quantity", "Unit Price", "ETA", "Status", "Payment Status", "Products JSON"],
+  Customers: ["Record ID", "Customer ID", "Business Name", "Contact Person", "Mobile", "WhatsApp", "Email", "GSTIN", "PAN", "Business Type", "Customer Category", "State", "City", "Address", "Pincode", "Credit Limit", "Payment Terms", "Assigned Salesperson", "Customer Status", "WhatsApp Group Link", "Special Rates JSON"],
+  Products: ["Record ID", "SKU", "Product Name", "Category", "Sub-category", "Brand", "Description", "Carton Qty", "Inner Qty", "Outer Qty", "Unit", "Selling Price", "Available Quantity", "Low Stock Alert", "Reserved", "Image URL", "Supplier"],
+  Orders: ["Order ID", "Customer", "City", "Product", "SKU", "Quantity", "Unit Price", "ETA", "Status", "Payment Status", "Transporter", "Remarks", "Client Approval", "Products JSON"],
   Backorders: ["Order ID", "Customer", "SKU", "Product", "Short Quantity", "Unit Price"],
   Quotes: ["Quote Number", "Customer", "Products JSON", "GST %", "Freight", "Validity", "Payment Terms", "Delivery Terms", "Status", "Created At"],
   Invoices: ["Invoice Number", "Customer", "Order", "Amount", "Due", "Status"],
   Leads: ["Lead ID", "Company", "Contact Person", "Mobile", "City", "Source", "Assigned Salesperson", "Requirement", "Expected Order Value", "Expected Order Date", "Status", "Lost Reason", "Created At"],
-  Tasks: ["Task ID", "Title", "Time", "Due Date", "Assignee", "Type", "Status", "Related To"],
-  Transporters: ["Record ID", "Transporter Name", "Contact Person", "Phone", "Email", "City", "GSTIN", "Service Type", "Notes"],
+  Tasks: ["Task ID", "Title", "Description", "Time", "Due Date", "Assignee", "Type", "Status", "Related To"],
+  Transporters: ["Record ID", "Transporter Name", "Contact Person", "Phone", "Email", "City", "Area", "GSTIN", "Service Type", "Notes"],
   Suppliers: ["Record ID", "Supplier Name", "Contact Person", "Phone", "Email", "City", "Country", "GSTIN", "Payment Terms", "Status", "Notes"],
   "Purchase Orders": ["PO Number", "Supplier", "Status", "Expected Date", "Created At", "Notes", "Lines JSON"],
   "Audit Log": ["Event ID", "Workspace Owner", "Actor", "Action", "Module", "Details", "Created At"],
@@ -59,10 +59,11 @@ export async function GET(request: Request) {
     const sheets = google.sheets({ version: "v4", auth });
     const supabase = createClient(url, serviceKey, { auth: { persistSession: false } });
     const owner = requestedOwnerId;
-    const [{ data: workspaces, error: workspaceError }, { data: auditEvents, error: auditError }, ...recordResults] = await Promise.all([
+    const [{ data: workspaces, error: workspaceError }, { data: auditEvents, error: auditError }, { data: stockRows, error: stockError }, ...recordResults] = await Promise.all([
       owner ? supabase.from("crm_workspaces").select("owner_id, data, updated_at").eq("owner_id", owner) : supabase.from("crm_workspaces").select("owner_id, data, updated_at"),
       owner ? supabase.from("crm_audit_events").select("id, workspace_owner_id, actor_email, action, module, details, created_at").eq("workspace_owner_id", owner).order("created_at", { ascending: false }).limit(500) : supabase.from("crm_audit_events").select("id, workspace_owner_id, actor_email, action, module, details, created_at").order("created_at", { ascending: false }).limit(500),
-      ...["crm_clients", "crm_products", "crm_orders", "crm_invoices", "crm_leads", "crm_quotes", "crm_tasks", "crm_transporters"].map((table) => owner ? supabase.from(table).select("data").eq("workspace_owner_id", owner).limit(100000) : supabase.from(table).select("data").limit(100000)),
+      owner ? supabase.from("crm_stock_inventory").select("data").eq("workspace_owner_id", owner).limit(100000) : supabase.from("crm_stock_inventory").select("data").limit(100000),
+      ...["crm_clients", "crm_orders", "crm_invoices", "crm_leads", "crm_quotes", "crm_tasks", "crm_transporters"].map((table) => owner ? supabase.from(table).select("data").eq("workspace_owner_id", owner).limit(100000) : supabase.from(table).select("data").limit(100000)),
     ]);
     if (workspaceError) throw workspaceError;
     // Audit history is useful, but a backup of core business data must still
@@ -70,19 +71,19 @@ export async function GET(request: Request) {
     const safeAuditEvents = auditError ? [] : auditEvents || [];
     const workspace = ((workspaces || [])[0] as Workspace | undefined);
     if (!workspace) throw new Error("No GeeBee workspace was found.");
-    const normalizedReady = recordResults.every((result) => !result.error);
+    const normalizedReady = !stockError && recordResults.every((result) => !result.error);
     const normalized = normalizedReady ? recordResults.map((result) => (result.data || []).map((row: any) => row.data)) : [];
-    const data = normalizedReady ? { clients: normalized[0], catalogue: normalized[1], orders: normalized[2], invoices: normalized[3], leads: normalized[4], quotes: normalized[5], tasks: normalized[6], transporters: normalized[7] } : workspace.data || {};
+    const data = normalizedReady ? { clients: normalized[0], catalogue: (stockRows || []).map((row: any) => row.data), orders: normalized[1], invoices: normalized[2], leads: normalized[3], quotes: normalized[4], tasks: normalized[5], transporters: normalized[6] } : workspace.data || {};
     const backupRows: Record<string, string[][]> = {
-      Customers: rows(data.clients, ["id", "customerId", "name", "contact", "phone", "whatsapp", "email", "gstin", "pan", "businessType", "customerCategory", "state", "city", "address", "pincode", "credit", "paymentTerms", "assignedSalesperson", "customerStatus", "specialRates"]),
-      Products: rows(data.catalogue, ["id", "sku", "name", "category", "subCategory", "brand", "description", "cartonQty", "unit", "packSize", "moq", "purchasePrice", "unitPrice", "wholesalePrice", "distributorPrice", "gst", "barcode", "weight", "dimensions", "supplier", "countryOfOrigin", "openingStock", "purchasedStock", "orderedStock", "damagedStock", "reservedStock"]),
-      Orders: rows(data.orders, ["id", "client", "city", "product", "sku", "quantity", "unitPrice", "eta", "status", "payment", "products"]),
+      Customers: rows(data.clients, ["id", "customerId", "name", "contact", "phone", "whatsapp", "email", "gstin", "pan", "businessType", "customerCategory", "state", "city", "address", "pincode", "credit", "paymentTerms", "assignedSalesperson", "customerStatus", "whatsappGroupLink", "specialRates"]),
+      Products: rows(data.catalogue, ["id", "sku", "name", "category", "subCategory", "brand", "description", "cartonQty", "innerQty", "outerQty", "unit", "unitPrice", "availableQuantity", "reorderThreshold", "reservedStock", "image", "supplier"]),
+      Orders: rows(data.orders, ["id", "client", "city", "product", "sku", "quantity", "unitPrice", "eta", "status", "payment", "transporter", "remarks", "clientApproval", "products"]),
       Backorders: Array.isArray(data.orders) ? data.orders.flatMap((order: any) => Array.isArray(order.backorders) ? order.backorders.map((line: any) => [text(order.id), text(order.client), text(line.sku), text(line.product), text(line.quantity), text(line.unitPrice)]) : []) : [],
       Quotes: rows(data.quotes, ["id", "customer", "products", "gst", "freight", "validity", "paymentTerms", "deliveryTerms", "status", "createdAt"]),
       Invoices: rows(data.invoices, ["id", "client", "order", "amount", "due", "status"]),
       Leads: rows(data.leads, ["id", "company", "contact", "mobile", "city", "source", "salesperson", "requirement", "expectedValue", "expectedDate", "status", "lostReason", "createdAt"]),
-      Tasks: rows(data.tasks, ["id", "title", "time", "dueDate", "assignee", "type", "status", "relatedTo"]),
-      Transporters: rows(data.transporters, ["id", "name", "contact", "phone", "email", "city", "gstin", "serviceType", "notes"]),
+      Tasks: rows(data.tasks, ["id", "title", "description", "time", "dueDate", "assignee", "type", "status", "relatedTo"]),
+      Transporters: rows(data.transporters, ["id", "name", "contact", "phone", "email", "city", "area", "gstin", "serviceType", "notes"]),
       Suppliers: rows((workspace.data || {}).suppliers, ["id", "name", "contact", "phone", "email", "city", "country", "gstin", "paymentTerms", "status", "notes"]),
       "Purchase Orders": rows((workspace.data || {}).purchases, ["id", "supplier", "status", "expectedDate", "createdAt", "notes", "lines"]),
       "Audit Log": safeAuditEvents.map((event: any) => [text(event.id), text(event.workspace_owner_id), text(event.actor_email), text(event.action), text(event.module), text(event.details), text(event.created_at)]),
@@ -98,6 +99,20 @@ export async function GET(request: Request) {
     await sheets.spreadsheets.values.update({ spreadsheetId, range: "'Backup Log'!A1", valueInputOption: "RAW", requestBody: { values: [["Backup timestamp", "Status", "Workspace updated at", "Record counts"]] } });
     const countSummary = Object.entries(backupRows).map(([title, value]) => `${title}: ${value.length}`).join(" | ");
     await sheets.spreadsheets.values.append({ spreadsheetId, range: "'Backup Log'!A:D", valueInputOption: "RAW", requestBody: { values: [[new Date().toISOString(), "Success", workspace.updated_at, countSummary]] } });
+    // Google Sheets is the human-readable recovery copy. Keep a compact server
+    // snapshot at the same moment as a second, exact rollback point.
+    const snapshotData = {
+      ...data,
+      suppliers: Array.isArray((workspace.data || {}).suppliers) ? (workspace.data || {}).suppliers : [],
+      purchases: Array.isArray((workspace.data || {}).purchases) ? (workspace.data || {}).purchases : [],
+    };
+    const { error: snapshotError } = await supabase.from("crm_recovery_snapshots").insert({
+      workspace_owner_id: workspace.owner_id,
+      restored_by: "Automated backup",
+      source: "Google Sheets backup",
+      data: snapshotData,
+    });
+    if (snapshotError) console.error("Server recovery snapshot was not saved:", snapshotError.message);
     return Response.json({ ok: true, backupAt: new Date().toISOString(), records: countSummary });
   } catch (error) {
     console.error("Google Sheets backup failed:", error instanceof Error ? error.message : error);

@@ -131,16 +131,18 @@ export async function POST(request: Request) {
     if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
     const auth = new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"] });
     const sheets = google.sheets({ version: "v4", auth });
-    const [{ data: existingOrders, error: ordersError }, { data: existingClients, error: clientsError }, { data: catalogue, error: productsError }, metadata] = await Promise.all([
+    const [{ data: existingOrders, error: ordersError }, { data: existingClients, error: clientsError }, { data: productMaster, error: productsError }, metadata] = await Promise.all([
       db.from("crm_orders").select("record_id").eq("workspace_owner_id", ownerId).limit(100000),
       db.from("crm_clients").select("record_id, data").eq("workspace_owner_id", ownerId).limit(100000),
-      db.from("crm_products").select("data").eq("workspace_owner_id", ownerId).limit(100000),
+      db.from("crm_stock_inventory").select("data").eq("workspace_owner_id", ownerId).limit(100000),
       sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties" }),
     ]);
     if (ordersError || clientsError || productsError) throw ordersError || clientsError || productsError;
     const knownOrderIds = new Set((existingOrders || []).map((row) => key(row.record_id)));
     const knownCustomers: CustomerIdentity[] = (existingClients || []).map((row: any) => ({ name: String(row.data?.name || "").trim(), city: String(row.data?.city || "").trim() })).filter((customer) => customer.name);
-    const productMap = new Map((catalogue || []).map((row: any) => [key(row.data?.sku), row.data as { name?: string }]));
+    // Order imports must resolve the SKU from the current Product / SKU
+    // master, never from the retired catalogue table.
+    const productMap = new Map((productMaster || []).map((row: any) => [key(row.data?.sku), row.data as { name?: string }]));
     const imported: ImportedOrder[] = [];
     const reusedCustomers: string[] = [];
     const pendingCustomers: string[] = [];

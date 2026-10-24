@@ -344,7 +344,9 @@ const orderEntrySource = (order: Order) => /imported\s+from/i.test(order.remarks
 const orderQuantity = (order: Order) => linesFor(order).reduce((total, line) => total + line.quantity, 0);
 const nextPurchaseOrderNumber = (purchases: PurchaseOrder[]) => {
   const now = new Date();
-  const prefix = `${String(now.getFullYear()).slice(-2)}${String(now.getMonth() + 1).padStart(2, "0")}`;
+  // Purchase order numbers are date + month based: 24 October becomes
+  // 2410-01, 2410-02, and so on for that day.
+  const prefix = `${String(now.getDate()).padStart(2, "0")}${String(now.getMonth() + 1).padStart(2, "0")}`;
   const sequence = purchases.reduce((highest, purchase) => {
     const match = purchase.id.match(new RegExp(`^${prefix}-(\\d+)$`, "i"));
     return match ? Math.max(highest, Number(match[1])) : highest;
@@ -1795,6 +1797,36 @@ function PurchaseOrdersPanel({ purchases, catalogue, lowStockProducts, add, edit
     cells.forEach((cell) => { cell.style.display = "none"; });
     return () => cells.forEach((cell) => { cell.style.display = ""; });
   }, [purchases]);
+  useEffect(() => {
+    // Keep the register focused: active replenishment work is separate from
+    // fully received or cancelled PO history.
+    const title = Array.from(document.querySelectorAll<HTMLElement>(".purchase-panel h2")).find((heading) => heading.textContent?.trim() === "Purchase order register");
+    const panel = title?.closest<HTMLElement>(".purchase-panel");
+    const table = panel?.querySelector("table");
+    if (!title || !panel || !table) return;
+    const tabs = document.createElement("div");
+    tabs.className = "purchase-register-tabs";
+    const ongoing = document.createElement("button");
+    const filled = document.createElement("button");
+    ongoing.type = "button"; filled.type = "button";
+    ongoing.textContent = `Ongoing (${purchases.filter((purchase) => !["Delivered", "Cancelled"].includes(purchase.status)).length})`;
+    filled.textContent = `Filled (${purchases.filter((purchase) => ["Delivered", "Cancelled"].includes(purchase.status)).length})`;
+    tabs.append(ongoing, filled);
+    title.parentElement?.append(tabs);
+    const show = (mode: "ongoing" | "filled") => {
+      ongoing.classList.toggle("active", mode === "ongoing");
+      filled.classList.toggle("active", mode === "filled");
+      Array.from(table.querySelectorAll("tbody tr")).forEach((row) => {
+        const status = row.children[6]?.textContent?.trim() || "";
+        const isFilled = ["Delivered", "Cancelled"].includes(status);
+        (row as HTMLElement).style.display = (mode === "filled") === isFilled ? "" : "none";
+      });
+    };
+    ongoing.onclick = () => show("ongoing");
+    filled.onclick = () => show("filled");
+    show("ongoing");
+    return () => tabs.remove();
+  }, [purchases]);
   return <section className="purchasing-page"><div className="purchase-metrics"><article><span>LOW STOCK ALERTS</span><b>{lowStockProducts.length}</b><small>SKU(s) at or below threshold</small></article><article><span>OPEN PURCHASE ORDERS</span><b>{open.length}</b><small>{pendingUnits.toLocaleString("en-IN")} units awaiting delivery</small></article><article><span>CATALOGUE COVERAGE</span><b>{catalogue.filter((product) => (product.reorderThreshold || 0) > 0).length}</b><small>SKU(s) with reorder limits</small></article></div><section className="panel purchase-panel"><div className="panel-head"><div><span className="overline">REORDER QUEUE</span><h2>Low-stock products</h2><p>Set the required quantity and create a supplier purchase order before stock runs out.</p></div><button className="outline purchase-new" onClick={() => add()}><Plus size={15}/> New purchase order</button></div>{lowStockProducts.length ? <div className="table-wrap"><table><thead><tr><th>PRODUCT / SKU</th><th>SUPPLIER</th><th>AVAILABLE</th><th>ALERT AT</th><th>RECOMMENDED ORDER</th><th></th></tr></thead><tbody>{lowStockProducts.map((product) => <tr key={product.id}><td><b>{catalogueName(product)}</b><small className="purchase-sku">{catalogueSku(product)}</small></td><td>{product.supplier || "Supplier not set"}</td><td className="purchase-danger">{availableStock(product).toLocaleString("en-IN")}</td><td>{(product.reorderThreshold || 0).toLocaleString("en-IN")}</td><td>{Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)).toLocaleString("en-IN")}</td><td><button className="text-btn" onClick={() => add(product)}>Create PO <span>→</span></button></td></tr>)}</tbody></table></div> : <div className="purchase-empty"><PackageCheck size={23}/><b>Inventory is healthy</b><span>Products with a threshold will appear here when stock reaches that limit.</span></div>}</section><section className="panel purchase-panel"><div className="panel-head"><div><span className="overline">PURCHASING</span><h2>Purchase order register</h2><p>Stock is added only after you mark a delivery as received.</p></div></div>{purchases.length ? <div className="table-wrap"><table><thead><tr><th>PO NUMBER</th><th>SUPPLIER</th><th>PRODUCTS</th><th>ORDERED</th><th>RECEIVED</th><th>EXPECTED</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody>{purchases.map((purchase) => { const ordered = purchase.lines.reduce((sum, line) => sum + line.quantity, 0); const received = purchase.lines.reduce((sum, line) => sum + line.receivedQuantity, 0); return <tr key={purchase.id}><td><b>{purchase.id}</b></td><td>{purchase.supplier || "Not assigned"}</td><td>{purchase.lines.map((line) => line.sku).join(", ")}</td><td>{ordered.toLocaleString("en-IN")}</td><td>{received.toLocaleString("en-IN")}</td><td>{purchase.expectedDate || "—"}</td><td><Pill value={purchase.status}/></td><td className="purchase-actions"><button className="text-btn" onClick={() => edit(purchase)}>Edit</button>{!["Delivered", "Cancelled"].includes(purchase.status) && <button className="text-btn" onClick={() => receive(purchase)}>Receive</button>}{purchase.status === "Draft" && <button className="text-btn" onClick={() => cancel(purchase)}>Cancel</button>}<button className="row-delete" type="button" onClick={() => remove(purchase)} aria-label={`Delete ${purchase.id}`}><Trash2 size={14}/> Delete</button><button className="whatsapp-action" type="button" onClick={() => window.open(`https://wa.me/?text=${encodeURIComponent(`GeeBee Purchase Order ${purchase.id}\nSupplier: ${purchase.supplier || "Not assigned"}\nProducts: ${purchase.lines.map((line) => `${line.sku} × ${line.quantity}`).join(", ")}`)}`, "_blank", "noopener,noreferrer")}>WA</button></td></tr>; })}</tbody></table></div> : <div className="purchase-empty"><ClipboardList size={23}/><b>No purchase orders yet</b><span>Create one from a low-stock alert or use New purchase order.</span></div>}</section></section>;
 }
 function PurchaseOrderModal({ purchase, draft, purchases, catalogue, suppliers, close, save }: { purchase: PurchaseOrder | null; draft: Partial<PurchaseOrder> | null; purchases: PurchaseOrder[]; catalogue: CatalogueItem[]; suppliers: Supplier[]; close: () => void; save: (purchase: PurchaseOrder) => void }) {
@@ -1819,6 +1851,21 @@ function PurchaseOrderModal({ purchase, draft, purchases, catalogue, suppliers, 
     const expectedLabel = Array.from(document.querySelectorAll<HTMLLabelElement>("label")).find((label) => label.textContent?.trim().startsWith("Expected delivery"));
     expectedLabel?.remove();
   }, []);
+  useEffect(() => {
+    // The native datalist is prefix-based in most browsers. Add a SKU-first
+    // label alongside the existing name-first label so both ways of searching
+    // work naturally while typing.
+    const list = document.getElementById("purchase-products");
+    if (!list) return;
+    const options = catalogue.map((product) => {
+      const option = document.createElement("option");
+      option.value = `${catalogueSku(product)} · ${catalogueName(product)}`;
+      option.label = `${catalogueSku(product)} · ${catalogueName(product)}`;
+      list.append(option);
+      return option;
+    });
+    return () => options.forEach((option) => option.remove());
+  }, [catalogue]);
   return <Shell close={close}><div className="order-modal-head"><div className="modal-mark"><ShipWheel size={22}/></div><div><span className="overline">PURCHASING</span><h2>{purchase ? "Edit purchase order" : "New purchase order"}</h2><p>Plan supplier replenishment. Receiving the order is the only step that changes available stock.</p></div></div><div className="form-row"><label>PO number<input value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value.toUpperCase() })}/></label><label>Expected delivery<input type="date" value={form.expectedDate} onChange={(event) => setForm({ ...form, expectedDate: event.target.value })}/></label></div><label>Supplier<input list="purchase-suppliers" value={form.supplier} onChange={(event) => setForm({ ...form, supplier: event.target.value })} placeholder="Select or type supplier"/><datalist id="purchase-suppliers">{supplierNames.map((supplier) => <option key={supplier} value={supplier}/>)}</datalist></label><div className="modal-section-title">Products to order</div><div className="purchase-lines">{form.lines.map((line, index) => <div className="purchase-line" key={`${line.sku}-${index}`}><span>{index + 1}</span><label>Product / SKU<input list="purchase-products" value={line.product && line.sku ? `${line.product} · ${line.sku}` : line.sku} onChange={(event) => chooseProduct(index, event.target.value)} placeholder="Search product or SKU"/></label><label>Qty to order<input type="number" min="1" value={line.quantity || ""} onChange={(event) => updateLine(index, { quantity: Number(event.target.value) })}/></label><button type="button" className="line-remove" onClick={() => setForm((current) => ({ ...current, lines: current.lines.filter((_, lineIndex) => lineIndex !== index) }))}><X size={15}/></button></div>)}</div><datalist id="purchase-products">{catalogue.map((product) => <option key={product.id} value={`${catalogueName(product)} · ${catalogueSku(product)}`}/>)}</datalist><button type="button" className="text-btn" onClick={() => setForm((current) => ({ ...current, lines: [...current.lines, { sku: "", product: "", quantity: 0, receivedQuantity: 0 }] }))}>+ Add product line</button><label>Notes<textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} placeholder="Supplier reference, freight notes or delivery instructions"/></label><button className="primary modal-submit" type="button" onClick={() => { const lines = form.lines.filter((line) => line.sku && line.quantity > 0); if (!lines.length) return; save({ ...form, lines }); }}>Save purchase order</button></Shell>;
 }
 function TransportersPanel({ transporters, edit, add, remove }: { transporters: Transporter[]; edit: (item: Transporter) => void; add: () => void; remove: (ids: number[]) => void }) {

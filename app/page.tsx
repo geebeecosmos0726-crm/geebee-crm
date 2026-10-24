@@ -1832,41 +1832,35 @@ function PurchaseOrdersPanel({ purchases, catalogue, lowStockProducts, add, edit
 function PurchaseOrderModal({ purchase, draft, purchases, catalogue, suppliers, close, save }: { purchase: PurchaseOrder | null; draft: Partial<PurchaseOrder> | null; purchases: PurchaseOrder[]; catalogue: CatalogueItem[]; suppliers: Supplier[]; close: () => void; save: (purchase: PurchaseOrder) => void }) {
   const initial: PurchaseOrder = purchase || { id: nextPurchaseOrderNumber(purchases), supplier: draft?.supplier || "", status: "Draft", expectedDate: "", createdAt: new Date().toISOString().slice(0, 10), notes: "", lines: draft?.lines || [{ sku: "", product: "", quantity: 0, receivedQuantity: 0 }] };
   const [form, setForm] = useState<PurchaseOrder>(initial);
+  const [queries, setQueries] = useState(() => initial.lines.map((line) => line.sku && line.product ? `${line.sku} · ${line.product}` : line.sku || line.product || ""));
   const supplierNames = [...new Set([...suppliers.map((supplier) => supplier.name), ...catalogue.map((product) => product.supplier || "")].filter(Boolean))];
-  const chooseProduct = (index: number, value: string) => {
-    const typed = value.trim();
-    const product = catalogue.find((item) => [catalogueSku(item), catalogueName(item), `${catalogueName(item)} · ${catalogueSku(item)}`, `${catalogueSku(item)} · ${catalogueName(item)}`].some((label) => label.toLowerCase() === typed.toLowerCase()));
-    setForm((current) => ({
-      ...current,
-      supplier: product ? current.supplier || product.supplier || "" : current.supplier,
-      lines: current.lines.map((line, lineIndex) => lineIndex === index
-        ? product ? { ...line, sku: product.sku, product: catalogueName(product) } : { ...line, sku: typed, product: "" }
-        : line),
-    }));
-  };
   const updateLine = (index: number, patch: Partial<PurchaseLine>) => setForm((current) => ({ ...current, lines: current.lines.map((line, lineIndex) => lineIndex === index ? { ...line, ...patch } : line) }));
-  useEffect(() => {
-    // Existing saved data retains its former expectedDate for compatibility,
-    // but Expected Delivery is no longer part of the Purchase Order workflow.
-    const expectedLabel = Array.from(document.querySelectorAll<HTMLLabelElement>("label")).find((label) => label.textContent?.trim().startsWith("Expected delivery"));
-    expectedLabel?.remove();
-  }, []);
-  useEffect(() => {
-    // The native datalist is prefix-based in most browsers. Add a SKU-first
-    // label alongside the existing name-first label so both ways of searching
-    // work naturally while typing.
-    const list = document.getElementById("purchase-products");
-    if (!list) return;
-    const options = catalogue.map((product) => {
-      const option = document.createElement("option");
-      option.value = `${catalogueSku(product)} · ${catalogueName(product)}`;
-      option.label = `${catalogueSku(product)} · ${catalogueName(product)}`;
-      list.append(option);
-      return option;
-    });
-    return () => options.forEach((option) => option.remove());
-  }, [catalogue]);
-  return <Shell close={close}><div className="order-modal-head"><div className="modal-mark"><ShipWheel size={22}/></div><div><span className="overline">PURCHASING</span><h2>{purchase ? "Edit purchase order" : "New purchase order"}</h2><p>Plan supplier replenishment. Receiving the order is the only step that changes available stock.</p></div></div><div className="form-row"><label>PO number<input value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value.toUpperCase() })}/></label><label>Expected delivery<input type="date" value={form.expectedDate} onChange={(event) => setForm({ ...form, expectedDate: event.target.value })}/></label></div><label>Supplier<input list="purchase-suppliers" value={form.supplier} onChange={(event) => setForm({ ...form, supplier: event.target.value })} placeholder="Select or type supplier"/><datalist id="purchase-suppliers">{supplierNames.map((supplier) => <option key={supplier} value={supplier}/>)}</datalist></label><div className="modal-section-title">Products to order</div><div className="purchase-lines">{form.lines.map((line, index) => <div className="purchase-line" key={`${line.sku}-${index}`}><span>{index + 1}</span><label>Product / SKU<input list="purchase-products" value={line.product && line.sku ? `${line.product} · ${line.sku}` : line.sku} onChange={(event) => chooseProduct(index, event.target.value)} placeholder="Search product or SKU"/></label><label>Qty to order<input type="number" min="1" value={line.quantity || ""} onChange={(event) => updateLine(index, { quantity: Number(event.target.value) })}/></label><button type="button" className="line-remove" onClick={() => setForm((current) => ({ ...current, lines: current.lines.filter((_, lineIndex) => lineIndex !== index) }))}><X size={15}/></button></div>)}</div><datalist id="purchase-products">{catalogue.map((product) => <option key={product.id} value={`${catalogueName(product)} · ${catalogueSku(product)}`}/>)}</datalist><button type="button" className="text-btn" onClick={() => setForm((current) => ({ ...current, lines: [...current.lines, { sku: "", product: "", quantity: 0, receivedQuantity: 0 }] }))}>+ Add product line</button><label>Notes<textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} placeholder="Supplier reference, freight notes or delivery instructions"/></label><button className="primary modal-submit" type="button" onClick={() => { const lines = form.lines.filter((line) => line.sku && line.quantity > 0); if (!lines.length) return; save({ ...form, lines }); }}>Save purchase order</button></Shell>;
+  const searchProduct = (index: number, value: string) => {
+    setQueries((current) => current.map((query, lineIndex) => lineIndex === index ? value : query));
+    const typed = value.trim().toLowerCase();
+    const product = catalogue.find((item) => [catalogueSku(item), catalogueName(item), `${catalogueSku(item)} · ${catalogueName(item)}`, `${catalogueName(item)} · ${catalogueSku(item)}`].some((label) => label.toLowerCase() === typed));
+    if (!product) return;
+    setQueries((current) => current.map((query, lineIndex) => lineIndex === index ? `${catalogueSku(product)} · ${catalogueName(product)}` : query));
+    setForm((current) => ({ ...current, supplier: current.supplier || product.supplier || "", lines: current.lines.map((line, lineIndex) => lineIndex === index ? { ...line, sku: product.sku, product: catalogueName(product) } : line) }));
+  };
+  const addLine = () => { setForm((current) => ({ ...current, lines: [...current.lines, { sku: "", product: "", quantity: 0, receivedQuantity: 0 }] })); setQueries((current) => [...current, ""]); };
+  const removeLine = (index: number) => { setForm((current) => ({ ...current, lines: current.lines.filter((_, lineIndex) => lineIndex !== index) })); setQueries((current) => current.filter((_, lineIndex) => lineIndex !== index)); };
+  const savePurchase = () => {
+    const lines = form.lines.filter((line) => line.sku && line.product && line.quantity > 0);
+    if (!lines.length || lines.length !== form.lines.length) { window.alert("Select a valid Product / SKU for every PO line and enter its quantity."); return; }
+    save({ ...form, lines });
+  };
+  return <Shell close={close}>
+    <div className="order-modal-head"><div className="modal-mark"><ShipWheel size={22}/></div><div><span className="overline">PURCHASING</span><h2>{purchase ? "Edit purchase order" : "New purchase order"}</h2><p>Plan supplier replenishment. Stock is updated from the Stock Master Sheet.</p></div></div>
+    <div className="form-row"><label>PO number<input value={form.id} readOnly title="Generated automatically as date-month-sequence"/></label></div>
+    <label>Supplier<input list="purchase-suppliers" value={form.supplier} onChange={(event) => setForm({ ...form, supplier: event.target.value })} placeholder="Select or type supplier"/><datalist id="purchase-suppliers">{supplierNames.map((supplier) => <option key={supplier} value={supplier}/>)}</datalist></label>
+    <div className="modal-section-title">Products to order</div>
+    <div className="purchase-lines">{form.lines.map((line, index) => <div className="purchase-line" key={`${line.sku}-${index}`}><span>{index + 1}</span><label>Product / SKU<input list="purchase-products" value={queries[index] || ""} onChange={(event) => searchProduct(index, event.target.value)} placeholder="Type SKU or product name" autoComplete="off"/></label><label>Qty to order<input type="number" min="1" value={line.quantity || ""} onChange={(event) => updateLine(index, { quantity: Number(event.target.value) })}/></label><button type="button" className="line-remove" onClick={() => removeLine(index)}><X size={15}/></button></div>)}</div>
+    <datalist id="purchase-products">{catalogue.flatMap((product) => [<option key={`${product.id}-sku`} value={`${catalogueSku(product)} · ${catalogueName(product)}`}/>, <option key={`${product.id}-name`} value={`${catalogueName(product)} · ${catalogueSku(product)}`}/>])}</datalist>
+    <button type="button" className="text-btn" onClick={addLine}>+ Add product line</button>
+    <label>Notes<textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} placeholder="Supplier reference, freight notes or delivery instructions"/></label>
+    <button className="primary modal-submit" type="button" onClick={savePurchase}>Save purchase order</button>
+  </Shell>;
 }
 function TransportersPanel({ transporters, edit, add, remove }: { transporters: Transporter[]; edit: (item: Transporter) => void; add: () => void; remove: (ids: number[]) => void }) {
   const [selected, setSelected] = useState<number[]>([]);

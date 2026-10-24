@@ -100,6 +100,9 @@ type Order = {
   transporter?: string;
   remarks?: string;
   clientApproval?: "Approval pending" | "Approval requested" | "Approved" | "Changes requested" | "Rejected";
+  // True only after this order's quantities have actually been deducted from
+  // Product / SKU available stock on entry to Dispatch Plan.
+  inventoryCommitted?: boolean;
   cancelledFromDispatch?: boolean;
   cancelledFromStage?: "Draft" | "Confirmed" | "Dispatch plan" | "Sent to customer" | "Received by customer";
   avatar: string;
@@ -1092,13 +1095,13 @@ export default function Home() {
     const advanceId = `ADV-${primaryId}`;
     const primaryOrder = orders.find((item) => item.id === primaryId);
     const advanceOrder = orders.find((item) => item.id === advanceId);
-    const dispatchedLines = isAdvance ? [] : primaryOrder?.status === "Confirmed" ? (primaryOrder.approvedProducts || linesFor(primaryOrder)) : primaryOrder && ["Dispatch plan", "Sent to customer", "Received by customer"].includes(primaryOrder.status) ? linesFor(primaryOrder) : [];
-    const reservedLines = isAdvance ? linesFor(order) : advanceOrder ? linesFor(advanceOrder) : [];
+    const confirmedLines = !isAdvance && primaryOrder?.status === "Confirmed" ? (primaryOrder.approvedProducts || linesFor(primaryOrder)) : [];
+    const committedLines = !isAdvance && primaryOrder?.inventoryCommitted ? linesFor(primaryOrder) : [];
     setCatalogue((current) => current.map((product) => {
-      const dispatched = dispatchedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      const reserved = reservedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      if (!dispatched && !reserved) return product;
-      return { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - dispatched - reserved) };
+      const reserved = confirmedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      const restore = committedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      if (!reserved && !restore) return product;
+      return { ...product, availableQuantity: availableStock(product) + restore, reservedStock: Math.max(0, (product.reservedStock || 0) - reserved) };
     }));
     const cancelledIds = isAdvance ? [order.id] : [primaryId, advanceId];
     setOrders((current) => current.map((item) => {
@@ -1127,16 +1130,19 @@ export default function Home() {
       if (orders.some((item) => item.id === advanceId)) advanceIds.add(advanceId);
     });
     const removedIds = new Set([...primaryIds, ...advanceIds]);
-    const dispatchedLines = [...primaryIds].flatMap((id) => {
+    const confirmedLines = [...primaryIds].flatMap((id) => {
       const order = orders.find((item) => item.id === id);
-      return order?.status === "Confirmed" ? (order.approvedProducts || linesFor(order)) : order && ["Dispatch plan", "Sent to customer", "Received by customer"].includes(order.status) ? linesFor(order) : [];
+      return order?.status === "Confirmed" ? (order.approvedProducts || linesFor(order)) : [];
     });
-    const reservedLines = [...advanceIds].flatMap((id) => linesFor(orders.find((item) => item.id === id) || {} as Order));
+    const committedLines = [...primaryIds].flatMap((id) => {
+      const order = orders.find((item) => item.id === id);
+      return order?.inventoryCommitted ? linesFor(order) : [];
+    });
     setCatalogue((current) => current.map((product) => {
-      const dispatched = dispatchedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      const reserved = reservedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      if (!dispatched && !reserved) return product;
-      return { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - dispatched - reserved) };
+      const reserved = confirmedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      const restore = committedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      if (!reserved && !restore) return product;
+      return { ...product, availableQuantity: availableStock(product) + restore, reservedStock: Math.max(0, (product.reservedStock || 0) - reserved) };
     }));
     setOrders((current) => current.filter((item) => !removedIds.has(item.id)));
     setInvoices((current) => current.filter((invoice) => !removedIds.has(invoice.order)));
@@ -1154,8 +1160,7 @@ export default function Home() {
     const restoredLines = [...confirmedLines, ...shortageLines];
     setCatalogue((current) => current.map((product) => {
       const released = confirmedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      const unreserved = shortageLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      return !released && !unreserved ? product : { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - released - unreserved) };
+      return !released ? product : { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - released) };
     }));
     const first = restoredLines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
     setOrders((current) => current.filter((item) => item.id !== advanceId).map((item) => item.id === order.id ? { ...item, ...first, products: restoredLines, approvedProducts: undefined, backorders: undefined, clientApproval: undefined, status: "Draft" } : item));
@@ -1166,12 +1171,16 @@ export default function Home() {
   };
   const returnDispatchToConfirmed = (order: Order) => {
     if (order.status !== "Dispatch plan") return;
-    if (!window.confirm(`Return ${order.id} to Confirmed Orders? The current inventory allocation will remain reserved.`)) return;
+    if (!window.confirm(`Return ${order.id} to Confirmed Orders? Its dispatched quantity will be restored to available stock and reserved again.`)) return;
     const lines = linesFor(order);
     const first = lines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
-    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...first, products: lines, approvedProducts: lines, status: "Confirmed" } : item));
+    if (order.inventoryCommitted) setCatalogue((current) => current.map((product) => {
+      const quantity = lines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      return quantity ? { ...product, availableQuantity: availableStock(product) + quantity, reservedStock: (product.reservedStock || 0) + quantity } : product;
+    }));
+    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...first, products: lines, approvedProducts: lines, status: "Confirmed", inventoryCommitted: false } : item));
     logActivity("Returned dispatch order to Confirmed Orders", "Dispatch Plan", order.id);
-    flash(`${order.id} returned to Confirmed Orders. Inventory remains allocated.`);
+    flash(`${order.id} returned to Confirmed Orders. Stock is restored and reserved until it is dispatched again.`);
   };
   const markOrderSentToCustomer = (order: Order) => {
     if (order.status !== "Dispatch plan") return;
@@ -1207,8 +1216,9 @@ export default function Home() {
     });
     setCatalogue((current) => current.map((product) => {
       const dispatched = dispatchLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      const short = shortages.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      return !dispatched && !short ? product : { ...product, reservedStock: (product.reservedStock || 0) + dispatched + short };
+      // Only quantities that physically exist are reserved. A shortage lives
+      // only in Backorders and must never consume stock from another order.
+      return !dispatched ? product : { ...product, reservedStock: (product.reservedStock || 0) + dispatched };
     }));
     const firstDispatch = dispatchLines[0] || requestedLines[0];
     const confirmedOrder: Order = { ...order, product: firstDispatch.product, sku: firstDispatch.sku, quantity: firstDispatch.quantity, unitPrice: firstDispatch.unitPrice, products: dispatchLines, approvedProducts: dispatchLines, status: "Confirmed", backorders: shortages };
@@ -1245,11 +1255,19 @@ export default function Home() {
     });
     if (!window.confirm(`Send ${order.id} to Dispatch Plan? Any quantity reduced by Operations will be released from CRM reservation.`)) return;
     setCatalogue((current) => current.map((product) => {
+      const dispatched = dispatchLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       const released = releasedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      return released ? { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - released) } : product;
+      if (!dispatched && !released) return product;
+      return {
+        ...product,
+        // Available Quantity changes only when Operations takes the order into
+        // Dispatch Plan. Confirmed Orders remain a reservation only.
+        availableQuantity: Math.max(0, availableStock(product) - dispatched),
+        reservedStock: Math.max(0, (product.reservedStock || 0) - dispatched - released),
+      };
     }));
     const first = dispatchLines[0] || approvedLines[0];
-    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, status: "Dispatch plan" } : item));
+    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, status: "Dispatch plan", inventoryCommitted: true } : item));
     logActivity("Sent confirmed order to Dispatch Plan", "Dispatch Plan", releasedLines.length ? `${order.id} · reduced CRM reservation released` : order.id);
     flash(releasedLines.length ? `${order.id} sent to Dispatch Plan; reduced quantities were released from CRM reservation.` : `${order.id} sent to Dispatch Plan for Operations.`);
   };

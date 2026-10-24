@@ -19,7 +19,7 @@ export async function POST(request: Request) {
   const { data: adminMembership } = ownedWorkspace ? { data: null } : await db.from("crm_workspace_members").select("workspace_owner_id, role").ilike("email", userResult.user.email).eq("role", "admin").maybeSingle();
   const ownerId = ownedWorkspace?.owner_id || adminMembership?.workspace_owner_id;
   if (!ownerId) return Response.json({ error: "Administrator access is required." }, { status: 403 });
-  const { data: products, error: readError } = await db.from("crm_products").select("record_id, data").eq("workspace_owner_id", ownerId).limit(100000);
+  const { data: products, error: readError } = await db.from("crm_stock_inventory").select("record_id, data").eq("workspace_owner_id", ownerId).limit(100000);
   if (readError) return Response.json({ error: readError.message }, { status: 500 });
   const updates = (products || []).map((row: { record_id: string; data: Record<string, unknown> }) => ({
     workspace_owner_id: ownerId,
@@ -29,9 +29,9 @@ export async function POST(request: Request) {
     updated_at: new Date().toISOString(),
   }));
   if (updates.length) {
-    const { error: writeError } = await db.from("crm_products").upsert(updates, { onConflict: "workspace_owner_id,record_id" });
+    const { error: writeError } = await db.from("crm_stock_inventory").upsert(updates, { onConflict: "workspace_owner_id,record_id" });
     if (writeError) return Response.json({ error: writeError.message }, { status: 500 });
   }
-  await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: userResult.user.email, action: "Reset demo inventory", module: "Catalogue", details: `${updates.length} products set to ${quantity.toLocaleString("en-IN")} available units with test allocations cleared` });
+  await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: userResult.user.email, action: "Reset demo inventory", module: "Products", details: `${updates.length} Product / SKU records set to ${quantity.toLocaleString("en-IN")} available units with test allocations cleared` });
   return Response.json({ ok: true, updated: updates.length, quantity });
 }

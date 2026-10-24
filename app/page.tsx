@@ -672,17 +672,25 @@ const readInternalOrderSheetImage = async (file: File): Promise<InternalOrderShe
 const storageKey = "geebee-crm-data-v1";
 type SavedCrmData = { orders: Order[]; clients: Client[]; invoices: Invoice[]; catalogue: CatalogueItem[]; leads: Lead[]; quotes: Quote[]; tasks: SalesTask[]; transporters: Transporter[]; suppliers: Supplier[]; purchases: PurchaseOrder[] };
 const loadCrmData = (): SavedCrmData => {
-  const fallback = { orders: seedOrders, clients: seedClients, invoices: seedInvoices, catalogue: seedCatalogue, leads: seedLeads, quotes: seedQuotes, tasks: seedTasks, transporters: seedTransporters, suppliers: seedSuppliers, purchases: [] as PurchaseOrder[] };
+  // Products / SKUs are never recovered from old browser state. The current
+  // Stock Master is the only source loaded after sign-in.
+  const fallback = { orders: seedOrders, clients: seedClients, invoices: seedInvoices, catalogue: [] as CatalogueItem[], leads: seedLeads, quotes: seedQuotes, tasks: seedTasks, transporters: seedTransporters, suppliers: seedSuppliers, purchases: [] as PurchaseOrder[] };
   if (typeof window === "undefined") return fallback;
   try {
     const saved = window.localStorage.getItem(storageKey);
     if (!saved) return fallback;
     const parsed = JSON.parse(saved) as Partial<SavedCrmData>;
+    // Permanently discard the retired browser catalogue cache. It could
+    // otherwise briefly appear before the current Stock Master loads.
+    if ("catalogue" in parsed) {
+      delete parsed.catalogue;
+      window.localStorage.setItem(storageKey, JSON.stringify(parsed));
+    }
     return {
       orders: Array.isArray(parsed.orders) ? parsed.orders : fallback.orders,
       clients: Array.isArray(parsed.clients) ? parsed.clients : fallback.clients,
       invoices: Array.isArray(parsed.invoices) ? parsed.invoices : fallback.invoices,
-      catalogue: Array.isArray(parsed.catalogue) ? parsed.catalogue : fallback.catalogue,
+      catalogue: fallback.catalogue,
       leads: Array.isArray(parsed.leads) ? parsed.leads : fallback.leads,
       quotes: Array.isArray(parsed.quotes) ? parsed.quotes : fallback.quotes,
       tasks: Array.isArray(parsed.tasks) ? parsed.tasks : fallback.tasks,
@@ -795,7 +803,7 @@ export default function Home() {
     [orders, setOrders] = useState(seedOrders),
     [clients, setClients] = useState(seedClients),
     [invoices, setInvoices] = useState(seedInvoices),
-    [catalogue, setCatalogue] = useState(seedCatalogue),
+    [catalogue, setCatalogue] = useState<CatalogueItem[]>([]),
     [catalogueHydrated, setCatalogueHydrated] = useState(false),
     [leads, setLeads] = useState(seedLeads),
     [quotes, setQuotes] = useState(seedQuotes),
@@ -929,7 +937,7 @@ export default function Home() {
   };
   useEffect(() => {
     const saved = loadCrmData();
-    setOrders(saved.orders); setClients(saved.clients); setInvoices(saved.invoices); setCatalogue(saved.catalogue); setLeads(saved.leads); setQuotes(saved.quotes); setTasks(saved.tasks); setTransporters(saved.transporters); setSuppliers(saved.suppliers); setPurchases(saved.purchases);
+    setOrders(saved.orders); setClients(saved.clients); setInvoices(saved.invoices); setCatalogue([]); setLeads(saved.leads); setQuotes(saved.quotes); setTasks(saved.tasks); setTransporters(saved.transporters); setSuppliers(saved.suppliers); setPurchases(saved.purchases);
     setStorageReady(true);
   }, []);
   useEffect(() => {
@@ -1043,6 +1051,17 @@ export default function Home() {
     }, 450);
     return () => window.clearTimeout(timer);
   }, [catalogue, catalogueHydrated, cloudReady, session?.access_token]);
+  useEffect(() => {
+    // The verified Product / SKU Stock Master has replaced the legacy product
+    // table. Retire that old table once, only after a current master exists.
+    if (!isAdmin || !catalogueHydrated || !catalogue.length || !session?.access_token || !workspaceOwnerId) return;
+    const key = `geebee-retired-legacy-catalogue:${workspaceOwnerId}`;
+    if (window.localStorage.getItem(key)) return;
+    fetch("/api/admin/retire-legacy-catalogue", { method: "POST", headers: { Authorization: `Bearer ${session.access_token}` } })
+      .then((response) => response.ok ? response.json() : null)
+      .then((result) => { if (result?.ok) window.localStorage.setItem(key, "true"); })
+      .catch(() => { /* The old table is inactive; retry next sign-in if needed. */ });
+  }, [isAdmin, catalogueHydrated, catalogue.length, session?.access_token, workspaceOwnerId]);
   useEffect(() => {
     const cloud = supabase;
     if (!cloud || !session || !cloudReady || !workspaceOwnerId) return;

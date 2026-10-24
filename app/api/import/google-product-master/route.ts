@@ -91,6 +91,11 @@ export async function POST(request: Request) {
     const { db, ownerId, email } = await administrator(request, url, serviceKey);
     const body = await request.json().catch(() => ({}));
     const mode = body?.mode === "setup" ? "setup" : "sync";
+    const syncPasscode = process.env.PRODUCT_MASTER_SYNC_PASSCODE;
+    if (mode === "sync") {
+      if (!syncPasscode) return Response.json({ error: "Secure Sheet sync is not configured. Add PRODUCT_MASTER_SYNC_PASSCODE in Vercel first." }, { status: 503 });
+      if (String(body?.passcode || "") !== syncPasscode) return Response.json({ error: "Incorrect sync passcode. The Google Stock Master was not changed." }, { status: 403 });
+    }
     const credentials = JSON.parse(keyJson);
     if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
     const auth = new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
@@ -194,6 +199,28 @@ export async function PATCH(request: Request) {
         const data = { ...(row.data as ProductData), availableQuantity: Math.max(0, number(update.availableQuantity)), reservedStock: Math.max(0, number(update.reservedStock)) };
         return { workspace_owner_id: ownerId, record_id: row.record_id, search_key: `${data.sku || ""} ${data.name || ""} ${data.category || ""}`.toLowerCase(), data, updated_at: now };
       });
+      // The Google Stock Master is the source of truth. Write the Sheet first;
+      // if this fails, do not let the CRM pretend that stock was moved.
+      const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+      const sheetId = process.env.GOOGLE_PRODUCT_MASTER_SHEET_ID || DEFAULT_PRODUCT_MASTER_SHEET_ID;
+      if (!keyJson) throw new Error("Google Stock Master is not configured, so dispatch stock cannot be moved safely.");
+      const credentials = JSON.parse(keyJson);
+      if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
+      const auth = new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
+      const sheets = google.sheets({ version: "v4", auth });
+      const metadata = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties" });
+      const selected = (metadata.data.sheets || []).find((sheet) => /^(product stock inventory|product master)$/i.test(sheet.properties?.title || "")) || metadata.data.sheets?.[0];
+      const title = selected?.properties?.title;
+      if (!title) throw new Error("The Google Stock Master has no worksheet.");
+      const values = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
+      const sheetRows = (values.data.values || []).map((row) => Array.isArray(row) ? row.map(display) : []);
+      const headerRow = sheetRows.find((row) => headerIndex(row, ["skuid", "sku"]) >= 0 && headerIndex(row, ["availablestock", "availablequantity", "stock"]) >= 0);
+      const stockColumn = headerRow ? headerIndex(headerRow, ["availablestock", "availablequantity", "stock"]) : -1;
+      if (stockColumn < 0) throw new Error("Google Stock Master needs an Available Stock column before dispatch can update it.");
+      const column = (index: number) => { let value = index + 1; let letters = ""; while (value) { const remainder = (value - 1) % 26; letters = String.fromCharCode(65 + remainder) + letters; value = Math.floor((value - 1) / 26); } return letters; };
+      const sheetUpdates = records.map((record) => ({ row: Number((record.data as ProductData).sourceRow), value: Number((record.data as ProductData).availableQuantity || 0) })).filter((item) => item.row > 0);
+      if (sheetUpdates.length !== records.length) throw new Error("Some Product / SKU rows are not linked to the Google Stock Master. Sync the Sheet before dispatching this order.");
+      await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: sheetId, requestBody: { valueInputOption: "USER_ENTERED", data: sheetUpdates.map((item) => ({ range: `'${title.replace(/'/g, "''")}'!${column(stockColumn)}${item.row}`, values: [[item.value]] })) } });
       if (records.length) {
         const { error: updateError } = await db.from("crm_stock_inventory").upsert(records, { onConflict: "workspace_owner_id,record_id" });
         if (updateError) throw updateError;

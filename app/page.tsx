@@ -62,7 +62,7 @@ import {
   Warehouse,
   X,
 } from "lucide-react";
-type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; masterPriceChanged?: boolean; review?: { product?: boolean; quantity?: boolean; price?: boolean } };
+type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; remarks?: string; masterPriceChanged?: boolean; review?: { product?: boolean; quantity?: boolean; price?: boolean } };
 type QuoteProduct = ProductLine & { discount: number };
 type CatalogueItem = { id: number; name: string; sku: string; unitPrice: number; category: string; image: string; description: string; cartonQty: string; innerQty?: string; outerQty?: string; subCategory?: string; brand?: string; unit?: string; packSize?: string; moq?: number; purchasePrice?: number; wholesalePrice?: number; distributorPrice?: number; gst?: number; barcode?: string; weight?: string; dimensions?: string; supplier?: string; countryOfOrigin?: string; availableQuantity?: number; openingStock?: number; purchasedStock?: number; orderedStock?: number; damagedStock?: number; reservedStock?: number; reorderThreshold?: number };
 type InventoryReconciliation = { sourceLabel: string; quantity: number; status: "matched" | "unmatched" | "ambiguous"; sku?: string; name?: string; currentAvailable?: number; candidates?: string[] };
@@ -810,7 +810,7 @@ export default function Home() {
     [notificationsOpen, setNotificationsOpen] = useState(false),
     [shortcutsOpen, setShortcutsOpen] = useState(false),
     [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({ Customers: true, "Leads & Enquiries": true, Sales: true, Products: true, Inventory: true, Operations: true, Billing: true, Imports: true, Reports: true, Automation: true, Settings: true }),
-    [modal, setModal] = useState<"order" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | null>(null),
+    [modal, setModal] = useState<"order" | "orderView" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | null>(null),
     [editing, setEditing] = useState<any>(null),
     [toast, setToast] = useState("");
   const [dashboardClock, setDashboardClock] = useState<number | null>(null);
@@ -846,7 +846,7 @@ export default function Home() {
       setToast(m);
       setTimeout(() => setToast(""), 2600);
     },
-    show = (k: "order" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase", d?: any) => {
+    show = (k: "order" | "orderView" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase", d?: any) => {
       setEditing(d || null);
       setModal(k);
     };
@@ -1299,7 +1299,7 @@ export default function Home() {
     { label: "Operations", module: "Operations" as CrmModule, icon: Truck, items: [{ label: "Dispatch Plan", section: "Dispatch Plan", count: String(orders.filter((order) => order.status === "Dispatch plan").length) }, { label: "Transporters", section: "Transporters", count: String(transporters.length) }, { label: "Picking", section: "Picking" }, { label: "Packing", section: "Packing" }] },
     { label: "Fulfilment", module: "Fulfilment" as CrmModule, icon: Truck, items: [{ label: "Sent to Customer", section: "Sent to Customer", count: String(orders.filter((order) => order.status === "Sent to customer").length) }] },
     { label: "Billing", module: "Billing" as CrmModule, icon: ReceiptText, items: [{ label: "Invoices", section: "Invoices", count: String(invoices.filter((i) => i.status !== "Paid").length) }, { label: "Payments", section: "Payments", count: "2" }, { label: "Outstanding", section: "Outstanding" }, { label: "Ageing", section: "Ageing" }] },
-    { label: "Imports", module: "Imports" as CrmModule, icon: ShipWheel, items: [{ label: "Suppliers", section: "Suppliers", count: String(suppliers.length) }, { label: "Purchase Orders", section: "Purchase Orders", count: String(purchases.filter((purchase) => !["Delivered", "Cancelled"].includes(purchase.status)).length) }, { label: "Shipments", section: "Shipments" }, { label: "Containers", section: "Containers" }, { label: "Landed Cost", section: "Landed Cost" }] },
+    { label: "Imports", module: "Imports" as CrmModule, icon: ShipWheel, items: [{ label: "Suppliers", section: "Suppliers", count: String(suppliers.length) }, { label: "Shipments", section: "Shipments" }, { label: "Containers", section: "Containers" }, { label: "Landed Cost", section: "Landed Cost" }] },
     { label: "Reports", module: "Reports" as CrmModule, icon: ChartNoAxesCombined, items: [{ label: "Sales", section: "Sales Report" }, { label: "Customers", section: "Customer Report" }, { label: "Products", section: "Product Report" }, { label: "Inventory", section: "Inventory Report" }, { label: "Payments", section: "Payment Report" }, { label: "Sales Team", section: "Sales Team Report" }] },
     { label: "Automation", module: "Automation" as CrmModule, icon: Bot, items: [{ label: "Rules", section: "Rules" }, { label: "Notifications", section: "Notifications" }, { label: "Templates", section: "Templates" }] },
     { label: "Settings", module: "Settings" as CrmModule, icon: Settings, items: [{ label: "Users", section: "Settings" }, { label: "Roles", section: "Settings" }, { label: "Import / Export", section: "Data Transfer" }, { label: "Data recovery", section: "Recovery" }, { label: "GST", section: "GST" }, { label: "Warehouses", section: "Warehouses" }, { label: "WhatsApp", section: "WhatsApp" }, { label: "Integrations", section: "Integrations" }] },
@@ -1383,7 +1383,7 @@ export default function Home() {
         </header>
         {cloudError && <div className="cloud-warning">{cloudError}</div>}
         {isViewOnly && <div className="cloud-warning">View-only access: you can review this module, but only an administrator can grant permission to make changes.</div>}
-        {(activeTasks.length > 0 || lowStockProducts.length > 0 || incompleteCatalogueProducts.length > 0) && <div className="crm-alert-strip" role="status">{activeTasks.length > 0 && <button type="button" onClick={() => setSection("Follow-ups")}><ClipboardList size={15}/><b>{activeTasks.length} active task{activeTasks.length === 1 ? "" : "s"}</b><span>Review today’s work</span></button>}{lowStockProducts.length > 0 && <button type="button" onClick={() => setSection("Purchase Orders")}><PackageCheck size={15}/><b>{lowStockProducts.length} low-stock item{lowStockProducts.length === 1 ? "" : "s"}</b><span>Create purchase orders</span></button>}{incompleteCatalogueProducts.length > 0 && <button type="button" onClick={() => { setSearch(""); setCatalogueAttentionOnly(true); setSection("Catalogue"); }}><PackageCheck size={15}/><b>{incompleteCatalogueProducts.length} incomplete product{incompleteCatalogueProducts.length === 1 ? "" : "s"}</b><span>Complete SKU details</span></button>}</div>}
+        {(activeTasks.length > 0 || lowStockProducts.length > 0 || incompleteCatalogueProducts.length > 0) && <div className="crm-alert-strip" role="status">{activeTasks.length > 0 && <button type="button" onClick={() => setSection("Follow-ups")}><ClipboardList size={15}/><b>{activeTasks.length} active task{activeTasks.length === 1 ? "" : "s"}</b><span>Review today’s work</span></button>}{lowStockProducts.length > 0 && <button type="button" onClick={() => setSection("Product Stock Inventory")}><PackageCheck size={15}/><b>{lowStockProducts.length} low-stock item{lowStockProducts.length === 1 ? "" : "s"}</b><span>Review Stock Master</span></button>}{incompleteCatalogueProducts.length > 0 && <button type="button" onClick={() => { setSearch(""); setCatalogueAttentionOnly(true); setSection("Catalogue"); }}><PackageCheck size={15}/><b>{incompleteCatalogueProducts.length} incomplete product{incompleteCatalogueProducts.length === 1 ? "" : "s"}</b><span>Complete SKU details</span></button>}</div>}
         <div className="page-head">
           <div>
             <div className="eyebrow">MONDAY, 15 SEPTEMBER 2026</div>
@@ -1430,7 +1430,7 @@ export default function Home() {
         )}{" "}
         {section === "Orders" && <Orders orders={shown.filter((order) => order.status === "Draft")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Draft")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} confirm={confirmOrder} />}{" "}
         {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToOrders={returnConfirmedToOrders} pushToDispatch={pushToDispatchPlan} sendWhatsApp={(order) => { const client = clients.find((item) => item.name.trim().toLowerCase() === order.client.trim().toLowerCase()); const groupLink = client?.whatsappGroupLink?.trim(); if (groupLink) { try { const url = new URL(groupLink); if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "chat.whatsapp.com") throw new Error("invalid"); window.open(url.toString(), "_blank", "noopener,noreferrer"); logActivity("Opened customer WhatsApp group", "Confirmed Orders", `${order.id} · ${client?.name || order.client}`); return; } catch { window.alert("The saved WhatsApp group link is not valid. Use a link beginning with https://chat.whatsapp.com/ in the customer profile."); return; } } window.open(`https://wa.me/?text=${encodeURIComponent(dispatchWhatsAppText(order))}`, "_blank", "noopener,noreferrer"); logActivity("Opened WhatsApp approval", "Confirmed Orders", `${order.id} · no customer group link saved`); }} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Confirmed Orders", `${id} · ${clientApproval}`); }} confirmed />}{" "}
-        {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToConfirmed={returnDispatchToConfirmed} markSent={markOrderSentToCustomer} />}{" "}
+        {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} view={(o) => show("orderView", o)} cancel={cancelOrder} returnToConfirmed={returnDispatchToConfirmed} markSent={markOrderSentToCustomer} />}{" "}
         {section === "Sent to Customer" && <FulfilmentPanel title="Sent to customer" description="These dispatched orders have been sent to the customer. This is the final fulfilment stage in the CRM." orders={orders.filter((order) => order.status === "Sent to customer" || order.status === "Received by customer")} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} />}{" "}
         {section === "Clients" && (
           <Clients
@@ -1522,14 +1522,9 @@ export default function Home() {
             // is intentionally untouched until the user moves it to Dispatch Plan.
             const savedOrder = editing ? { ...o, id: requestedId, status: editing.status } : { ...o, id: requestedId, status: "Draft", backorders: [] };
             const orderedLines = o.products?.length ? o.products : [{ product: o.product, sku: o.sku, quantity: o.quantity, unitPrice: o.unitPrice }];
-            if (orderedLines.some((line) => !line.product.trim())) { flash("Enter a product name for every unmatched SKU before saving the order."); return; }
+            if (orderedLines.some((line) => !line.product.trim())) { flash("Choose every product from Product / SKU. If it is missing, add it in Stock Master first."); return; }
             const missingLines = orderedLines.filter((line) => !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku)));
-            if (missingLines.length) {
-              setCatalogue((current) => {
-                const known = new Set(current.map((product) => skuKey(product.sku)));
-                return [...current, ...missingLines.filter((line) => !known.has(skuKey(line.sku))).map((line, index) => ({ id: Date.now() + index, sku: line.sku.trim() || `UNMATCHED-${Date.now() + index}`, name: line.product, unitPrice: line.unitPrice || 0, category: "Uncategorised", image: "", description: "", cartonQty: "", innerQty: "", outerQty: "", availableQuantity: 10000 } as CatalogueItem))];
-              });
-            }
+            if (missingLines.length) { flash(`${missingLines.length} product line${missingLines.length === 1 ? " is" : "s are"} not in Product / SKU. Add it in Stock Master, sync, then save this order.`); return; }
             setClients((current) => current.map((client) => client.name.trim().toLowerCase() === savedOrder.client.trim().toLowerCase() ? { ...client, customerStatus: "Active" } : client));
             setOrders((current) => {
               if (!editing) return [...current, savedOrder];
@@ -1540,10 +1535,11 @@ export default function Home() {
             if (editing && requestedId !== editing.id) setInvoices((current) => current.map((invoice) => invoice.order === editing.id ? { ...invoice, order: requestedId } : invoice.order === `ADV-${editing.id}` ? { ...invoice, order: `ADV-${requestedId}` } : invoice));
             setModal(null);
             logActivity(editing ? "Updated order" : "Created order", "Orders", requestedId);
-            flash(missingLines.length ? `${missingLines.length} unmatched product${missingLines.length === 1 ? " was" : "s were"} added to Products as incomplete records. Complete their details from the alert above.` : editing ? "Order updated successfully" : "Draft order created. Confirm it to reserve available stock and create any backorder.");
+            flash(editing ? "Order updated successfully" : "Draft order created. Confirm it to reserve available stock and create any backorder.");
           }}
         />
       )}
+      {modal === "orderView" && editing && <OrderViewModal order={editing as Order} close={() => setModal(null)} />}
       {modal === "client" && (
         <ClientModal
           client={editing}
@@ -1828,6 +1824,8 @@ function Orders({
 function OrderTable({
   orders,
   edit,
+  view,
+  readOnly = false,
   cancel,
   remove,
   sendWhatsApp,
@@ -1842,6 +1840,8 @@ function OrderTable({
 }: {
   orders: Order[];
   edit: (o: Order) => void;
+  view?: (o: Order) => void;
+  readOnly?: boolean;
   cancel?: (order: Order) => void;
   remove?: (ids: string[]) => void;
   sendWhatsApp?: (order: Order) => void;
@@ -1877,7 +1877,7 @@ function OrderTable({
             <th>ETA</th>
             <th>STATUS</th>
             <th>PAYMENT</th>
-            {!compact && <th>ENTRY</th>}
+            {!compact && <th>PACKING</th>}
             <th />
           </tr>
         </thead>
@@ -1912,9 +1912,9 @@ function OrderTable({
               <td>
                 <Pill value={o.payment} />
               </td>
-              {!compact && <td><span className="order-entry-source" title={o.remarks || "Entered manually"}>{orderEntrySource(o)}</span></td>}
+              {!compact && <td><span className="order-entry-source" title="Packing note">—</span></td>}
               <td>
-                <div className="record-actions">{confirm && o.status === "Draft" && <button className="dispatch-action" type="button" onClick={() => confirm(o)}>Confirm order</button>}{returnToOrders && (o.status === "Confirmed" || o.status === "Dispatch plan") && <button className="outline" type="button" onClick={() => returnToOrders(o)}>{returnLabel}</button>}{pushToDispatch && o.status === "Confirmed" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{advance && <button className="dispatch-action" type="button" onClick={() => advance(o)}>{advanceLabel || "Continue"}</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>{whatsAppLabel || "WA"}</button>}<button className="whatsapp-action" type="button" onClick={() => downloadOrderPdf(o)} aria-label={`Download ${o.status === "Advance order" ? "advance order" : "purchase order"} ${o.id}`}>{o.status === "Advance order" ? "AO" : "PO"}</button><button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>{cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
+                <div className="record-actions">{view && <button className="outline" type="button" onClick={() => view(o)}>View</button>}{confirm && o.status === "Draft" && <button className="dispatch-action" type="button" onClick={() => confirm(o)}>Confirm order</button>}{returnToOrders && (o.status === "Confirmed" || o.status === "Dispatch plan") && <button className="outline" type="button" onClick={() => returnToOrders(o)}>{returnLabel}</button>}{pushToDispatch && o.status === "Confirmed" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{advance && <button className="dispatch-action" type="button" onClick={() => advance(o)}>{advanceLabel || "Continue"}</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>{whatsAppLabel || "WA"}</button>}{readOnly && <button className="outline" type="button" onClick={() => window.print()}>Print</button>}{!readOnly && <button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>}{!readOnly && cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{!readOnly && selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
               </td>
             </tr>
           ))}
@@ -1923,6 +1923,10 @@ function OrderTable({
       {!orders.length && <div className="empty">No matching orders found.</div>}
     </div></>
   );
+}
+function OrderViewModal({ order, close }: { order: Order; close: () => void }) {
+  const lines = linesFor(order);
+  return <Shell close={close}><div className="order-modal-head"><div className="modal-mark"><PackageCheck size={22}/></div><div><span className="overline">DISPATCH ORDER</span><h2>{order.id}</h2><p>{order.client}{order.city ? ` · ${order.city}` : ""}{order.transporter ? ` · ${order.transporter}` : ""}</p></div></div><div className="panel-head"><div><h3>Products to pack</h3><p>Rates and amounts are intentionally hidden for operations.</p></div><button className="outline" type="button" onClick={() => window.print()}>Print</button></div><div className="table-wrap"><table className="records"><thead><tr><th>SKU</th><th>PRODUCT</th><th>QTY</th><th>REMARK</th></tr></thead><tbody>{lines.map((line, index) => <tr key={`${line.sku}-${index}`}><td><b>{line.sku}</b></td><td>{line.product}</td><td><b>{line.quantity.toLocaleString("en-IN")}</b></td><td>{line.remarks || "—"}</td></tr>)}</tbody></table></div><p className="profile-empty">Packing: {order.remarks || "—"}</p></Shell>;
 }
 function Clients({
   clients,
@@ -2094,9 +2098,9 @@ function ReportsDashboard({ report, orders, clients, catalogue, leads, quotes, i
     {report === "Payment Report" && <><section className="panel"><h3>Outstanding invoices</h3><div className="report-list">{openInvoices.sort((a, b) => amount(b.amount) - amount(a.amount)).slice(0, 8).map((invoice) => <article key={invoice.id}><span>{invoice.id} · {invoice.client}</span><b>{displayMoney(invoice.amount)}</b></article>)}{!openInvoices.length && <p className="profile-empty">No outstanding invoices.</p>}</div></section><section className="panel"><h3>Recent collections</h3><div className="report-list">{invoices.filter((invoice) => invoice.status === "Paid").slice(0, 8).map((invoice) => <article key={invoice.id}><span>{invoice.id} · {invoice.client}</span><b>{displayMoney(invoice.amount)}</b></article>)}{!invoices.some((invoice) => invoice.status === "Paid") && <p className="profile-empty">No paid invoices recorded yet.</p>}</div></section></>}
   </div></section>;
 }
-function DispatchPlanPanel({ orders, edit, cancel, remove, returnToConfirmed, markSent }: { orders: Order[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void; returnToConfirmed: (order: Order) => void; markSent: (order: Order) => void }) {
+function DispatchPlanPanel({ orders, view, cancel, returnToConfirmed, markSent }: { orders: Order[]; view: (order: Order) => void; cancel: (order: Order) => void; returnToConfirmed: (order: Order) => void; markSent: (order: Order) => void }) {
   const [showCancelled, setShowCancelled] = useState(false); const active = orders.filter((order) => order.status === "Dispatch plan"); const cancelled = orders.filter((order) => order.status === "Cancelled" && order.cancelledFromDispatch);
-  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">OPERATIONS HANDOFF</span><h2>Dispatch Plan</h2><p>Orders reach this stage after customer approval has been sent and recorded in Confirmed Orders. Operations can now prepare, pack and dispatch them.</p></div></div><OrderTable orders={active} edit={edit} cancel={cancel} remove={remove} returnToOrders={returnToConfirmed} returnLabel="Return to Confirmed" advance={markSent} advanceLabel="Mark sent to customer" />{cancelled.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled from Dispatch Plan <b>{cancelled.length}</b></button>{showCancelled && <OrderTable orders={cancelled} edit={edit} cancel={cancel} remove={remove} />}</section>}</section>;
+  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">OPERATIONS HANDOFF</span><h2>Dispatch Plan</h2><p>Orders reach this stage after customer approval has been sent and recorded in Confirmed Orders. Operations can now prepare, pack and dispatch them.</p></div></div><OrderTable orders={active} edit={view} view={view} readOnly cancel={cancel} returnToOrders={returnToConfirmed} returnLabel="Return to Confirmed" advance={markSent} advanceLabel="Mark sent to customer" />{cancelled.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled from Dispatch Plan <b>{cancelled.length}</b></button>{showCancelled && <OrderTable orders={cancelled} edit={view} view={view} readOnly />}</section>}</section>;
 }
 function FulfilmentPanel({ title, description, orders, edit, cancel, remove, advance, advanceLabel }: { title: string; description: string; orders: Order[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void; advance?: (order: Order) => void; advanceLabel?: string }) {
   return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">FULFILMENT TRACKING</span><h2>{title}</h2><p>{description}</p></div></div><OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} advance={advance} advanceLabel={advanceLabel} /></section>;
@@ -2186,7 +2190,9 @@ function ProductStockInventoryPanel({ session, canApply, onAudit, query, onProdu
   const sync = async (mode: "sync" | "setup", background = false) => {
     if (!background) { setLoading(true); setMessage(""); }
     try {
-      const response = await fetch("/api/import/google-product-master", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ mode }) });
+      const passcode = mode === "sync" && !background ? window.prompt("Enter the Stock Master sync passcode. This updates CRM data from Google Sheet.") : "";
+      if (mode === "sync" && !background && passcode === null) { setLoading(false); return; }
+      const response = await fetch("/api/import/google-product-master", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ mode, passcode }) });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Product Stock Inventory could not be updated.");
       if (mode === "setup") { setMessage(result.message || "Blank Sheet headers and test rows are ready."); await load(); return; }
@@ -2216,7 +2222,7 @@ function ProductStockInventoryPanel({ session, canApply, onAudit, query, onProdu
     } catch (error) { setMessage(error instanceof Error ? error.message : "Product could not be updated."); }
     finally { setLoading(false); }
   };
-  return <><section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT MASTER</span><h2>Products / SKUs</h2><p>Your Google Sheet inventory is the product master for this section. Sync it only when the sheet has changed.</p></div><div className="catalogue-count"><b>{items.length}</b><span>SKUs</span></div></div><section className="catalogue-actions"><div className="catalogue-tip"><b>Google Sheet product master</b><p>Fields: SKU ID, Product Name, Category, Unit, Inner Qty, Outer Qty, Selling Price, Available Stock, Low Stock Alert, Image URL.</p></div><div className="button-row">{canApply && <button className="outline" type="button" disabled={loading} onClick={() => sync("setup")}>Set up blank sheet + test rows</button>}<button className="primary" type="button" disabled={loading} onClick={() => sync("sync")}>{loading ? "Syncing…" : "Sync Google Sheet now"}</button></div></section>{message && <p className="inventory-recon-message success">{message}</p>}<section className="catalogue-grid">{visibleItems.map((item) => <article className="catalogue-card" key={item.id} onClick={() => canApply && setEditing(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={item.name} onError={(event) => { event.currentTarget.style.display = "none"; }}/> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><small title={item.sku}>{item.sku}</small><h3 title={item.name}>{item.name}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / ${item.unit || "pc"}` : "Price to be added"}</p><p className="catalogue-stock">Available: <b>{availableStock(item).toLocaleString("en-IN")}</b></p><p className="catalogue-stock">Low alert: <b>{item.reorderThreshold ?? 0}</b></p>{canApply && <button className="edit-product" type="button" onClick={(event) => { event.stopPropagation(); setEditing(item); }}><Pencil size={13}/> Edit product</button>}</div></article>)}{!loading && !visibleItems.length && <div className="empty">No products match this search. Sync Google Sheet if the product master has changed.</div>}</section></section>{editing && <StockInventoryModal item={editing} close={() => setEditing(null)} save={saveEdit}/>}</>;
+  return <><section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT MASTER</span><h2>Products / SKUs</h2><p>Your Google Sheet inventory is the product master for this section. Sync it only when the sheet has changed.</p></div><div className="catalogue-count"><b>{items.length}</b><span>SKUs</span></div></div><section className="catalogue-actions"><div className="catalogue-tip"><b>Google Sheet product master</b><p>Fields: SKU ID, Product Name, Category, Unit, Inner Qty, Outer Qty, Selling Price, Available Stock, Low Stock Alert, Image URL.</p></div><div className="button-row">{canApply && <button className="outline" type="button" disabled={loading} onClick={() => sync("setup")}>Set up blank sheet + test rows</button>}<span className="sync-stock-action"><button className="primary" type="button" disabled={loading} onClick={() => sync("sync")}>{loading ? "Syncing…" : "Sync Google Sheet"}</button><small>Update CRM from Sheet</small></span></div></section>{message && <p className="inventory-recon-message success">{message}</p>}<section className="catalogue-grid">{visibleItems.map((item) => <article className="catalogue-card" key={item.id} onClick={() => canApply && setEditing(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={item.name} onError={(event) => { event.currentTarget.style.display = "none"; }}/> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><small title={item.sku}>{item.sku}</small><h3 title={item.name}>{item.name}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / ${item.unit || "pc"}` : "Price to be added"}</p><p className="catalogue-stock">Available: <b>{availableStock(item).toLocaleString("en-IN")}</b></p><p className="catalogue-stock">Low alert: <b>{item.reorderThreshold ?? 0}</b></p>{canApply && <button className="edit-product" type="button" onClick={(event) => { event.stopPropagation(); setEditing(item); }}><Pencil size={13}/> Edit product</button>}</div></article>)}{!loading && !visibleItems.length && <div className="empty">No products match this search. Sync Google Sheet if the product master has changed.</div>}</section></section>{editing && <StockInventoryModal item={editing} close={() => setEditing(null)} save={saveEdit}/>}</>;
 }
 
 function ProductStockCategoriesPanel({ session, query, openCategory }: { session: Session; query: string; openCategory: (category: string) => void }) {

@@ -831,6 +831,7 @@ export default function Home() {
   const setSearch = (value: string) => setSectionSearches((current) => ({ ...current, [section]: value }));
   const searchInputRef = useRef<HTMLInputElement>(null);
   const recordSnapshots = useRef<Record<string, Map<string, string>>>({});
+  const inventorySnapshots = useRef<Map<string, string>>(new Map());
   // Customer records are business-critical.  They may only be removed from
   // the cloud after an explicit delete action, never because a browser has
   // briefly loaded an empty/stale client array while a Sheet import is running.
@@ -1007,6 +1008,7 @@ export default function Home() {
         if (!response.ok) throw new Error(result.error || "Product / SKU master could not be loaded.");
         if (cancelled) return;
         const products = (result.products || []) as CatalogueItem[];
+        inventorySnapshots.current = new Map(products.map((product) => [String(product.id), JSON.stringify({ availableQuantity: product.availableQuantity, reservedStock: product.reservedStock || 0 })]));
         setCatalogue(products.map((product) => ({ ...product, name: catalogueName(product) })));
         setCatalogueHydrated(true);
       } catch (error) {
@@ -1015,6 +1017,21 @@ export default function Home() {
     }, 300);
     return () => { cancelled = true; window.clearTimeout(timer); };
   }, [cloudReady, session?.access_token, catalogueHydrated]);
+  useEffect(() => {
+    // Dispatch changes product stock in the dedicated Product / SKU table.
+    // Persist only the quantities that actually changed, after the initial
+    // product master load has established the baseline.
+    if (!cloudReady || !catalogueHydrated || !session?.access_token) return;
+    const next = new Map(catalogue.map((product) => [String(product.id), JSON.stringify({ availableQuantity: availableStock(product), reservedStock: product.reservedStock || 0 })]));
+    const changed = catalogue.filter((product) => inventorySnapshots.current.get(String(product.id)) !== next.get(String(product.id)));
+    if (!changed.length) return;
+    const timer = window.setTimeout(async () => {
+      const response = await fetch("/api/import/google-product-master", { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ stockUpdates: changed.map((product) => ({ id: product.id, availableQuantity: availableStock(product), reservedStock: product.reservedStock || 0 })) }) });
+      if (!response.ok) { const result = await response.json().catch(() => ({})); setCloudError(result.error || "Dispatch stock movement could not be saved to Product / SKU inventory."); return; }
+      inventorySnapshots.current = next;
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [catalogue, catalogueHydrated, cloudReady, session?.access_token]);
   useEffect(() => {
     const cloud = supabase;
     if (!cloud || !session || !cloudReady || !workspaceOwnerId) return;

@@ -342,6 +342,15 @@ const linesFor = (order: Order): ProductLine[] => order.products || [{ product: 
 const orderTotal = (order: Order) => linesFor(order).reduce((total, line) => total + line.quantity * line.unitPrice, 0);
 const orderEntrySource = (order: Order) => /imported\s+from/i.test(order.remarks || "") ? "Import" : "Manual";
 const orderQuantity = (order: Order) => linesFor(order).reduce((total, line) => total + line.quantity, 0);
+const nextPurchaseOrderNumber = (purchases: PurchaseOrder[]) => {
+  const now = new Date();
+  const prefix = `${String(now.getFullYear()).slice(-2)}${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const sequence = purchases.reduce((highest, purchase) => {
+    const match = purchase.id.match(new RegExp(`^${prefix}-(\\d+)$`, "i"));
+    return match ? Math.max(highest, Number(match[1])) : highest;
+  }, 0) + 1;
+  return `${prefix}-${String(sequence).padStart(2, "0")}`;
+};
 const initials = (n: string) =>
   n
     .split(" ")
@@ -1100,10 +1109,43 @@ export default function Home() {
     if (purchase.status === "Cancelled" || purchase.status === "Delivered") return;
     const remaining = purchase.lines.filter((line) => Math.max(0, line.quantity - line.receivedQuantity) > 0);
     if (!remaining.length) return;
-    if (!window.confirm(`Receive the remaining ${remaining.reduce((sum, line) => sum + line.quantity - line.receivedQuantity, 0).toLocaleString("en-IN")} unit(s) for ${purchase.id}? This will add them to available SKU stock.`)) return;
-    setPurchases((current) => current.map((item) => item.id === purchase.id ? { ...item, status: "Delivered", lines: item.lines.map((line) => ({ ...line, receivedQuantity: line.quantity })) } : item));
-    logActivity("Received purchase order", "Purchase Orders", `${purchase.id} · ${remaining.length} SKU line(s) awaiting Product Stock Inventory sync`);
-    flash(`${purchase.id} marked delivered. Refresh Product Stock Inventory after Tally/Sheet stock is updated.`);
+    const receivedBySku = new Map<string, number>();
+    for (const line of remaining) {
+      const outstanding = Math.max(0, line.quantity - line.receivedQuantity);
+      const input = window.prompt(`${line.sku} · ${line.product}\nOrdered: ${line.quantity.toLocaleString("en-IN")} · already received: ${line.receivedQuantity.toLocaleString("en-IN")}\nEnter quantity received now:`, String(outstanding));
+      if (input === null) return;
+      const quantity = Number(input);
+      if (!Number.isFinite(quantity) || quantity < 0 || quantity > outstanding) {
+        flash(`Enter a quantity from 0 to ${outstanding.toLocaleString("en-IN")} for ${line.sku}. Nothing was changed.`);
+        return;
+      }
+      receivedBySku.set(`${line.sku}::${line.product}`, quantity);
+    }
+    const updatedLines = purchase.lines.map((line) => ({ ...line, receivedQuantity: line.receivedQuantity + (receivedBySku.get(`${line.sku}::${line.product}`) || 0) }));
+    const backorderLines = updatedLines.flatMap((line) => {
+      const quantity = Math.max(0, line.quantity - line.receivedQuantity);
+      return quantity ? [{ sku: line.sku, product: line.product, quantity, receivedQuantity: 0 }] : [];
+    });
+    const receivedTotal = [...receivedBySku.values()].reduce((sum, quantity) => sum + quantity, 0);
+    if (!receivedTotal) { flash("No quantity was received, so the purchase order was left unchanged."); return; }
+    setPurchases((current) => {
+      const received = { ...purchase, status: "Delivered" as const, lines: updatedLines };
+      const next = current.map((item) => item.id === purchase.id ? received : item);
+      if (!backorderLines.length) return next;
+      const backorder: PurchaseOrder = {
+        id: nextPurchaseOrderNumber(next),
+        supplier: purchase.supplier,
+        status: "Draft",
+        expectedDate: "",
+        createdAt: new Date().toISOString().slice(0, 10),
+        notes: [purchase.notes, `Backorder balance from ${purchase.id}`].filter(Boolean).join(" · "),
+        lines: backorderLines,
+      };
+      return [...next, backorder];
+    });
+    const backorderNote = backorderLines.length ? ` A backorder PO will be created for ${backorderLines.reduce((sum, line) => sum + line.quantity, 0).toLocaleString("en-IN")} remaining unit(s).` : "";
+    logActivity("Received purchase order", "Purchase Orders", `${purchase.id} · ${receivedTotal} unit(s) received.${backorderNote}`);
+    flash(`${purchase.id} marked delivered for the received quantity.${backorderNote} Update the Stock Master Sheet, then sync Product / SKUs.`);
   };
   const cancelOrder = (order: Order) => {
     if (!window.confirm(`Cancel ${order.id}? Its allocated stock will be released back to available inventory.`)) return;
@@ -1597,7 +1639,7 @@ export default function Home() {
       {modal === "task" && <TaskModal task={editing} owner={session.user.email || signedInName} close={() => setModal(null)} save={(task) => { const savedTask = editing ? task : { ...task, assignee: session.user.email || signedInName }; setTasks((current) => editing ? current.map((item) => item.id === editing.id ? savedTask : item) : [...current, savedTask]); setModal(null); logActivity(editing ? "Updated task" : "Created task", "Daily Tasks", savedTask.title); flash(editing ? "Task updated" : "Task created"); }} />}
       {modal === "transporter" && <TransporterModal transporter={editing} close={() => setModal(null)} save={(transporter) => { setTransporters((current) => editing ? current.map((item) => item.id === editing.id ? transporter : item) : [...current, transporter]); setModal(null); logActivity(editing ? "Updated transporter" : "Added transporter", "Transporters", transporter.name); flash(editing ? "Transporter updated" : "Transporter added"); }} />}
       {modal === "supplier" && <SupplierModal supplier={editing} close={() => setModal(null)} save={(supplier) => { setSuppliers((current) => editing ? current.map((item) => item.id === editing.id ? supplier : item) : [...current, supplier]); setModal(null); logActivity(editing ? "Updated supplier" : "Added supplier", "Suppliers", supplier.name); flash(editing ? "Supplier updated" : "Supplier added"); }} />}
-      {modal === "purchase" && <PurchaseOrderModal purchase={editing?.id ? editing as PurchaseOrder : null} draft={editing?.lines ? editing : null} catalogue={catalogue} suppliers={suppliers} close={() => setModal(null)} save={(purchase) => { if (purchase.supplier.trim()) setSuppliers((current) => current.some((supplier) => supplier.name.trim().toLowerCase() === purchase.supplier.trim().toLowerCase()) ? current : [...current, { id: Date.now(), name: purchase.supplier.trim(), contact: "", phone: "", email: "", city: "", country: "", gstin: "", paymentTerms: "", notes: "", status: "Active" }]); setPurchases((current) => editing?.id ? current.map((item) => item.id === purchase.id ? purchase : item) : [...current, purchase]); setModal(null); logActivity(editing?.id ? "Updated purchase order" : "Created purchase order", "Purchase Orders", purchase.id); flash(editing?.id ? "Purchase order updated." : "Purchase order created. Stock will change only when it is received."); }} />}
+      {modal === "purchase" && <PurchaseOrderModal purchase={editing?.id ? editing as PurchaseOrder : null} draft={editing?.lines ? editing : null} purchases={purchases} catalogue={catalogue} suppliers={suppliers} close={() => setModal(null)} save={(purchase) => { if (purchase.supplier.trim()) setSuppliers((current) => current.some((supplier) => supplier.name.trim().toLowerCase() === purchase.supplier.trim().toLowerCase()) ? current : [...current, { id: Date.now(), name: purchase.supplier.trim(), contact: "", phone: "", email: "", city: "", country: "", gstin: "", paymentTerms: "", notes: "", status: "Active" }]); setPurchases((current) => editing?.id ? current.map((item) => item.id === purchase.id ? purchase : item) : [...current, purchase]); setModal(null); logActivity(editing?.id ? "Updated purchase order" : "Created purchase order", "Purchase Orders", purchase.id); flash(editing?.id ? "Purchase order updated." : "Purchase order created. Stock will change only when it is received."); }} />}
       {toast && (
         <div className="toast">
           <PackageCheck size={18} />
@@ -1744,14 +1786,39 @@ function Overview({
 function PurchaseOrdersPanel({ purchases, catalogue, lowStockProducts, add, edit, receive, cancel, remove }: { purchases: PurchaseOrder[]; catalogue: CatalogueItem[]; lowStockProducts: CatalogueItem[]; add: (product?: CatalogueItem) => void; edit: (purchase: PurchaseOrder) => void; receive: (purchase: PurchaseOrder) => void; cancel: (purchase: PurchaseOrder) => void; remove: (purchase: PurchaseOrder) => void }) {
   const open = purchases.filter((purchase) => !["Delivered", "Cancelled"].includes(purchase.status));
   const pendingUnits = open.reduce((total, purchase) => total + purchase.lines.reduce((lineTotal, line) => lineTotal + Math.max(0, line.quantity - line.receivedQuantity), 0), 0);
+  useEffect(() => {
+    const header = Array.from(document.querySelectorAll<HTMLTableCellElement>(".purchase-panel th")).find((cell) => cell.textContent?.trim() === "EXPECTED");
+    const table = header?.closest("table");
+    if (!header || !table) return;
+    const column = Array.from(header.parentElement?.children || []).indexOf(header);
+    const cells = Array.from(table.querySelectorAll("tr")).flatMap((row) => Array.from(row.children)[column] ? [Array.from(row.children)[column] as HTMLElement] : []);
+    cells.forEach((cell) => { cell.style.display = "none"; });
+    return () => cells.forEach((cell) => { cell.style.display = ""; });
+  }, [purchases]);
   return <section className="purchasing-page"><div className="purchase-metrics"><article><span>LOW STOCK ALERTS</span><b>{lowStockProducts.length}</b><small>SKU(s) at or below threshold</small></article><article><span>OPEN PURCHASE ORDERS</span><b>{open.length}</b><small>{pendingUnits.toLocaleString("en-IN")} units awaiting delivery</small></article><article><span>CATALOGUE COVERAGE</span><b>{catalogue.filter((product) => (product.reorderThreshold || 0) > 0).length}</b><small>SKU(s) with reorder limits</small></article></div><section className="panel purchase-panel"><div className="panel-head"><div><span className="overline">REORDER QUEUE</span><h2>Low-stock products</h2><p>Set the required quantity and create a supplier purchase order before stock runs out.</p></div><button className="outline purchase-new" onClick={() => add()}><Plus size={15}/> New purchase order</button></div>{lowStockProducts.length ? <div className="table-wrap"><table><thead><tr><th>PRODUCT / SKU</th><th>SUPPLIER</th><th>AVAILABLE</th><th>ALERT AT</th><th>RECOMMENDED ORDER</th><th></th></tr></thead><tbody>{lowStockProducts.map((product) => <tr key={product.id}><td><b>{catalogueName(product)}</b><small className="purchase-sku">{catalogueSku(product)}</small></td><td>{product.supplier || "Supplier not set"}</td><td className="purchase-danger">{availableStock(product).toLocaleString("en-IN")}</td><td>{(product.reorderThreshold || 0).toLocaleString("en-IN")}</td><td>{Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)).toLocaleString("en-IN")}</td><td><button className="text-btn" onClick={() => add(product)}>Create PO <span>→</span></button></td></tr>)}</tbody></table></div> : <div className="purchase-empty"><PackageCheck size={23}/><b>Inventory is healthy</b><span>Products with a threshold will appear here when stock reaches that limit.</span></div>}</section><section className="panel purchase-panel"><div className="panel-head"><div><span className="overline">PURCHASING</span><h2>Purchase order register</h2><p>Stock is added only after you mark a delivery as received.</p></div></div>{purchases.length ? <div className="table-wrap"><table><thead><tr><th>PO NUMBER</th><th>SUPPLIER</th><th>PRODUCTS</th><th>ORDERED</th><th>RECEIVED</th><th>EXPECTED</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody>{purchases.map((purchase) => { const ordered = purchase.lines.reduce((sum, line) => sum + line.quantity, 0); const received = purchase.lines.reduce((sum, line) => sum + line.receivedQuantity, 0); return <tr key={purchase.id}><td><b>{purchase.id}</b></td><td>{purchase.supplier || "Not assigned"}</td><td>{purchase.lines.map((line) => line.sku).join(", ")}</td><td>{ordered.toLocaleString("en-IN")}</td><td>{received.toLocaleString("en-IN")}</td><td>{purchase.expectedDate || "—"}</td><td><Pill value={purchase.status}/></td><td className="purchase-actions"><button className="text-btn" onClick={() => edit(purchase)}>Edit</button>{!["Delivered", "Cancelled"].includes(purchase.status) && <button className="text-btn" onClick={() => receive(purchase)}>Receive</button>}{purchase.status === "Draft" && <button className="text-btn" onClick={() => cancel(purchase)}>Cancel</button>}<button className="row-delete" type="button" onClick={() => remove(purchase)} aria-label={`Delete ${purchase.id}`}><Trash2 size={14}/> Delete</button><button className="whatsapp-action" type="button" onClick={() => window.open(`https://wa.me/?text=${encodeURIComponent(`GeeBee Purchase Order ${purchase.id}\nSupplier: ${purchase.supplier || "Not assigned"}\nProducts: ${purchase.lines.map((line) => `${line.sku} × ${line.quantity}`).join(", ")}`)}`, "_blank", "noopener,noreferrer")}>WA</button></td></tr>; })}</tbody></table></div> : <div className="purchase-empty"><ClipboardList size={23}/><b>No purchase orders yet</b><span>Create one from a low-stock alert or use New purchase order.</span></div>}</section></section>;
 }
-function PurchaseOrderModal({ purchase, draft, catalogue, suppliers, close, save }: { purchase: PurchaseOrder | null; draft: Partial<PurchaseOrder> | null; catalogue: CatalogueItem[]; suppliers: Supplier[]; close: () => void; save: (purchase: PurchaseOrder) => void }) {
-  const initial: PurchaseOrder = purchase || { id: `PO-${String(Date.now()).slice(-7)}`, supplier: draft?.supplier || "", status: "Draft", expectedDate: "", createdAt: new Date().toISOString().slice(0, 10), notes: "", lines: draft?.lines || [{ sku: "", product: "", quantity: 0, receivedQuantity: 0 }] };
+function PurchaseOrderModal({ purchase, draft, purchases, catalogue, suppliers, close, save }: { purchase: PurchaseOrder | null; draft: Partial<PurchaseOrder> | null; purchases: PurchaseOrder[]; catalogue: CatalogueItem[]; suppliers: Supplier[]; close: () => void; save: (purchase: PurchaseOrder) => void }) {
+  const initial: PurchaseOrder = purchase || { id: nextPurchaseOrderNumber(purchases), supplier: draft?.supplier || "", status: "Draft", expectedDate: "", createdAt: new Date().toISOString().slice(0, 10), notes: "", lines: draft?.lines || [{ sku: "", product: "", quantity: 0, receivedQuantity: 0 }] };
   const [form, setForm] = useState<PurchaseOrder>(initial);
   const supplierNames = [...new Set([...suppliers.map((supplier) => supplier.name), ...catalogue.map((product) => product.supplier || "")].filter(Boolean))];
-  const chooseProduct = (index: number, value: string) => { const product = catalogue.find((item) => `${catalogueName(item)} · ${catalogueSku(item)}` === value) || catalogue.find((item) => skuKey(item.sku) === skuKey(value)); if (!product) return; setForm((current) => ({ ...current, supplier: current.supplier || product.supplier || "", lines: current.lines.map((line, lineIndex) => lineIndex === index ? { ...line, sku: product.sku, product: catalogueName(product) } : line) })); };
+  const chooseProduct = (index: number, value: string) => {
+    const typed = value.trim();
+    const product = catalogue.find((item) => [catalogueSku(item), catalogueName(item), `${catalogueName(item)} · ${catalogueSku(item)}`, `${catalogueSku(item)} · ${catalogueName(item)}`].some((label) => label.toLowerCase() === typed.toLowerCase()));
+    setForm((current) => ({
+      ...current,
+      supplier: product ? current.supplier || product.supplier || "" : current.supplier,
+      lines: current.lines.map((line, lineIndex) => lineIndex === index
+        ? product ? { ...line, sku: product.sku, product: catalogueName(product) } : { ...line, sku: typed, product: "" }
+        : line),
+    }));
+  };
   const updateLine = (index: number, patch: Partial<PurchaseLine>) => setForm((current) => ({ ...current, lines: current.lines.map((line, lineIndex) => lineIndex === index ? { ...line, ...patch } : line) }));
+  useEffect(() => {
+    // Existing saved data retains its former expectedDate for compatibility,
+    // but Expected Delivery is no longer part of the Purchase Order workflow.
+    const expectedLabel = Array.from(document.querySelectorAll<HTMLLabelElement>("label")).find((label) => label.textContent?.trim().startsWith("Expected delivery"));
+    expectedLabel?.remove();
+  }, []);
   return <Shell close={close}><div className="order-modal-head"><div className="modal-mark"><ShipWheel size={22}/></div><div><span className="overline">PURCHASING</span><h2>{purchase ? "Edit purchase order" : "New purchase order"}</h2><p>Plan supplier replenishment. Receiving the order is the only step that changes available stock.</p></div></div><div className="form-row"><label>PO number<input value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value.toUpperCase() })}/></label><label>Expected delivery<input type="date" value={form.expectedDate} onChange={(event) => setForm({ ...form, expectedDate: event.target.value })}/></label></div><label>Supplier<input list="purchase-suppliers" value={form.supplier} onChange={(event) => setForm({ ...form, supplier: event.target.value })} placeholder="Select or type supplier"/><datalist id="purchase-suppliers">{supplierNames.map((supplier) => <option key={supplier} value={supplier}/>)}</datalist></label><div className="modal-section-title">Products to order</div><div className="purchase-lines">{form.lines.map((line, index) => <div className="purchase-line" key={`${line.sku}-${index}`}><span>{index + 1}</span><label>Product / SKU<input list="purchase-products" value={line.product && line.sku ? `${line.product} · ${line.sku}` : line.sku} onChange={(event) => chooseProduct(index, event.target.value)} placeholder="Search product or SKU"/></label><label>Qty to order<input type="number" min="1" value={line.quantity || ""} onChange={(event) => updateLine(index, { quantity: Number(event.target.value) })}/></label><button type="button" className="line-remove" onClick={() => setForm((current) => ({ ...current, lines: current.lines.filter((_, lineIndex) => lineIndex !== index) }))}><X size={15}/></button></div>)}</div><datalist id="purchase-products">{catalogue.map((product) => <option key={product.id} value={`${catalogueName(product)} · ${catalogueSku(product)}`}/>)}</datalist><button type="button" className="text-btn" onClick={() => setForm((current) => ({ ...current, lines: [...current.lines, { sku: "", product: "", quantity: 0, receivedQuantity: 0 }] }))}>+ Add product line</button><label>Notes<textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} placeholder="Supplier reference, freight notes or delivery instructions"/></label><button className="primary modal-submit" type="button" onClick={() => { const lines = form.lines.filter((line) => line.sku && line.quantity > 0); if (!lines.length) return; save({ ...form, lines }); }}>Save purchase order</button></Shell>;
 }
 function TransportersPanel({ transporters, edit, add, remove }: { transporters: Transporter[]; edit: (item: Transporter) => void; add: () => void; remove: (ids: number[]) => void }) {

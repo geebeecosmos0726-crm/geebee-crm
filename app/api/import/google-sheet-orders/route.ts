@@ -3,7 +3,7 @@ import { google } from "googleapis";
 
 export const runtime = "nodejs";
 
-type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number };
+type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; remarks?: string };
 type ImportedOrder = { id: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string };
 type CustomerIdentity = { name: string; city: string };
 
@@ -93,6 +93,7 @@ function readLines(values: unknown[][], products: Map<string, { name?: string }>
   const itemIndex = findColumn(header, ["item", "sku", "product", "productsku"]);
   const quantityIndex = findColumn(header, ["quantity", "qty"]);
   const priceIndex = findColumn(header, ["price", "rate", "unitprice"]);
+  const remarksIndex = findColumn(header, ["remarks", "remark", "notes", "note"]);
   const lines: ProductLine[] = [];
   for (const row of rows.slice(headerIndex + 1)) {
     const item = (row[itemIndex] || "").trim();
@@ -101,7 +102,14 @@ function readLines(values: unknown[][], products: Map<string, { name?: string }>
     if (key(item).includes("total") || key(item).includes("transporter")) break;
     if (!item || quantity <= 0) continue;
     const matched = products.get(key(item));
-    lines.push({ sku: item.toUpperCase(), product: matched?.name?.trim() || item.toUpperCase(), quantity, unitPrice: priceIndex >= 0 ? number(row[priceIndex]) : 0 });
+    lines.push({
+      sku: item.toUpperCase(),
+      product: matched?.name?.trim() || item.toUpperCase(),
+      quantity,
+      unitPrice: priceIndex >= 0 ? number(row[priceIndex]) : 0,
+      // Remarks belong to the specific product row, not to the whole order.
+      remarks: remarksIndex >= 0 ? String(row[remarksIndex] || "").trim() : "",
+    });
   }
   return lines;
 }
@@ -159,7 +167,7 @@ export async function POST(request: Request) {
       const matchedCustomer = bestCustomerMatch(details.client, details.city, knownCustomers);
       const client = matchedCustomer?.name || details.client;
       const city = details.city || matchedCustomer?.city || "";
-      imported.push({ id: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "Imported from connected Google Sheet" });
+      imported.push({ id: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "" });
       knownOrderIds.add(key(details.id));
       if (matchedCustomer) {
         reusedCustomers.push(`${details.id}: ${details.client} → ${matchedCustomer.name}`);

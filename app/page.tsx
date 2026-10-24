@@ -2638,7 +2638,9 @@ function LegacyMultiProductOrderModal({ order, clients, close, save }: { order: 
 }
 function OrderModal({ order, clients, catalogue, transporters, createClient, createTransporter, close, save }: { order: Order | null; clients: Client[]; catalogue: CatalogueItem[]; transporters: Transporter[]; createClient: (client: Client) => void; createTransporter: (transporter: Transporter) => void; close: () => void; save: (o: Order) => void }) {
   const base = order || { id: nextOrderNumber(), client: "", city: "", eta: "", status: "Draft", payment: "Partial", transporter: "", remarks: "", avatar: "" };
-  const [f, setF] = useState(base);
+  // The old import marker was never a real packing instruction. Do not show
+  // it as one when an older imported order is opened and saved again.
+  const [f, setF] = useState({ ...base, remarks: /imported from connected google sheet/i.test(base.remarks || "") ? "" : base.remarks });
   const [products, setProducts] = useState<ProductLine[]>(order?.products || (order ? [{ product: order.product, sku: order.sku, quantity: order.quantity, unitPrice: order.unitPrice }] : [{ product: "", sku: "", quantity: 0, unitPrice: 0 }]));
   const [preview, setPreview] = useState("");
   const [scanState, setScanState] = useState<"idle" | "scanning" | "ready" | "error">("idle");
@@ -2784,6 +2786,32 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     });
     return () => { buttons.forEach((button) => button.remove()); removeButtons.forEach((button) => button.remove()); };
   }, [catalogue, products, f.client]);
+  useEffect(() => {
+    // Product remarks are deliberately attached to the product line. This
+    // preserves the Remarks column from an imported order sheet and keeps
+    // a blank input available when the sheet cell is blank.
+    const inputs: HTMLInputElement[] = [];
+    Array.from(document.querySelectorAll<HTMLElement>(".product-line")).forEach((productLine, index) => {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "product-line-remark";
+      input.placeholder = "Product remark (optional)";
+      input.setAttribute("aria-label", "Product remark");
+      input.value = products[index]?.remarks || "";
+      input.oninput = () => setProducts((current) => current.map((line, lineIndex) => lineIndex === index ? { ...line, remarks: input.value } : line));
+      productLine.append(input);
+      inputs.push(input);
+    });
+    return () => inputs.forEach((input) => input.remove());
+  }, [products.length]);
+  useEffect(() => {
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea[placeholder="Optional order remark"]');
+    const label = textarea?.parentElement;
+    if (!textarea || !label) return;
+    const text = Array.from(label.childNodes).find((node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim() === "Remarks");
+    if (text) text.textContent = "Packing";
+    textarea.placeholder = "Packing instructions (optional)";
+  }, []);
   useEffect(() => {
     const productInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="Product name"]'));
     const controls: HTMLButtonElement[] = [];

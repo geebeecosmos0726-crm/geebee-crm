@@ -1141,6 +1141,13 @@ export default function Home() {
     });
     const receivedTotal = receivedNow.reduce((sum, quantity) => sum + quantity, 0);
     if (!receivedTotal) { flash("No quantity was received, so the purchase order was left unchanged."); return; }
+    // Product / SKU is the live stock master. A received quantity is added to
+    // the matching SKU immediately; the existing stock-sync effect persists
+    // the same change to the linked Google Stock Master.
+    setCatalogue((current) => current.map((product) => {
+      const receivedForSku = purchase.lines.reduce((total, line, index) => total + (skuKey(line.sku) === skuKey(product.sku) ? (receivedNow[index] || 0) : 0), 0);
+      return receivedForSku ? { ...product, availableQuantity: availableStock(product) + receivedForSku } : product;
+    }));
     setPurchases((current) => {
       const received = { ...purchase, status: "Delivered" as const, lines: updatedLines };
       const next = current.map((item) => item.id === purchase.id ? received : item);
@@ -1158,7 +1165,21 @@ export default function Home() {
     });
     const backorderNote = backorderLines.length ? ` A backorder PO will be created for ${backorderLines.reduce((sum, line) => sum + line.quantity, 0).toLocaleString("en-IN")} remaining unit(s).` : "";
     logActivity("Received purchase order", "Purchase Orders", `${purchase.id} · ${receivedTotal} unit(s) received.${backorderNote}`);
-    flash(`${purchase.id} marked delivered for the received quantity.${backorderNote} Update the Stock Master Sheet, then sync Product / SKUs.`);
+    flash(`${purchase.id} received: ${receivedTotal.toLocaleString("en-IN")} unit(s) added to Product / SKUs.${backorderNote}`);
+  };
+  const deletePurchase = (purchase: PurchaseOrder) => {
+    if (!isAdmin) { flash("Only an administrator can permanently delete a purchase order."); return; }
+    const passcode = window.prompt(`Enter the delete passcode to permanently remove ${purchase.id}. Received quantities will be reversed from Product / SKUs.`);
+    if (passcode !== "GeeBee2026") { flash("Incorrect delete passcode. Purchase order was not removed."); return; }
+    if (!window.confirm(`Permanently delete ${purchase.id}? ${purchase.lines.reduce((total, line) => total + line.receivedQuantity, 0).toLocaleString("en-IN")} received unit(s) will be removed from inventory.`)) return;
+    setCatalogue((current) => current.map((product) => {
+      const receivedForSku = purchase.lines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((total, line) => total + line.receivedQuantity, 0);
+      return receivedForSku ? { ...product, availableQuantity: Math.max(0, availableStock(product) - receivedForSku) } : product;
+    }));
+    setPurchases((current) => current.filter((item) => item.id !== purchase.id));
+    logActivity("Deleted purchase order and reversed received inventory", "Purchase Orders", `${purchase.id} · ${purchase.lines.reduce((total, line) => total + line.receivedQuantity, 0)} unit(s) reversed`);
+    syncGoogleSheetAfterDelete();
+    flash(`${purchase.id} permanently deleted. Its received stock was reversed from Product / SKUs.`);
   };
   const fetchProductPurchaseOrders = async () => {
     if (!session?.access_token || productPoLoading) return;
@@ -1567,7 +1588,7 @@ export default function Home() {
         {section === "Settings" && <TeamAccess members={members} requests={accessRequests} workspaceOwnerId={workspaceOwnerId} canManage={isAdmin} onChange={setMembers} onRequestsChange={setAccessRequests} onAudit={logActivity} auditEvents={auditEvents} />}{" "}
         {section === "Data Transfer" && <DataTransferPanel catalogue={catalogue} clients={clients} orders={orders} invoices={invoices} leads={leads} quotes={quotes} tasks={tasks} transporters={transporters} setCatalogue={setCatalogue} setClients={setClients} setOrders={setOrders} setInvoices={setInvoices} setLeads={setLeads} setQuotes={setQuotes} setTasks={setTasks} setTransporters={setTransporters} onAudit={logActivity} canHardDelete={isAdmin} hardDelete={(scope, ids) => { const wanted = new Set(ids.map((id) => id.trim().toLowerCase()).filter(Boolean)); if (!wanted.size) return 0; if (scope === "Customers") { const removed = clients.filter((client) => wanted.has((client.customerId || "").toLowerCase()) || wanted.has(client.name.toLowerCase())); setClients((current) => current.filter((client) => !removed.some((item) => item.id === client.id))); logActivity("Hard deleted customers from sheet", "Import / Export", removed.map((item) => item.name).join(", ")); return removed.length; } const stage = scope === "Orders" ? "Draft" : scope === "Approved Orders" ? "Confirmed" : "Dispatch plan"; const targetIds = orders.filter((order) => order.status === stage && wanted.has(order.id.toLowerCase())).map((order) => order.id); if (!targetIds.length) return 0; removeOrders(targetIds); logActivity("Hard deleted orders from sheet", "Import / Export", `${scope}: ${targetIds.join(", ")}`); return targetIds.length; }} />}{" "}
         {section === "Recovery" && <RecoveryPanel canManage={isAdmin} session={session} clearBusinessData={() => { markForCloudDeletion("crm_clients", clients.map((client) => client.id)); setOrders([]); setClients([]); setInvoices([]); setLeads([]); setQuotes([]); setTasks([]); setTransporters([]); setPurchases([]); recordSnapshots.current = {}; flash("Business records have been permanently cleared. SKU catalogue was preserved."); }} applyRestore={(data) => { setOrders(data.orders); setClients(data.clients); setInvoices(data.invoices); setCatalogue(data.catalogue); setLeads(data.leads); setQuotes(data.quotes); setTasks(data.tasks); setTransporters(data.transporters || []); logActivity("Applied Google Sheets recovery", "Data recovery", "Recovery snapshot created before restore"); flash("Backup restored. Your previous CRM state is saved as a recovery snapshot."); }} />}{" "}
-        {section === "Purchase Orders" && <PurchaseOrdersPanel purchases={purchases.filter((purchase) => `${purchase.id} ${purchase.supplier} ${purchase.lines.map((line) => `${line.sku} ${line.product}`).join(" ")}`.toLowerCase().includes(search.toLowerCase()))} catalogue={catalogue} lowStockProducts={lowStockProducts} add={(product) => show("purchase", product ? { lines: [{ sku: product.sku, product: catalogueName(product), quantity: Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)), receivedQuantity: 0 }], supplier: product.supplier || "" } : null)} edit={(purchase) => show("purchase", purchase)} receive={receivePurchase} cancel={(purchase) => { if (!window.confirm(`Cancel purchase order ${purchase.id}? No stock will be changed.`)) return; setPurchases((current) => current.map((item) => item.id === purchase.id ? { ...item, status: "Cancelled" } : item)); logActivity("Cancelled purchase order", "Purchase Orders", purchase.id); flash("Purchase order cancelled."); }} remove={(purchase) => { if (!window.confirm(`Permanently delete ${purchase.id}? This does not change stock.`)) return; setPurchases((current) => current.filter((item) => item.id !== purchase.id)); logActivity("Deleted purchase order", "Purchase Orders", purchase.id); syncGoogleSheetAfterDelete(); flash("Purchase order permanently deleted."); }} />} {" "}
+        {section === "Purchase Orders" && <PurchaseOrdersPanel purchases={purchases.filter((purchase) => `${purchase.id} ${purchase.supplier} ${purchase.lines.map((line) => `${line.sku} ${line.product}`).join(" ")}`.toLowerCase().includes(search.toLowerCase()))} catalogue={catalogue} lowStockProducts={lowStockProducts} add={(product) => show("purchase", product ? { lines: [{ sku: product.sku, product: catalogueName(product), quantity: Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)), receivedQuantity: 0 }], supplier: product.supplier || "" } : null)} edit={(purchase) => show("purchase", purchase)} receive={receivePurchase} cancel={(purchase) => { if (!window.confirm(`Cancel purchase order ${purchase.id}? No stock will be changed.`)) return; setPurchases((current) => current.map((item) => item.id === purchase.id ? { ...item, status: "Cancelled" } : item)); logActivity("Cancelled purchase order", "Purchase Orders", purchase.id); flash("Purchase order cancelled."); }} remove={deletePurchase} />} {" "}
         {section === "Notifications" && <AutomationPanel />}{" "}
         {!(["Overview", "Orders", "Confirmed Orders", "Dispatch Plan", "Clients", "Leads", "Enquiries", "Follow-ups", "Lost Leads", "Quotations", "Backorders", "Invoices", "Catalogue", "Product Stock Inventory", "Categories", "Fetch Orders", "Transporters", "Suppliers", "Purchase Orders", "Settings", "Recovery", "Data Transfer", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report"].includes(section)) && (
           <section className="panel coming">

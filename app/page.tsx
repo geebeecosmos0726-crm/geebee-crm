@@ -1099,7 +1099,10 @@ export default function Home() {
       }
     }, 650);
     return () => window.clearTimeout(syncTimer);
-  }, [orders, clients, invoices, catalogue, catalogueHydrated, leads, quotes, tasks, transporters, session, cloudReady, workspaceOwnerId]);
+  // Product / SKU stock is saved through its dedicated stock-master effect
+  // above. Keeping it out of this general business-record sync prevents a
+  // stock update from repeatedly serialising every order, client and invoice.
+  }, [orders, clients, invoices, leads, quotes, tasks, transporters, session, cloudReady, workspaceOwnerId]);
   useEffect(() => {
     const cloud = supabase;
     if (!cloud || !session || !cloudReady || !workspaceOwnerId) return;

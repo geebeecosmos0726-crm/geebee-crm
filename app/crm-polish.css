@@ -2,7 +2,8 @@
 :root{--crm-ink:#33252c;--crm-muted:#847980;--crm-line:#ece5e2;--crm-paper:#fff;--crm-wine:#7e1f36;--crm-soft:#fff8f5}
 body{background:#f8f6f4}
 .content{padding-right:42px!important;padding-left:42px!important}
-header{position:sticky;top:0;z-index:5;background:rgba(248,246,244,.92);backdrop-filter:blur(14px);margin-bottom:28px!important}
+header{position:sticky;top:0;z-index:5;isolation:isolate;pointer-events:auto;background:rgba(248,246,244,.98);margin-bottom:28px!important}
+header button,header input{pointer-events:auto}
 .page-head{margin:8px 0 24px!important}.page-head h1{letter-spacing:-1.1px!important}.page-head p{max-width:650px}
 .panel,.metric{border-color:var(--crm-line)!important;box-shadow:0 6px 20px rgba(65,37,45,.035)}
 .panel{border-radius:14px!important}.record-panel,.purchase-panel,.transfer-panel{padding:24px!important}

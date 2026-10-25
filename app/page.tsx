@@ -334,6 +334,12 @@ const displayMoney = (value: string | number) => {
 };
 const openWhatsApp = (phone: string, message: string) => window.open(`https://wa.me/${phone.replace(/\D/g, "")}?text=${encodeURIComponent(message)}`, "_blank", "noopener,noreferrer");
 const availableStock = (product: CatalogueItem) => product.availableQuantity ?? ((product.openingStock || 0) + (product.purchasedStock || 0) - (product.orderedStock || 0) - (product.damagedStock || 0));
+// Older imported POs may not have a receivedQuantity value at all. Treat that
+// as zero everywhere; never let an undefined value turn stock into NaN/zero.
+const receivedPurchaseQuantity = (line: Partial<PurchaseLine>) => {
+  const value = Number(line.receivedQuantity);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+};
 // Available quantity belongs to the Product Stock Inventory Sheet. CRM orders
 // only reserve part of that quantity, so the Sheet and the CRM never overwrite
 // each other between stock syncs.
@@ -1129,14 +1135,14 @@ export default function Home() {
   const activeTasks = visibleTasks.filter((task) => task.status === "Open");
   const receivePurchase = (purchase: PurchaseOrder) => {
     if (purchase.status === "Cancelled" || purchase.status === "Delivered") return;
-    if (!purchase.lines.some((line) => Math.max(0, line.quantity - line.receivedQuantity) > 0)) return;
+    if (!purchase.lines.some((line) => Math.max(0, line.quantity - receivedPurchaseQuantity(line)) > 0)) return;
     show("purchaseReceive", purchase);
   };
   const savePurchaseReceipt = (purchase: PurchaseOrder, receivedNow: number[]) => {
     if (purchase.status === "Cancelled" || purchase.status === "Delivered") return;
-    const updatedLines = purchase.lines.map((line, index) => ({ ...line, receivedQuantity: line.receivedQuantity + (receivedNow[index] || 0) }));
+    const updatedLines = purchase.lines.map((line, index) => ({ ...line, receivedQuantity: receivedPurchaseQuantity(line) + (receivedNow[index] || 0) }));
     const backorderLines = updatedLines.flatMap((line) => {
-      const quantity = Math.max(0, line.quantity - line.receivedQuantity);
+      const quantity = Math.max(0, line.quantity - receivedPurchaseQuantity(line));
       return quantity ? [{ sku: line.sku, product: line.product, quantity, receivedQuantity: 0 }] : [];
     });
     const receivedTotal = receivedNow.reduce((sum, quantity) => sum + quantity, 0);
@@ -1171,13 +1177,14 @@ export default function Home() {
     if (!isAdmin) { flash("Only an administrator can permanently delete a purchase order."); return; }
     const passcode = window.prompt(`Enter the delete passcode to permanently remove ${purchase.id}. Received quantities will be reversed from Product / SKUs.`);
     if (passcode !== "GeeBee2026") { flash("Incorrect delete passcode. Purchase order was not removed."); return; }
-    if (!window.confirm(`Permanently delete ${purchase.id}? ${purchase.lines.reduce((total, line) => total + line.receivedQuantity, 0).toLocaleString("en-IN")} received unit(s) will be removed from inventory.`)) return;
+    const totalReceived = purchase.lines.reduce((total, line) => total + receivedPurchaseQuantity(line), 0);
+    if (!window.confirm(`Permanently delete ${purchase.id}? ${totalReceived.toLocaleString("en-IN")} received unit(s) will be removed from inventory.`)) return;
     setCatalogue((current) => current.map((product) => {
-      const receivedForSku = purchase.lines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((total, line) => total + line.receivedQuantity, 0);
+      const receivedForSku = purchase.lines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((total, line) => total + receivedPurchaseQuantity(line), 0);
       return receivedForSku ? { ...product, availableQuantity: Math.max(0, availableStock(product) - receivedForSku) } : product;
     }));
     setPurchases((current) => current.filter((item) => item.id !== purchase.id));
-    logActivity("Deleted purchase order and reversed received inventory", "Purchase Orders", `${purchase.id} · ${purchase.lines.reduce((total, line) => total + line.receivedQuantity, 0)} unit(s) reversed`);
+    logActivity("Deleted purchase order and reversed received inventory", "Purchase Orders", `${purchase.id} · ${totalReceived} unit(s) reversed`);
     syncGoogleSheetAfterDelete();
     flash(`${purchase.id} permanently deleted. Its received stock was reversed from Product / SKUs.`);
   };
@@ -1849,7 +1856,7 @@ function Overview({
 }
 function PurchaseOrdersPanel({ purchases, catalogue, lowStockProducts, add, edit, receive, cancel, remove }: { purchases: PurchaseOrder[]; catalogue: CatalogueItem[]; lowStockProducts: CatalogueItem[]; add: (product?: CatalogueItem) => void; edit: (purchase: PurchaseOrder) => void; receive: (purchase: PurchaseOrder) => void; cancel: (purchase: PurchaseOrder) => void; remove: (purchase: PurchaseOrder) => void }) {
   const open = purchases.filter((purchase) => !["Delivered", "Cancelled"].includes(purchase.status));
-  const pendingUnits = open.reduce((total, purchase) => total + purchase.lines.reduce((lineTotal, line) => lineTotal + Math.max(0, line.quantity - line.receivedQuantity), 0), 0);
+  const pendingUnits = open.reduce((total, purchase) => total + purchase.lines.reduce((lineTotal, line) => lineTotal + Math.max(0, line.quantity - receivedPurchaseQuantity(line)), 0), 0);
   useEffect(() => {
     const header = Array.from(document.querySelectorAll<HTMLTableCellElement>(".purchase-panel th")).find((cell) => cell.textContent?.trim() === "EXPECTED");
     const table = header?.closest("table");
@@ -1889,7 +1896,7 @@ function PurchaseOrdersPanel({ purchases, catalogue, lowStockProducts, add, edit
     show("ongoing");
     return () => tabs.remove();
   }, [purchases]);
-  return <section className="purchasing-page"><div className="purchase-metrics"><article><span>LOW STOCK ALERTS</span><b>{lowStockProducts.length}</b><small>SKU(s) at or below threshold</small></article><article><span>OPEN PURCHASE ORDERS</span><b>{open.length}</b><small>{pendingUnits.toLocaleString("en-IN")} units awaiting delivery</small></article><article><span>CATALOGUE COVERAGE</span><b>{catalogue.filter((product) => (product.reorderThreshold || 0) > 0).length}</b><small>SKU(s) with reorder limits</small></article></div><section className="panel purchase-panel"><div className="panel-head"><div><span className="overline">REORDER QUEUE</span><h2>Low-stock products</h2><p>Set the required quantity and create a supplier purchase order before stock runs out.</p></div><button className="outline purchase-new" onClick={() => add()}><Plus size={15}/> New purchase order</button></div>{lowStockProducts.length ? <div className="table-wrap"><table><thead><tr><th>PRODUCT / SKU</th><th>SUPPLIER</th><th>AVAILABLE</th><th>ALERT AT</th><th>RECOMMENDED ORDER</th><th></th></tr></thead><tbody>{lowStockProducts.map((product) => <tr key={product.id}><td><b>{catalogueName(product)}</b><small className="purchase-sku">{catalogueSku(product)}</small></td><td>{product.supplier || "Supplier not set"}</td><td className="purchase-danger">{availableStock(product).toLocaleString("en-IN")}</td><td>{(product.reorderThreshold || 0).toLocaleString("en-IN")}</td><td>{Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)).toLocaleString("en-IN")}</td><td><button className="text-btn" onClick={() => add(product)}>Create PO <span>→</span></button></td></tr>)}</tbody></table></div> : <div className="purchase-empty"><PackageCheck size={23}/><b>Inventory is healthy</b><span>Products with a threshold will appear here when stock reaches that limit.</span></div>}</section><section className="panel purchase-panel"><div className="panel-head"><div><span className="overline">PURCHASING</span><h2>Purchase order register</h2><p>Stock is added only after you mark a delivery as received.</p></div></div>{purchases.length ? <div className="table-wrap"><table><thead><tr><th>PO NUMBER</th><th>SUPPLIER</th><th>PRODUCTS</th><th>ORDERED</th><th>RECEIVED</th><th>EXPECTED</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody>{purchases.map((purchase) => { const ordered = purchase.lines.reduce((sum, line) => sum + line.quantity, 0); const received = purchase.lines.reduce((sum, line) => sum + line.receivedQuantity, 0); return <tr key={purchase.id}><td><b>{purchase.id}</b></td><td>{purchase.supplier || "Not assigned"}</td><td>{purchase.lines.map((line) => line.sku).join(", ")}</td><td>{ordered.toLocaleString("en-IN")}</td><td>{received.toLocaleString("en-IN")}</td><td>{purchase.expectedDate || "—"}</td><td><Pill value={purchase.status}/></td><td className="purchase-actions"><button className="text-btn" onClick={() => edit(purchase)}>Edit</button>{!["Delivered", "Cancelled"].includes(purchase.status) && <button className="text-btn" onClick={() => receive(purchase)}>Receive</button>}{purchase.status === "Draft" && <button className="text-btn" onClick={() => cancel(purchase)}>Cancel</button>}<button className="row-delete" type="button" onClick={() => remove(purchase)} aria-label={`Delete ${purchase.id}`}><Trash2 size={14}/> Delete</button><button className="whatsapp-action" type="button" onClick={() => window.open(`https://wa.me/?text=${encodeURIComponent(`GeeBee Purchase Order ${purchase.id}\nSupplier: ${purchase.supplier || "Not assigned"}\nProducts: ${purchase.lines.map((line) => `${line.sku} × ${line.quantity}`).join(", ")}`)}`, "_blank", "noopener,noreferrer")}>WA</button></td></tr>; })}</tbody></table></div> : <div className="purchase-empty"><ClipboardList size={23}/><b>No purchase orders yet</b><span>Create one from a low-stock alert or use New purchase order.</span></div>}</section></section>;
+  return <section className="purchasing-page"><div className="purchase-metrics"><article><span>LOW STOCK ALERTS</span><b>{lowStockProducts.length}</b><small>SKU(s) at or below threshold</small></article><article><span>OPEN PURCHASE ORDERS</span><b>{open.length}</b><small>{pendingUnits.toLocaleString("en-IN")} units awaiting delivery</small></article><article><span>CATALOGUE COVERAGE</span><b>{catalogue.filter((product) => (product.reorderThreshold || 0) > 0).length}</b><small>SKU(s) with reorder limits</small></article></div><section className="panel purchase-panel"><div className="panel-head"><div><span className="overline">REORDER QUEUE</span><h2>Low-stock products</h2><p>Set the required quantity and create a supplier purchase order before stock runs out.</p></div><button className="outline purchase-new" onClick={() => add()}><Plus size={15}/> New purchase order</button></div>{lowStockProducts.length ? <div className="table-wrap"><table><thead><tr><th>PRODUCT / SKU</th><th>SUPPLIER</th><th>AVAILABLE</th><th>ALERT AT</th><th>RECOMMENDED ORDER</th><th></th></tr></thead><tbody>{lowStockProducts.map((product) => <tr key={product.id}><td><b>{catalogueName(product)}</b><small className="purchase-sku">{catalogueSku(product)}</small></td><td>{product.supplier || "Supplier not set"}</td><td className="purchase-danger">{availableStock(product).toLocaleString("en-IN")}</td><td>{(product.reorderThreshold || 0).toLocaleString("en-IN")}</td><td>{Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)).toLocaleString("en-IN")}</td><td><button className="text-btn" onClick={() => add(product)}>Create PO <span>→</span></button></td></tr>)}</tbody></table></div> : <div className="purchase-empty"><PackageCheck size={23}/><b>Inventory is healthy</b><span>Products with a threshold will appear here when stock reaches that limit.</span></div>}</section><section className="panel purchase-panel"><div className="panel-head"><div><span className="overline">PURCHASING</span><h2>Purchase order register</h2><p>Stock is added only after you mark a delivery as received.</p></div></div>{purchases.length ? <div className="table-wrap"><table><thead><tr><th>PO NUMBER</th><th>SUPPLIER</th><th>PRODUCTS</th><th>ORDERED</th><th>RECEIVED</th><th>EXPECTED</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody>{purchases.map((purchase) => { const ordered = purchase.lines.reduce((sum, line) => sum + line.quantity, 0); const received = purchase.lines.reduce((sum, line) => sum + receivedPurchaseQuantity(line), 0); return <tr key={purchase.id}><td><b>{purchase.id}</b></td><td>{purchase.supplier || "Not assigned"}</td><td>{purchase.lines.map((line) => line.sku).join(", ")}</td><td>{ordered.toLocaleString("en-IN")}</td><td>{received.toLocaleString("en-IN")}</td><td>{purchase.expectedDate || "—"}</td><td><Pill value={purchase.status}/></td><td className="purchase-actions"><button className="text-btn" onClick={() => edit(purchase)}>Edit</button>{!["Delivered", "Cancelled"].includes(purchase.status) && <button className="text-btn" onClick={() => receive(purchase)}>Receive</button>}{purchase.status === "Draft" && <button className="text-btn" onClick={() => cancel(purchase)}>Cancel</button>}<button className="row-delete" type="button" onClick={() => remove(purchase)} aria-label={`Delete ${purchase.id}`}><Trash2 size={14}/> Delete</button><button className="whatsapp-action" type="button" onClick={() => window.open(`https://wa.me/?text=${encodeURIComponent(`GeeBee Purchase Order ${purchase.id}\nSupplier: ${purchase.supplier || "Not assigned"}\nProducts: ${purchase.lines.map((line) => `${line.sku} × ${line.quantity}`).join(", ")}`)}`, "_blank", "noopener,noreferrer")}>WA</button></td></tr>; })}</tbody></table></div> : <div className="purchase-empty"><ClipboardList size={23}/><b>No purchase orders yet</b><span>Create one from a low-stock alert or use New purchase order.</span></div>}</section></section>;
 }
 function PurchaseOrderModal({ purchase, draft, purchases, catalogue, suppliers, close, save }: { purchase: PurchaseOrder | null; draft: Partial<PurchaseOrder> | null; purchases: PurchaseOrder[]; catalogue: CatalogueItem[]; suppliers: Supplier[]; close: () => void; save: (purchase: PurchaseOrder) => void }) {
   const initial: PurchaseOrder = purchase || { id: nextPurchaseOrderNumber(purchases), supplier: draft?.supplier || "", status: "Draft", expectedDate: "", createdAt: new Date().toISOString().slice(0, 10), notes: "", lines: draft?.lines || [{ sku: "", product: "", quantity: 0, receivedQuantity: 0 }] };
@@ -1932,7 +1939,7 @@ function PurchaseReceiptModal({ purchase, close, save }: { purchase: PurchaseOrd
       const quantities = purchase.lines.map((line, index) => {
         const raw = received[index]?.trim() || "0";
         const amount = Number(raw);
-        const outstanding = Math.max(0, line.quantity - line.receivedQuantity);
+        const outstanding = Math.max(0, line.quantity - receivedPurchaseQuantity(line));
         if (!Number.isFinite(amount) || amount < 0 || amount > outstanding) throw new Error(`${line.sku}: enter a quantity from 0 to ${outstanding.toLocaleString("en-IN")}.`);
         return amount;
       });
@@ -1943,7 +1950,7 @@ function PurchaseReceiptModal({ purchase, close, save }: { purchase: PurchaseOrd
   return <Shell close={close}>
     <div className="order-modal-head"><div className="modal-mark"><PackageCheck size={22}/></div><div><span className="overline">GOODS RECEIPT</span><h2>Receive purchase order {purchase.id}</h2><p>Enter the received quantity for each product separately. Remaining quantities will become a new backorder PO.</p></div></div>
     <div className="purchase-receipt-lines">
-      {purchase.lines.map((line, index) => { const outstanding = Math.max(0, line.quantity - line.receivedQuantity); return <div className="purchase-receipt-line" key={`${line.sku}-${index}`}><div><b>{line.sku} · {line.product}</b><small>Ordered {line.quantity.toLocaleString("en-IN")} · previously received {line.receivedQuantity.toLocaleString("en-IN")} · remaining {outstanding.toLocaleString("en-IN")}</small></div><label>Receive now<input type="number" min="0" max={outstanding} value={received[index] || ""} onChange={(event) => update(index, event.target.value)} placeholder="0" disabled={outstanding === 0}/></label></div>; })}
+      {purchase.lines.map((line, index) => { const alreadyReceived = receivedPurchaseQuantity(line); const outstanding = Math.max(0, line.quantity - alreadyReceived); return <div className="purchase-receipt-line" key={`${line.sku}-${index}`}><div><b>{line.sku} · {line.product}</b><small>Ordered {line.quantity.toLocaleString("en-IN")} · previously received {alreadyReceived.toLocaleString("en-IN")} · remaining {outstanding.toLocaleString("en-IN")}</small></div><label>Receive now<input type="number" min="0" max={outstanding} value={received[index] || ""} onChange={(event) => update(index, event.target.value)} placeholder="0" disabled={outstanding === 0}/></label></div>; })}
     </div>
     <button className="primary modal-submit" type="button" onClick={submit}>Save individual receipt</button>
   </Shell>;

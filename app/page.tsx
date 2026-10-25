@@ -1755,7 +1755,9 @@ function Overview({
   const pending = invoices.filter((invoice) => invoice.status !== "Paid").reduce((total, invoice) => total + amount(invoice.amount), 0);
   const collectedPercent = paid + pending ? Math.round((paid / (paid + pending)) * 100) : 0;
   const activeOrders = normalOrders.filter((order) => order.status !== "Delivered").length;
-  const inTransit = normalOrders.filter((order) => order.status === "In transit").length;
+  const draftOrders = normalOrders.filter((order) => order.status === "Draft").length;
+  const approvedOrders = normalOrders.filter((order) => order.status === "Confirmed").length;
+  const dispatchPlanOrders = normalOrders.filter((order) => order.status === "Dispatch plan").length;
   return (
     <>
       <div className="metrics">
@@ -1773,13 +1775,9 @@ function Overview({
           icon={<CircleDollarSign />}
           kind="coral"
         />
-        <Metric
-          label="Shipments in transit"
-          value={String(inTransit)}
-          change={inTransit ? "Currently in transit" : "No active transit orders"}
-          icon={<ShipWheel />}
-          kind="gold"
-        />
+        <Metric label="Draft orders" value={String(draftOrders)} change="Awaiting approval" icon={<FileText />} kind="gold" />
+        <Metric label="Approved orders" value={String(approvedOrders)} change="Ready for dispatch" icon={<PackageCheck />} kind="violet" />
+        <Metric label="Dispatch plan" value={String(dispatchPlanOrders)} change="In operations" icon={<ShipWheel />} kind="burgundy" />
         <Metric
           label="Active clients"
           value={String(clients.length)}

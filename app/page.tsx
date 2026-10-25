@@ -2142,7 +2142,7 @@ function OrderTable({
 }
 function OrderViewModal({ order, close }: { order: Order; close: () => void }) {
   const lines = linesFor(order);
-  return <Shell close={close}><section className="dispatch-print-document"><div className="order-modal-head"><div className="modal-mark"><PackageCheck size={22}/></div><div><span className="overline">DISPATCH ORDER · {order.id}</span><h2 className="dispatch-customer-name">{order.client}</h2><p>{order.city || "—"}{order.transporter ? ` · ${order.transporter}` : ""}</p></div></div><div className="panel-head"><div><h3>Products to pack</h3></div><button className="outline dispatch-print-button" type="button" onClick={() => window.print()}>Print</button></div><div className="table-wrap"><table className="records dispatch-print-table"><thead><tr><th>SKU</th><th>PRODUCT</th><th>QTY</th><th>REMARKS</th></tr></thead><tbody>{lines.map((line, index) => <tr key={`${line.sku}-${index}`}><td><b>{line.sku}</b></td><td>{line.product}</td><td><b>{line.quantity.toLocaleString("en-IN")}</b></td><td>{line.remarks?.trim() || "—"}</td></tr>)}</tbody></table></div>{packingInstructions(order) && <p className="profile-empty dispatch-packing-note"><b>Packing:</b> {packingInstructions(order)}</p>}</section></Shell>;
+  return <Shell close={close} printDocument><section className="dispatch-print-document"><div className="order-modal-head"><div className="modal-mark"><PackageCheck size={22}/></div><div><span className="overline">DISPATCH ORDER · {order.id}</span><h2 className="dispatch-customer-name">{order.client}</h2><p>{order.city || "—"}{order.transporter ? ` · ${order.transporter}` : ""}</p></div></div><div className="panel-head"><div><h3>Products to pack</h3></div><button className="outline dispatch-print-button" type="button" onClick={() => window.print()}>Print</button></div><div className="table-wrap"><table className="records dispatch-print-table"><thead><tr><th>SKU</th><th>PRODUCT</th><th>QTY</th><th>REMARKS</th></tr></thead><tbody>{lines.map((line, index) => <tr key={`${line.sku}-${index}`}><td><b>{line.sku}</b></td><td>{line.product}</td><td><b>{line.quantity.toLocaleString("en-IN")}</b></td><td>{line.remarks?.trim() || "—"}</td></tr>)}</tbody></table></div>{packingInstructions(order) && <p className="profile-empty dispatch-packing-note"><b>Packing:</b> {packingInstructions(order)}</p>}</section></Shell>;
 }
 function Clients({
   clients,
@@ -2674,14 +2674,16 @@ function Shell({
   children,
   close,
   wide = false,
+  printDocument = false,
 }: {
   children: React.ReactNode;
   close: () => void;
   wide?: boolean;
+  printDocument?: boolean;
 }) {
   return (
-    <div className="modal-backdrop" onMouseDown={close}>
-      <form className={`modal${wide ? " modal-wide" : ""}`} onMouseDown={(e) => e.stopPropagation()}>
+    <div className={`modal-backdrop${printDocument ? " dispatch-print-backdrop" : ""}`} onMouseDown={close}>
+      <form className={`modal${wide ? " modal-wide" : ""}${printDocument ? " dispatch-print-modal" : ""}`} onMouseDown={(e) => e.stopPropagation()}>
         <button type="button" className="close" onClick={close}>
           <X size={19} />
         </button>

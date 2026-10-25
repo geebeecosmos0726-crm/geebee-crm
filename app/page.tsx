@@ -876,6 +876,11 @@ export default function Home() {
       setEditing(d || null);
       setModal(k);
     };
+  const refreshPanel = () => {
+    // A full refresh re-reads the cloud workspace and the current Product / SKU
+    // Stock Master without asking the user to use browser controls.
+    window.location.reload();
+  };
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -1481,6 +1486,9 @@ export default function Home() {
           </div>
           <button className="shortcut-trigger" type="button" aria-label="Open keyboard shortcuts" onClick={() => setShortcutsOpen((current) => !current)}>
             <Keyboard size={17}/><span>Shortcuts</span>
+          </button>
+          <button className="icon-btn" type="button" aria-label="Refresh panel" title="Refresh panel" onClick={refreshPanel}>
+            <RotateCcw size={18} />
           </button>
           <button className="icon-btn" type="button" aria-label="Open notifications" onClick={() => setNotificationsOpen((current) => !current)}>
             <Bell size={19} />

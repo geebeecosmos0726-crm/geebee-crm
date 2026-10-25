@@ -2046,6 +2046,8 @@ function OrderTable({
   advance,
   advanceLabel,
   compact = false,
+  showDispatchDetails = false,
+  hidePrint = false,
 }: {
   orders: Order[];
   edit: (o: Order) => void;
@@ -2062,6 +2064,8 @@ function OrderTable({
   advance?: (order: Order) => void;
   advanceLabel?: string;
   compact?: boolean;
+  showDispatchDetails?: boolean;
+  hidePrint?: boolean;
 }) {
   const [selected, setSelected] = useState<string[]>([]);
   const selectable = Boolean(remove) && !compact;
@@ -2087,6 +2091,7 @@ function OrderTable({
             <th>STATUS</th>
             <th>PAYMENT</th>
             {!compact && <th>PACKING</th>}
+            {showDispatchDetails && <th>REMARKS</th>}
             <th />
           </tr>
         </thead>
@@ -2121,9 +2126,10 @@ function OrderTable({
               <td>
                 <Pill value={o.payment} />
               </td>
-              {!compact && <td><span className="order-entry-source" title="Packing note">—</span></td>}
+              {!compact && <td><span className="order-entry-source" title="Packing instructions">{o.remarks || "—"}</span></td>}
+              {showDispatchDetails && <td><span className="order-entry-source" title="Product remarks">{linesFor(o).map((line) => line.remarks?.trim()).filter(Boolean).join(" · ") || "—"}</span></td>}
               <td>
-                <div className="record-actions">{view && <button className="outline" type="button" onClick={() => view(o)}>View</button>}{confirm && o.status === "Draft" && <button className="dispatch-action" type="button" onClick={() => confirm(o)}>Confirm order</button>}{returnToOrders && (o.status === "Confirmed" || o.status === "Dispatch plan") && <button className="outline" type="button" onClick={() => returnToOrders(o)}>{returnLabel}</button>}{pushToDispatch && o.status === "Confirmed" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{advance && <button className="dispatch-action" type="button" onClick={() => advance(o)}>{advanceLabel || "Continue"}</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>{whatsAppLabel || "WA"}</button>}{readOnly && <button className="outline" type="button" onClick={() => window.print()}>Print</button>}{!readOnly && <button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>}{!readOnly && cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{!readOnly && selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
+                <div className="record-actions">{view && <button className="outline" type="button" onClick={() => view(o)}>View</button>}{confirm && o.status === "Draft" && <button className="dispatch-action" type="button" onClick={() => confirm(o)}>Confirm order</button>}{returnToOrders && (o.status === "Confirmed" || o.status === "Dispatch plan") && <button className="outline" type="button" onClick={() => returnToOrders(o)}>{returnLabel}</button>}{pushToDispatch && o.status === "Confirmed" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{advance && <button className="dispatch-action" type="button" onClick={() => advance(o)}>{advanceLabel || "Continue"}</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>{whatsAppLabel || "WA"}</button>}{readOnly && !hidePrint && <button className="outline" type="button" onClick={() => window.print()}>Print</button>}{!readOnly && <button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>}{!readOnly && cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{!readOnly && selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
               </td>
             </tr>
           ))}
@@ -2309,7 +2315,7 @@ function ReportsDashboard({ report, orders, clients, catalogue, leads, quotes, i
 }
 function DispatchPlanPanel({ orders, view, cancel, returnToConfirmed, markSent }: { orders: Order[]; view: (order: Order) => void; cancel: (order: Order) => void; returnToConfirmed: (order: Order) => void; markSent: (order: Order) => void }) {
   const [showCancelled, setShowCancelled] = useState(false); const active = orders.filter((order) => order.status === "Dispatch plan"); const cancelled = orders.filter((order) => order.status === "Cancelled" && order.cancelledFromDispatch);
-  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">OPERATIONS HANDOFF</span><h2>Dispatch Plan</h2><p>Orders reach this stage after customer approval has been sent and recorded in Confirmed Orders. Operations can now prepare, pack and dispatch them.</p></div></div><OrderTable orders={active} edit={view} view={view} readOnly cancel={cancel} returnToOrders={returnToConfirmed} returnLabel="Return to Confirmed" advance={markSent} advanceLabel="Mark sent to customer" />{cancelled.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled from Dispatch Plan <b>{cancelled.length}</b></button>{showCancelled && <OrderTable orders={cancelled} edit={view} view={view} readOnly />}</section>}</section>;
+  return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">OPERATIONS HANDOFF</span><h2>Dispatch Plan</h2><p>Orders reach this stage after customer approval has been sent and recorded in Confirmed Orders. Operations can now prepare, pack and dispatch them.</p></div></div><OrderTable orders={active} edit={view} view={view} readOnly cancel={cancel} returnToOrders={returnToConfirmed} returnLabel="Return to Confirmed" advance={markSent} advanceLabel="Mark sent to customer" showDispatchDetails hidePrint />{cancelled.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled from Dispatch Plan <b>{cancelled.length}</b></button>{showCancelled && <OrderTable orders={cancelled} edit={view} view={view} readOnly showDispatchDetails hidePrint />}</section>}</section>;
 }
 function FulfilmentPanel({ title, description, orders, edit, cancel, remove, advance, advanceLabel }: { title: string; description: string; orders: Order[]; edit: (order: Order) => void; cancel: (order: Order) => void; remove?: (ids: string[]) => void; advance?: (order: Order) => void; advanceLabel?: string }) {
   return <section className="panel record-panel dispatch-plan-panel"><div className="panel-head"><div><span className="overline">FULFILMENT TRACKING</span><h2>{title}</h2><p>{description}</p></div></div><OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} advance={advance} advanceLabel={advanceLabel} /></section>;

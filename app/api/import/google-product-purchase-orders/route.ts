@@ -11,6 +11,7 @@ const quoteRange = (title: string) => `'${title.replace(/'/g, "''")}'!A:Z`;
 
 type PurchaseLine = { sku: string; product: string; quantity: number; receivedQuantity: number };
 type PurchaseOrder = { id: string; supplier: string; status: "Draft"; expectedDate: string; createdAt: string; notes: string; lines: PurchaseLine[]; importKey: string };
+type Supplier = { id: number; name: string; contact: string; phone: string; email: string; city: string; country: string; gstin: string; paymentTerms: string; notes: string; status: "Active" };
 
 const column = (headers: string[], aliases: string[]) => headers.findIndex((header) => aliases.includes(compact(header)));
 const dateKey = (value: string) => {
@@ -62,27 +63,29 @@ export async function POST(request: Request) {
     const result = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(tab) });
     const rows = (result.data.values || []).map((row) => Array.isArray(row) ? row.map(text) : []);
     const headerRow = rows.find((row) => column(row, ["date"]) >= 0 && column(row, ["skuid", "sku"]) >= 0 && column(row, ["qtyordered", "quantityordered", "qty", "quantity"]) >= 0);
-    if (!headerRow) throw new Error("Use these Product PO headers: Date, SKU ID, Product Name, Qty Ordered.");
+    if (!headerRow) throw new Error("Use these Product PO headers: Date, Supplier, SKU ID, Product Name, Qty Ordered.");
     const dateIndex = column(headerRow, ["date"]);
     const skuIndex = column(headerRow, ["skuid", "sku"]);
     const nameIndex = column(headerRow, ["productname", "product"]);
+    const supplierIndex = column(headerRow, ["supplier", "suppliername", "vendor", "vendorname"]);
     const quantityIndex = column(headerRow, ["qtyordered", "quantityordered", "qty", "quantity"]);
     const start = rows.indexOf(headerRow) + 1;
     const { data: inventory, error: inventoryError } = await db.from("crm_stock_inventory").select("data").eq("workspace_owner_id", ownerId).limit(100000);
     if (inventoryError) throw inventoryError;
     const products = new Map((inventory || []).map((row: any) => [compact(row.data?.sku), row.data]));
-    const workspaceData = (workspace.data || {}) as { purchases?: PurchaseOrder[]; suppliers?: unknown[] };
+    const workspaceData = (workspace.data || {}) as { purchases?: PurchaseOrder[]; suppliers?: Supplier[] };
     const existing = Array.isArray(workspaceData.purchases) ? workspaceData.purchases : [];
-    const groups = new Map<string, { date: string; lines: PurchaseLine[] }>();
+    const groups = new Map<string, { date: string; supplier?: string; lines: PurchaseLine[] }>();
     const unmatched: string[] = [];
     rows.slice(start).forEach((row) => {
-      const date = text(row[dateIndex]); const sku = text(row[skuIndex]); const ordered = quantity(row[quantityIndex]);
+      const date = text(row[dateIndex]); const sku = text(row[skuIndex]); const supplier = supplierIndex >= 0 ? text(row[supplierIndex]) : ""; const ordered = quantity(row[quantityIndex]);
       if (!date && !sku && !ordered) return;
       if (!date || !sku || ordered <= 0) return;
       const product = products.get(compact(sku));
       if (!product) { unmatched.push(sku); return; }
       const key = `product-po:${dateKey(date)}`;
-      const group = groups.get(key) || { date, lines: [] };
+      const group = groups.get(key) || { date, supplier: supplier || undefined, lines: [] };
+      if (!group.supplier && supplier) group.supplier = supplier;
       group.lines.push({ sku: String(product.sku || sku), product: String(product.name || text(row[nameIndex]) || sku), quantity: ordered, receivedQuantity: 0 });
       groups.set(key, group);
     });
@@ -94,24 +97,34 @@ export async function POST(request: Request) {
       const current = byImportKey.get(importKey);
       if (!current) {
         const prefix = dateKey(group.date);
-        imported.push({ id: nextId(prefix, [...existing, ...imported]), supplier: "", status: "Draft", expectedDate: "", createdAt: new Date().toISOString().slice(0, 10), notes: `Imported from Product PO Sheet · ${group.date}`, lines: group.lines, importKey });
+        imported.push({ id: nextId(prefix, [...existing, ...imported]), supplier: group.supplier || "", status: "Draft", expectedDate: "", createdAt: new Date().toISOString().slice(0, 10), notes: `Imported from Product PO Sheet · ${group.date}`, lines: group.lines, importKey });
         return;
       }
       // The sheet remains the source for draft Product POs. This lets a user
       // append rows (or correct quantities) and fetch again without creating
       // a second PO for the same date. Received/cancelled POs are never changed.
-      if (current.status === "Draft" && lineSignature(current.lines) !== lineSignature(group.lines)) updatedImportKeys.add(importKey);
+      if (current.status === "Draft" && (lineSignature(current.lines) !== lineSignature(group.lines) || (supplierIndex >= 0 && compact(current.supplier) !== compact(group.supplier)))) updatedImportKeys.add(importKey);
     });
     const purchases = existing.map((purchase) => updatedImportKeys.has(purchase.importKey || "")
-      ? { ...purchase, lines: groups.get(purchase.importKey || "")?.lines || purchase.lines }
+      ? { ...purchase, supplier: groups.get(purchase.importKey || "")?.supplier ?? purchase.supplier, lines: groups.get(purchase.importKey || "")?.lines || purchase.lines }
       : purchase,
     ).concat(imported);
-    if (imported.length || updatedImportKeys.size) {
-      const { error: updateError } = await db.from("crm_workspaces").update({ data: { ...workspaceData, purchases }, updated_at: new Date().toISOString() }).eq("owner_id", ownerId);
+    const existingSuppliers = Array.isArray(workspaceData.suppliers) ? workspaceData.suppliers : [];
+    const supplierNames = new Set(existingSuppliers.map((supplier) => compact(supplier.name)));
+    const newSuppliers: Supplier[] = [];
+    purchases.forEach((purchase, index) => {
+      const name = purchase.supplier.trim();
+      if (!name || supplierNames.has(compact(name))) return;
+      supplierNames.add(compact(name));
+      newSuppliers.push({ id: Date.now() + index, name, contact: "", phone: "", email: "", city: "", country: "", gstin: "", paymentTerms: "", notes: "Added from Product PO Sheet", status: "Active" });
+    });
+    const suppliers = [...existingSuppliers, ...newSuppliers];
+    if (imported.length || updatedImportKeys.size || newSuppliers.length) {
+      const { error: updateError } = await db.from("crm_workspaces").update({ data: { ...workspaceData, purchases, suppliers }, updated_at: new Date().toISOString() }).eq("owner_id", ownerId);
       if (updateError) throw updateError;
-      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched Product POs from Google Sheet", module: "Purchase Orders", details: `${imported.length} new PO(s) · ${updatedImportKeys.size} updated PO(s) · ${unmatched.length} unmatched SKU row(s)` });
+      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched Product POs from Google Sheet", module: "Purchase Orders", details: `${imported.length} new PO(s) · ${updatedImportKeys.size} updated PO(s) · ${newSuppliers.length} supplier(s) added · ${unmatched.length} unmatched SKU row(s)` });
     }
-    return Response.json({ purchases, imported: imported.length, updated: updatedImportKeys.size, unmatched: [...new Set(unmatched)], skipped: groups.size - imported.length - updatedImportKeys.size, sheet: tab });
+    return Response.json({ purchases, imported: imported.length, updated: updatedImportKeys.size, suppliersAdded: newSuppliers.length, unmatched: [...new Set(unmatched)], skipped: groups.size - imported.length - updatedImportKeys.size, sheet: tab });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "Could not fetch Product POs." }, { status: 400 });
   }

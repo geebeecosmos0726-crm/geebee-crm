@@ -73,7 +73,6 @@ export async function POST(request: Request) {
     const products = new Map((inventory || []).map((row: any) => [compact(row.data?.sku), row.data]));
     const workspaceData = (workspace.data || {}) as { purchases?: PurchaseOrder[]; suppliers?: unknown[] };
     const existing = Array.isArray(workspaceData.purchases) ? workspaceData.purchases : [];
-    const known = new Set(existing.map((purchase) => purchase.importKey).filter(Boolean));
     const groups = new Map<string, { date: string; lines: PurchaseLine[] }>();
     const unmatched: string[] = [];
     rows.slice(start).forEach((row) => {
@@ -88,18 +87,31 @@ export async function POST(request: Request) {
       groups.set(key, group);
     });
     const imported: PurchaseOrder[] = [];
+    const updatedImportKeys = new Set<string>();
+    const lineSignature = (lines: PurchaseLine[]) => lines.map((line) => `${compact(line.sku)}:${line.quantity}:${compact(line.product)}`).join("|");
+    const byImportKey = new Map(existing.map((purchase) => [purchase.importKey, purchase]));
     groups.forEach((group, importKey) => {
-      if (known.has(importKey)) return;
-      const prefix = dateKey(group.date);
-      imported.push({ id: nextId(prefix, [...existing, ...imported]), supplier: "", status: "Draft", expectedDate: "", createdAt: new Date().toISOString().slice(0, 10), notes: `Imported from Product PO Sheet · ${group.date}`, lines: group.lines, importKey });
+      const current = byImportKey.get(importKey);
+      if (!current) {
+        const prefix = dateKey(group.date);
+        imported.push({ id: nextId(prefix, [...existing, ...imported]), supplier: "", status: "Draft", expectedDate: "", createdAt: new Date().toISOString().slice(0, 10), notes: `Imported from Product PO Sheet · ${group.date}`, lines: group.lines, importKey });
+        return;
+      }
+      // The sheet remains the source for draft Product POs. This lets a user
+      // append rows (or correct quantities) and fetch again without creating
+      // a second PO for the same date. Received/cancelled POs are never changed.
+      if (current.status === "Draft" && lineSignature(current.lines) !== lineSignature(group.lines)) updatedImportKeys.add(importKey);
     });
-    const purchases = [...existing, ...imported];
-    if (imported.length) {
+    const purchases = existing.map((purchase) => updatedImportKeys.has(purchase.importKey || "")
+      ? { ...purchase, lines: groups.get(purchase.importKey || "")?.lines || purchase.lines }
+      : purchase,
+    ).concat(imported);
+    if (imported.length || updatedImportKeys.size) {
       const { error: updateError } = await db.from("crm_workspaces").update({ data: { ...workspaceData, purchases }, updated_at: new Date().toISOString() }).eq("owner_id", ownerId);
       if (updateError) throw updateError;
-      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched Product POs from Google Sheet", module: "Purchase Orders", details: `${imported.length} new PO(s) · ${unmatched.length} unmatched SKU row(s)` });
+      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched Product POs from Google Sheet", module: "Purchase Orders", details: `${imported.length} new PO(s) · ${updatedImportKeys.size} updated PO(s) · ${unmatched.length} unmatched SKU row(s)` });
     }
-    return Response.json({ purchases, imported: imported.length, unmatched: [...new Set(unmatched)], skipped: groups.size - imported.length, sheet: tab });
+    return Response.json({ purchases, imported: imported.length, updated: updatedImportKeys.size, unmatched: [...new Set(unmatched)], skipped: groups.size - imported.length - updatedImportKeys.size, sheet: tab });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "Could not fetch Product POs." }, { status: 400 });
   }

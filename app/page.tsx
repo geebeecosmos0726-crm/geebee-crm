@@ -1181,9 +1181,11 @@ export default function Home() {
       if (!response.ok) throw new Error(result?.error || "Could not fetch Product POs.");
       if (Array.isArray(result?.purchases)) setPurchases(result.purchases as PurchaseOrder[]);
       const unmatched = Array.isArray(result?.unmatched) ? result.unmatched : [];
-      if (Number(result?.imported || 0) > 0) {
-        logActivity("Fetched Product POs from Google Sheet", "Purchase Orders", `${result.imported} new PO(s)${unmatched.length ? ` · ${unmatched.length} unmatched SKU(s)` : ""}`);
-        flash(`${result.imported} Product PO${result.imported === 1 ? "" : "s"} imported.${unmatched.length ? ` ${unmatched.length} SKU${unmatched.length === 1 ? "" : "s"} need mapping.` : ""}`);
+      const imported = Number(result?.imported || 0);
+      const updated = Number(result?.updated || 0);
+      if (imported > 0 || updated > 0) {
+        logActivity("Fetched Product POs from Google Sheet", "Purchase Orders", `${imported} new PO(s) · ${updated} updated PO(s)${unmatched.length ? ` · ${unmatched.length} unmatched SKU(s)` : ""}`);
+        flash(`${imported ? `${imported} Product PO${imported === 1 ? "" : "s"} imported` : ""}${imported && updated ? "; " : ""}${updated ? `${updated} existing draft PO${updated === 1 ? "" : "s"} updated` : ""}.${unmatched.length ? ` ${unmatched.length} SKU${unmatched.length === 1 ? "" : "s"} need mapping.` : ""}`);
       } else {
         flash(`No new Product POs found.${unmatched.length ? ` Unmatched SKUs: ${unmatched.slice(0, 5).join(", ")}${unmatched.length > 5 ? "…" : ""}` : ""}`);
       }

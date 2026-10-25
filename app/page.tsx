@@ -67,7 +67,7 @@ type QuoteProduct = ProductLine & { discount: number };
 type CatalogueItem = { id: number; name: string; sku: string; unitPrice: number; category: string; image: string; description: string; cartonQty: string; innerQty?: string; outerQty?: string; subCategory?: string; brand?: string; unit?: string; packSize?: string; moq?: number; purchasePrice?: number; wholesalePrice?: number; distributorPrice?: number; gst?: number; barcode?: string; weight?: string; dimensions?: string; supplier?: string; countryOfOrigin?: string; availableQuantity?: number; openingStock?: number; purchasedStock?: number; orderedStock?: number; damagedStock?: number; reservedStock?: number; reorderThreshold?: number };
 type InventoryReconciliation = { sourceLabel: string; quantity: number; status: "matched" | "unmatched" | "ambiguous"; sku?: string; name?: string; currentAvailable?: number; candidates?: string[] };
 type PurchaseLine = { sku: string; product: string; quantity: number; receivedQuantity: number };
-type PurchaseOrder = { id: string; supplier: string; status: "Draft" | "Ordered" | "Part received" | "Delivered" | "Cancelled"; expectedDate: string; createdAt: string; notes: string; lines: PurchaseLine[] };
+type PurchaseOrder = { id: string; supplier: string; status: "Draft" | "Ordered" | "Part received" | "Delivered" | "Cancelled"; expectedDate: string; createdAt: string; notes: string; lines: PurchaseLine[]; importKey?: string };
 type ClientSpecialRate = { sku: string; rate: number };
 const crmModules = ["Dashboard", "Customers", "Enquiries", "Daily Tasks", "Sales", "Products", "Inventory", "Operations", "Fulfilment", "Billing", "Imports", "Reports", "Automation", "Settings"] as const;
 type CrmModule = typeof crmModules[number];
@@ -832,6 +832,7 @@ export default function Home() {
     [modal, setModal] = useState<"order" | "orderView" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | null>(null),
     [editing, setEditing] = useState<any>(null),
     [toast, setToast] = useState("");
+  const [productPoLoading, setProductPoLoading] = useState(false);
   const [dashboardClock, setDashboardClock] = useState<number | null>(null);
   useEffect(() => {
     const refreshClock = () => setDashboardClock(Date.now());
@@ -1168,6 +1169,30 @@ export default function Home() {
     logActivity("Received purchase order", "Purchase Orders", `${purchase.id} · ${receivedTotal} unit(s) received.${backorderNote}`);
     flash(`${purchase.id} marked delivered for the received quantity.${backorderNote} Update the Stock Master Sheet, then sync Product / SKUs.`);
   };
+  const fetchProductPurchaseOrders = async () => {
+    if (!session?.access_token || productPoLoading) return;
+    setProductPoLoading(true);
+    try {
+      const response = await fetch("/api/import/google-product-purchase-orders", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result?.error || "Could not fetch Product POs.");
+      if (Array.isArray(result?.purchases)) setPurchases(result.purchases as PurchaseOrder[]);
+      const unmatched = Array.isArray(result?.unmatched) ? result.unmatched : [];
+      if (Number(result?.imported || 0) > 0) {
+        logActivity("Fetched Product POs from Google Sheet", "Purchase Orders", `${result.imported} new PO(s)${unmatched.length ? ` · ${unmatched.length} unmatched SKU(s)` : ""}`);
+        flash(`${result.imported} Product PO${result.imported === 1 ? "" : "s"} imported.${unmatched.length ? ` ${unmatched.length} SKU${unmatched.length === 1 ? "" : "s"} need mapping.` : ""}`);
+      } else {
+        flash(`No new Product POs found.${unmatched.length ? ` Unmatched SKUs: ${unmatched.slice(0, 5).join(", ")}${unmatched.length > 5 ? "…" : ""}` : ""}`);
+      }
+    } catch (error) {
+      flash(error instanceof Error ? error.message : "Could not fetch Product POs.");
+    } finally {
+      setProductPoLoading(false);
+    }
+  };
   const cancelOrder = (order: Order) => {
     if (!window.confirm(`Cancel ${order.id}? Its allocated stock will be released back to available inventory.`)) return;
     const isAdvance = order.status === "Advance order";
@@ -1479,7 +1504,10 @@ export default function Home() {
           {section === "Follow-ups" && <button className="primary" onClick={() => show("task")}><Plus size={18}/> New task</button>}
           {section === "Quotations" && <button className="primary" onClick={() => show("quote")}><Plus size={18}/> New quotation</button>}
           {section === "Suppliers" && <button className="primary" onClick={() => show("supplier")}><Plus size={18}/> Add supplier</button>}
-          {section === "Purchase Orders" && <button className="primary" onClick={() => show("purchase")}><Plus size={18}/> New purchase order</button>}
+          {section === "Purchase Orders" && <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {isAdmin && <button className="outline" type="button" disabled={productPoLoading} onClick={fetchProductPurchaseOrders}><Download size={17}/>{productPoLoading ? "Fetching…" : "Fetch Product POs"}</button>}
+            <button className="primary" onClick={() => show("purchase")}><Plus size={18}/> New purchase order</button>
+          </div>}
         </div>
         {section === "Overview" && (
           <Overview

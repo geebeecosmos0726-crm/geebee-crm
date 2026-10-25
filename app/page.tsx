@@ -829,7 +829,7 @@ export default function Home() {
     [notificationsOpen, setNotificationsOpen] = useState(false),
     [shortcutsOpen, setShortcutsOpen] = useState(false),
     [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({ Customers: true, "Leads & Enquiries": true, Sales: true, Products: true, Inventory: true, Operations: true, Billing: true, Imports: true, Reports: true, Automation: true, Settings: true }),
-    [modal, setModal] = useState<"order" | "orderView" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | null>(null),
+    [modal, setModal] = useState<"order" | "orderView" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | "purchaseReceive" | null>(null),
     [editing, setEditing] = useState<any>(null),
     [toast, setToast] = useState("");
   const [productPoLoading, setProductPoLoading] = useState(false);
@@ -866,7 +866,7 @@ export default function Home() {
       setToast(m);
       setTimeout(() => setToast(""), 2600);
     },
-    show = (k: "order" | "orderView" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase", d?: any) => {
+    show = (k: "order" | "orderView" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | "purchaseReceive", d?: any) => {
       setEditing(d || null);
       setModal(k);
     };
@@ -1129,26 +1129,17 @@ export default function Home() {
   const activeTasks = visibleTasks.filter((task) => task.status === "Open");
   const receivePurchase = (purchase: PurchaseOrder) => {
     if (purchase.status === "Cancelled" || purchase.status === "Delivered") return;
-    const remaining = purchase.lines.filter((line) => Math.max(0, line.quantity - line.receivedQuantity) > 0);
-    if (!remaining.length) return;
-    const receivedBySku = new Map<string, number>();
-    for (const line of remaining) {
-      const outstanding = Math.max(0, line.quantity - line.receivedQuantity);
-      const input = window.prompt(`${line.sku} · ${line.product}\nOrdered: ${line.quantity.toLocaleString("en-IN")} · already received: ${line.receivedQuantity.toLocaleString("en-IN")}\nEnter quantity received now:`, String(outstanding));
-      if (input === null) return;
-      const quantity = Number(input);
-      if (!Number.isFinite(quantity) || quantity < 0 || quantity > outstanding) {
-        flash(`Enter a quantity from 0 to ${outstanding.toLocaleString("en-IN")} for ${line.sku}. Nothing was changed.`);
-        return;
-      }
-      receivedBySku.set(`${line.sku}::${line.product}`, quantity);
-    }
-    const updatedLines = purchase.lines.map((line) => ({ ...line, receivedQuantity: line.receivedQuantity + (receivedBySku.get(`${line.sku}::${line.product}`) || 0) }));
+    if (!purchase.lines.some((line) => Math.max(0, line.quantity - line.receivedQuantity) > 0)) return;
+    show("purchaseReceive", purchase);
+  };
+  const savePurchaseReceipt = (purchase: PurchaseOrder, receivedNow: number[]) => {
+    if (purchase.status === "Cancelled" || purchase.status === "Delivered") return;
+    const updatedLines = purchase.lines.map((line, index) => ({ ...line, receivedQuantity: line.receivedQuantity + (receivedNow[index] || 0) }));
     const backorderLines = updatedLines.flatMap((line) => {
       const quantity = Math.max(0, line.quantity - line.receivedQuantity);
       return quantity ? [{ sku: line.sku, product: line.product, quantity, receivedQuantity: 0 }] : [];
     });
-    const receivedTotal = [...receivedBySku.values()].reduce((sum, quantity) => sum + quantity, 0);
+    const receivedTotal = receivedNow.reduce((sum, quantity) => sum + quantity, 0);
     if (!receivedTotal) { flash("No quantity was received, so the purchase order was left unchanged."); return; }
     setPurchases((current) => {
       const received = { ...purchase, status: "Delivered" as const, lines: updatedLines };
@@ -1691,6 +1682,7 @@ export default function Home() {
       {modal === "transporter" && <TransporterModal transporter={editing} close={() => setModal(null)} save={(transporter) => { setTransporters((current) => editing ? current.map((item) => item.id === editing.id ? transporter : item) : [...current, transporter]); setModal(null); logActivity(editing ? "Updated transporter" : "Added transporter", "Transporters", transporter.name); flash(editing ? "Transporter updated" : "Transporter added"); }} />}
       {modal === "supplier" && <SupplierModal supplier={editing} close={() => setModal(null)} save={(supplier) => { setSuppliers((current) => editing ? current.map((item) => item.id === editing.id ? supplier : item) : [...current, supplier]); setModal(null); logActivity(editing ? "Updated supplier" : "Added supplier", "Suppliers", supplier.name); flash(editing ? "Supplier updated" : "Supplier added"); }} />}
       {modal === "purchase" && <PurchaseOrderModal purchase={editing?.id ? editing as PurchaseOrder : null} draft={editing?.lines ? editing : null} purchases={purchases} catalogue={catalogue} suppliers={suppliers} close={() => setModal(null)} save={(purchase) => { if (purchase.supplier.trim()) setSuppliers((current) => current.some((supplier) => supplier.name.trim().toLowerCase() === purchase.supplier.trim().toLowerCase()) ? current : [...current, { id: Date.now(), name: purchase.supplier.trim(), contact: "", phone: "", email: "", city: "", country: "", gstin: "", paymentTerms: "", notes: "", status: "Active" }]); setPurchases((current) => editing?.id ? current.map((item) => item.id === purchase.id ? purchase : item) : [...current, purchase]); setModal(null); logActivity(editing?.id ? "Updated purchase order" : "Created purchase order", "Purchase Orders", purchase.id); flash(editing?.id ? "Purchase order updated." : "Purchase order created. Stock will change only when it is received."); }} />}
+      {modal === "purchaseReceive" && editing?.id && <PurchaseReceiptModal purchase={editing as PurchaseOrder} close={() => { setModal(null); setEditing(null); }} save={(quantities) => { savePurchaseReceipt(editing as PurchaseOrder, quantities); setModal(null); setEditing(null); }}/>} 
       {toast && (
         <div className="toast">
           <PackageCheck size={18} />
@@ -1909,6 +1901,30 @@ function PurchaseOrderModal({ purchase, draft, purchases, catalogue, suppliers, 
     <button type="button" className="text-btn" onClick={addLine}>+ Add product line</button>
     <label>Notes<textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} placeholder="Supplier reference, freight notes or delivery instructions"/></label>
     <button className="primary modal-submit" type="button" onClick={savePurchase}>Save purchase order</button>
+  </Shell>;
+}
+function PurchaseReceiptModal({ purchase, close, save }: { purchase: PurchaseOrder; close: () => void; save: (quantities: number[]) => void }) {
+  const [received, setReceived] = useState<string[]>(() => purchase.lines.map(() => ""));
+  const update = (index: number, value: string) => setReceived((current) => current.map((quantity, lineIndex) => lineIndex === index ? value : quantity));
+  const submit = () => {
+    try {
+      const quantities = purchase.lines.map((line, index) => {
+        const raw = received[index]?.trim() || "0";
+        const amount = Number(raw);
+        const outstanding = Math.max(0, line.quantity - line.receivedQuantity);
+        if (!Number.isFinite(amount) || amount < 0 || amount > outstanding) throw new Error(`${line.sku}: enter a quantity from 0 to ${outstanding.toLocaleString("en-IN")}.`);
+        return amount;
+      });
+      if (!quantities.some(Boolean)) { window.alert("Enter the quantity received for at least one product."); return; }
+      save(quantities);
+    } catch (error) { window.alert(error instanceof Error ? error.message : "Check the received quantities."); }
+  };
+  return <Shell close={close}>
+    <div className="order-modal-head"><div className="modal-mark"><PackageCheck size={22}/></div><div><span className="overline">GOODS RECEIPT</span><h2>Receive purchase order {purchase.id}</h2><p>Enter the received quantity for each product separately. Remaining quantities will become a new backorder PO.</p></div></div>
+    <div className="purchase-receipt-lines">
+      {purchase.lines.map((line, index) => { const outstanding = Math.max(0, line.quantity - line.receivedQuantity); return <div className="purchase-receipt-line" key={`${line.sku}-${index}`}><div><b>{line.sku} · {line.product}</b><small>Ordered {line.quantity.toLocaleString("en-IN")} · previously received {line.receivedQuantity.toLocaleString("en-IN")} · remaining {outstanding.toLocaleString("en-IN")}</small></div><label>Receive now<input type="number" min="0" max={outstanding} value={received[index] || ""} onChange={(event) => update(index, event.target.value)} placeholder="0" disabled={outstanding === 0}/></label></div>; })}
+    </div>
+    <button className="primary modal-submit" type="button" onClick={submit}>Save individual receipt</button>
   </Shell>;
 }
 function TransportersPanel({ transporters, edit, add, remove }: { transporters: Transporter[]; edit: (item: Transporter) => void; add: () => void; remove: (ids: number[]) => void }) {

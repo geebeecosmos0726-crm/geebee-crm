@@ -367,29 +367,8 @@ const initials = (n: string) =>
     .join("")
     .slice(0, 2)
     .toUpperCase();
-const readDocumentText = async (file: File) => {
-  if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
-    if (file.size > 25 * 1024 * 1024) throw new Error("This PDF is over the 25 MB catalogue limit. Please split it into smaller files.");
-    let response: Response;
-    if (file.size > 3 * 1024 * 1024) {
-      if (!supabase) throw new Error("Cloud upload is not configured yet.");
-      const path = `pdf-imports/${crypto.randomUUID()}-${file.name.replace(/[^a-z0-9._-]/gi, "-")}`;
-      const { error: uploadError } = await supabase.storage.from("catalogue-imports").upload(path, file, { contentType: "application/pdf", upsert: false });
-      if (uploadError) throw new Error("Large PDF upload is not ready yet. Please run the latest Supabase setup script, then try again.");
-      const { data, error: linkError } = await supabase.storage.from("catalogue-imports").createSignedUrl(path, 600);
-      if (linkError || !data?.signedUrl) throw new Error("A secure link for this PDF could not be created.");
-      response = await fetch("/api/pdf-text", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sourceUrl: data.signedUrl }) });
-    } else {
-      const form = new FormData();
-      form.append("file", file);
-      response = await fetch("/api/pdf-text", { method: "POST", body: form });
-    }
-    const raw = await response.text();
-    let result: { text?: string; error?: string } = {};
-    try { result = JSON.parse(raw); } catch { throw new Error(response.status === 413 ? "This PDF is over the online upload limit. Please use the large-file import after running the Supabase setup script." : "The PDF service returned an unexpected response. Please try again."); }
-    if (!response.ok) throw new Error(result.error || "The PDF could not be read.");
-    return result.text as string;
-  }
+const readOrderImageText = async (file: File) => {
+  if (!file.type.startsWith("image/")) throw new Error("Upload a clear image file.");
   const { recognize } = await import("tesseract.js");
   return (await recognize(file, "eng")).data.text;
 };
@@ -2961,7 +2940,7 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     const capture = document.querySelector(".document-capture");
     if (!capture) return;
     const label = document.createElement("label"); label.className = "upload-button"; label.innerHTML = "<span>Upload multiple order photos</span>";
-    const input = document.createElement("input"); input.type = "file"; input.accept = "image/*,application/pdf"; input.multiple = true;
+    const input = document.createElement("input"); input.type = "file"; input.accept = "image/*"; input.multiple = true;
     input.onchange = () => scanDocuments(input.files);
     label.append(input); capture.append(label);
     return () => label.remove();
@@ -3078,10 +3057,10 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     });
   }, [products]);
   const scanDocument = async (file: File, append = false) => {
-    setPreview((file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) ? "" : URL.createObjectURL(file)); setScanState("scanning"); setScanNote("Reading document and finding product lines…");
+    setPreview(URL.createObjectURL(file)); setScanState("scanning"); setScanNote("Reading image and finding product lines…");
     try {
       const recognisedSheet = await readInternalOrderSheetImage(file);
-      const rawText = recognisedSheet ? "" : await readDocumentText(file);
+      const rawText = recognisedSheet ? "" : await readOrderImageText(file);
       const internalSheet = recognisedSheet || parseInternalOrderSheet(rawText);
       if (internalSheet) {
         const matchedClient = clients.find((client) => client.name.trim().toLowerCase() === internalSheet.client.trim().toLowerCase());
@@ -3157,7 +3136,6 @@ function CataloguePanel({ items, edit, duplicate, addDrafts, setAllOpeningStock,
   const [scanState, setScanState] = useState<"idle" | "scanning" | "ready" | "error">("idle");
   const [notice, setNotice] = useState("");
   const [selected, setSelected] = useState<number[]>([]);
-  const [pendingPdf, setPendingPdf] = useState<{ drafts: CatalogueItem[]; pages: number } | null>(null);
   const toggleSelected = (id: number) => setSelected((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]);
   const toggleAll = () => setSelected((current) => current.length === items.length ? [] : items.map((item) => item.id));
   useEffect(() => {
@@ -3189,40 +3167,16 @@ function CataloguePanel({ items, edit, duplicate, addDrafts, setAllOpeningStock,
   };
   const importCatalogueImage = async (file?: File) => {
     if (!file) return;
-    setScanState("scanning"); setNotice("Reading SKU IDs from your catalogue document…");
+    setScanState("scanning"); setNotice("Reading SKU IDs from your catalogue image…");
     try {
-      const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
-      if (isPdf) {
-        if (file.size > 25 * 1024 * 1024) throw new Error("This PDF is over the 25 MB catalogue limit. Please split it into smaller files.");
-        let response: Response;
-        if (file.size > 3 * 1024 * 1024) {
-          if (!supabase) throw new Error("Cloud upload is not configured yet.");
-          const path = `pdf-imports/${crypto.randomUUID()}-${file.name.replace(/[^a-z0-9._-]/gi, "-")}`;
-          const { error: uploadError } = await supabase.storage.from("catalogue-imports").upload(path, file, { contentType: "application/pdf", upsert: false });
-          if (uploadError) throw new Error("Large PDF upload is not ready yet. Please run the latest Supabase setup script, then try again.");
-          const { data, error: linkError } = await supabase.storage.from("catalogue-imports").createSignedUrl(path, 600);
-          if (linkError || !data?.signedUrl) throw new Error("A secure link for this PDF could not be created.");
-          response = await fetch("/api/pdf-text", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sourceUrl: data.signedUrl }) });
-        } else { const form = new FormData(); form.append("file", file); response = await fetch("/api/pdf-text", { method: "POST", body: form }); }
-        const raw = await response.text();
-        let result: { products?: Omit<CatalogueItem, "id">[]; pages?: number; error?: string } = {};
-        try { result = JSON.parse(raw); } catch { throw new Error(response.status === 413 ? "This PDF is over the online upload limit. Please run the Supabase setup script for large-file imports." : "The PDF service returned an unexpected response. Please try again."); }
-        if (!response.ok) throw new Error(result.error || "The catalogue PDF could not be read.");
-        if (!result.products?.length) throw new Error("No product records were found in this catalogue PDF.");
-        const drafts = result.products.map((product: Omit<CatalogueItem, "id">, index: number) => ({ ...product, availableQuantity: product.availableQuantity ?? 10000, id: Date.now() + index }));
-        setPendingPdf({ drafts, pages: result.pages || 0 });
-        setScanState("ready"); setNotice(`${drafts.length} products read from the PDF. Review them before saving.`);
-        return;
-      }
-      const text = await readDocumentText(file);
+      const text = await readOrderImageText(file);
       const skus = [...new Set((text.toUpperCase().match(/\b[A-Z]{1,4}[- ]?\d{2,8}\b/g) || []).map((sku) => sku.replace(" ", "-")))];
       if (!skus.length) throw new Error("No SKUs found");
-      const image = (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) ? "" : await fileToDataUrl(file);
+      const image = await fileToDataUrl(file);
       addDrafts(skus.map((sku, index) => ({ id: Date.now() + index, sku, name: `New product — ${sku}`, description: "", cartonQty: "", unitPrice: 0, category: "Uncategorised", image, availableQuantity: 10000 })));
       setScanState("ready"); setNotice(`${skus.length} SKU draft${skus.length === 1 ? "" : "s"} added. Open each card to add its product name and price.`);
     } catch (error) { setScanState("error"); setNotice(error instanceof Error ? error.message : "The catalogue file could not be read."); }
   };
-  if (pendingPdf) return <CatalogueImportReview drafts={pendingPdf.drafts} pages={pendingPdf.pages} confirm={() => { addDrafts(pendingPdf.drafts); setPendingPdf(null); setNotice("Catalogue import confirmed. Matching SKUs were updated and missing SKUs were added."); }} cancel={() => { setPendingPdf(null); setScanState("idle"); setNotice(""); }} />;
   return <section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT LIBRARY</span><h2>Your catalogue, ready for order matching.</h2><p>Upload individual product photos, or scan a complete catalogue image or PDF to create SKU drafts quickly.</p></div><div className="catalogue-count"><b>{items.length}</b><span>active SKUs</span></div></div><section className="catalogue-actions"><label className="catalogue-scan"><div className="scan-orb"><ScanText size={20}/></div><div><b>Scan catalogue image or PDF</b><p>Read SKU IDs from a complete catalogue page.</p></div><span className="scan-cta">Upload file <ImagePlus size={14}/></span><input type="file" accept="image/*,application/pdf" onChange={(e) => importCatalogueImage(e.target.files?.[0])} disabled={scanState === "scanning"}/></label><div className="catalogue-tip"><b>How it works</b><p>Catalogue SKUs are matched automatically when you scan an incoming order image or PDF.</p></div></section>{scanState !== "idle" && <div className={`catalogue-notice ${scanState}`}><ScanText size={16}/>{notice}</div>}<div className="catalogue-toolbar"><div><h3>Products</h3><span>{items.length} shown</span></div><div className="catalogue-toolbar-actions"><button type="button" className="bulk-delete" onClick={downloadProductExcel}><Download size={14}/> Download Excel</button><button type="button" className="bulk-delete" onClick={() => setAllOpeningStock(10000)}>Set all available: 10,000</button><button type="button" className="bulk-delete" onClick={() => setAllOpeningStock(20000)}>Set all available: 20,000</button>{selected.length > 0 && <button type="button" className="bulk-delete" onClick={removeSelected}><Trash2 size={14}/> Remove {selected.length} selected</button>}<span>Click a product to edit it, duplicate it, or select products to remove.</span></div></div><section className="catalogue-grid">{items.map((item) => <article className="catalogue-card" key={item.id} onClick={() => edit(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={catalogueName(item)} onError={(event) => { event.currentTarget.style.display = "none"; }} /> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><div className="catalogue-card-heading"><label className="catalogue-select" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected.includes(item.id)} onChange={() => toggleSelected(item.id)} aria-label={`Select ${catalogueName(item)}`}/><span>Select</span></label><small title={catalogueSku(item)}>{catalogueSku(item)}</small></div><h3 title={catalogueName(item)}>{catalogueName(item)}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / pc` : "Price to be added"}</p><p className="catalogue-stock">Available: <b>{availableStock(item).toLocaleString("en-IN")}</b></p><div className="catalogue-card-actions"><button type="button" className="edit-product"><Pencil size={13}/> Edit product</button><button type="button" className="edit-product" onClick={(event) => { event.stopPropagation(); duplicate(item); }}><Copy size={13}/> Duplicate</button><button type="button" className="delete-product" onClick={(event) => { event.stopPropagation(); removeOne(item); }}><Trash2 size={13}/> Remove</button></div></div></article>)}{!items.length && <div className="empty">No catalogue products match your search.</div>}</section></section>;
 }
 function CatalogueModal({ item, close, save }: { item: CatalogueItem | null; close: () => void; save: (item: CatalogueItem) => void }) {

@@ -816,7 +816,7 @@ export default function Home() {
     [notificationsOpen, setNotificationsOpen] = useState(false),
     [shortcutsOpen, setShortcutsOpen] = useState(false),
     [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({ Customers: true, "Leads & Enquiries": true, Sales: true, Products: true, Inventory: true, Operations: true, Billing: true, Imports: true, Reports: true, Automation: true, Settings: true }),
-    [modal, setModal] = useState<"order" | "orderView" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | "purchaseReceive" | null>(null),
+    [modal, setModal] = useState<"order" | "orderView" | "orderDetails" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | "purchaseView" | "purchaseReceive" | null>(null),
     [editing, setEditing] = useState<any>(null),
     [toast, setToast] = useState("");
   const [productPoLoading, setProductPoLoading] = useState(false);
@@ -853,10 +853,20 @@ export default function Home() {
       setToast(m);
       setTimeout(() => setToast(""), 2600);
     },
-    show = (k: "order" | "orderView" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | "purchaseReceive", d?: any) => {
+    show = (k: "order" | "orderView" | "orderDetails" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | "purchaseView" | "purchaseReceive", d?: any) => {
       setEditing(d || null);
       setModal(k);
     };
+  useEffect(() => {
+    const openOrder = (event: Event) => show("orderDetails", (event as CustomEvent<Order>).detail);
+    const openPurchase = (event: Event) => show("purchaseView", (event as CustomEvent<PurchaseOrder>).detail);
+    window.addEventListener("geebee:view-order", openOrder);
+    window.addEventListener("geebee:view-purchase", openPurchase);
+    return () => {
+      window.removeEventListener("geebee:view-order", openOrder);
+      window.removeEventListener("geebee:view-purchase", openPurchase);
+    };
+  }, []);
   const refreshPanel = () => {
     // A full refresh re-reads the cloud workspace and the current Product / SKU
     // Stock Master without asking the user to use browser controls.
@@ -1415,6 +1425,7 @@ export default function Home() {
     if (!isViewOnly) return;
     const target = event.target as HTMLElement;
     if (target.closest(".search")) return;
+    if (target.closest("[data-view-action]")) return;
     if (target.closest("button, input, select, textarea")) { event.preventDefault(); event.stopPropagation(); flash("You have view-only access to this module. Ask an administrator for edit access."); }
   };
   if (!authReady) return <div className="auth-screen"><div className="auth-card"><b>Opening secure workspace…</b></div></div>;
@@ -1644,6 +1655,7 @@ export default function Home() {
         />
       )}
       {modal === "orderView" && editing && <OrderViewModal order={editing as Order} close={() => setModal(null)} />}
+      {modal === "orderDetails" && editing && <OrderDetailsModal order={editing as Order} close={() => setModal(null)} />}
       {modal === "client" && (
         <ClientModal
           client={editing}
@@ -1702,6 +1714,7 @@ export default function Home() {
       {modal === "transporter" && <TransporterModal transporter={editing} close={() => setModal(null)} save={(transporter) => { setTransporters((current) => editing ? current.map((item) => item.id === editing.id ? transporter : item) : [...current, transporter]); setModal(null); logActivity(editing ? "Updated transporter" : "Added transporter", "Transporters", transporter.name); flash(editing ? "Transporter updated" : "Transporter added"); }} />}
       {modal === "supplier" && <SupplierModal supplier={editing} close={() => setModal(null)} save={(supplier) => { setSuppliers((current) => editing ? current.map((item) => item.id === editing.id ? supplier : item) : [...current, supplier]); setModal(null); logActivity(editing ? "Updated supplier" : "Added supplier", "Suppliers", supplier.name); flash(editing ? "Supplier updated" : "Supplier added"); }} />}
       {modal === "purchase" && <PurchaseOrderModal purchase={editing?.id ? editing as PurchaseOrder : null} draft={editing?.lines ? editing : null} purchases={purchases} catalogue={catalogue} suppliers={suppliers} close={() => setModal(null)} save={(purchase) => { if (purchase.supplier.trim()) setSuppliers((current) => current.some((supplier) => supplier.name.trim().toLowerCase() === purchase.supplier.trim().toLowerCase()) ? current : [...current, { id: Date.now(), name: purchase.supplier.trim(), contact: "", phone: "", email: "", city: "", country: "", gstin: "", paymentTerms: "", notes: "", status: "Active" }]); setPurchases((current) => editing?.id ? current.map((item) => item.id === purchase.id ? purchase : item) : [...current, purchase]); setModal(null); logActivity(editing?.id ? "Updated purchase order" : "Created purchase order", "Purchase Orders", purchase.id); flash(editing?.id ? "Purchase order updated." : "Purchase order created. Stock will change only when it is received."); }} />}
+      {modal === "purchaseView" && editing?.id && <PurchaseOrderViewModal purchase={editing as PurchaseOrder} close={() => setModal(null)} />}
       {modal === "purchaseReceive" && editing?.id && <PurchaseReceiptModal purchase={editing as PurchaseOrder} close={() => { setModal(null); setEditing(null); }} save={(quantities) => { savePurchaseReceipt(editing as PurchaseOrder, quantities); setModal(null); setEditing(null); }}/>} 
       {toast && (
         <div className="toast">
@@ -1885,6 +1898,25 @@ function PurchaseOrdersPanel({ purchases, catalogue, lowStockProducts, add, edit
     filled.onclick = () => show("filled");
     show("ongoing");
     return () => tabs.remove();
+  }, [purchases]);
+  useEffect(() => {
+    const title = Array.from(document.querySelectorAll<HTMLElement>(".purchase-panel h2")).find((heading) => heading.textContent?.trim() === "Purchase order register");
+    const table = title?.closest<HTMLElement>(".purchase-panel")?.querySelector("table");
+    if (!table) return;
+    const buttons = Array.from(table.querySelectorAll<HTMLTableRowElement>("tbody tr")).map((row, index) => {
+      const purchase = purchases[index];
+      const actions = row.querySelector<HTMLElement>(".purchase-actions");
+      if (!purchase || !actions) return null;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "text-btn";
+      button.textContent = "View";
+      button.dataset.viewAction = "";
+      button.onclick = () => window.dispatchEvent(new CustomEvent("geebee:view-purchase", { detail: purchase }));
+      actions.prepend(button);
+      return button;
+    });
+    return () => buttons.forEach((button) => button?.remove());
   }, [purchases]);
   return <section className="purchasing-page"><div className="purchase-metrics"><article><span>LOW STOCK ALERTS</span><b>{lowStockProducts.length}</b><small>SKU(s) at or below threshold</small></article><article><span>OPEN PURCHASE ORDERS</span><b>{open.length}</b><small>{pendingUnits.toLocaleString("en-IN")} units awaiting delivery</small></article><article><span>CATALOGUE COVERAGE</span><b>{catalogue.filter((product) => (product.reorderThreshold || 0) > 0).length}</b><small>SKU(s) with reorder limits</small></article></div><section className="panel purchase-panel"><div className="panel-head"><div><span className="overline">REORDER QUEUE</span><h2>Low-stock products</h2><p>Set the required quantity and create a supplier purchase order before stock runs out.</p></div><button className="outline purchase-new" onClick={() => add()}><Plus size={15}/> New purchase order</button></div>{lowStockProducts.length ? <div className="table-wrap"><table><thead><tr><th>PRODUCT / SKU</th><th>SUPPLIER</th><th>AVAILABLE</th><th>ALERT AT</th><th>RECOMMENDED ORDER</th><th></th></tr></thead><tbody>{lowStockProducts.map((product) => <tr key={product.id}><td><b>{catalogueName(product)}</b><small className="purchase-sku">{catalogueSku(product)}</small></td><td>{product.supplier || "Supplier not set"}</td><td className="purchase-danger">{availableStock(product).toLocaleString("en-IN")}</td><td>{(product.reorderThreshold || 0).toLocaleString("en-IN")}</td><td>{Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)).toLocaleString("en-IN")}</td><td><button className="text-btn" onClick={() => add(product)}>Create PO <span>→</span></button></td></tr>)}</tbody></table></div> : <div className="purchase-empty"><PackageCheck size={23}/><b>Inventory is healthy</b><span>Products with a threshold will appear here when stock reaches that limit.</span></div>}</section><section className="panel purchase-panel"><div className="panel-head"><div><span className="overline">PURCHASING</span><h2>Purchase order register</h2><p>Stock is added only after you mark a delivery as received.</p></div></div>{purchases.length ? <div className="table-wrap"><table><thead><tr><th>PO NUMBER</th><th>SUPPLIER</th><th>PRODUCTS</th><th>ORDERED</th><th>RECEIVED</th><th>EXPECTED</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody>{purchases.map((purchase) => { const ordered = purchase.lines.reduce((sum, line) => sum + line.quantity, 0); const received = purchase.lines.reduce((sum, line) => sum + receivedPurchaseQuantity(line), 0); return <tr key={purchase.id}><td><b>{purchase.id}</b></td><td>{purchase.supplier || "Not assigned"}</td><td>{purchase.lines.map((line) => line.sku).join(", ")}</td><td>{ordered.toLocaleString("en-IN")}</td><td>{received.toLocaleString("en-IN")}</td><td>{purchase.expectedDate || "—"}</td><td><Pill value={purchase.status}/></td><td className="purchase-actions"><button className="text-btn" onClick={() => edit(purchase)}>Edit</button>{!["Delivered", "Cancelled"].includes(purchase.status) && <button className="text-btn" onClick={() => receive(purchase)}>Receive</button>}{purchase.status === "Draft" && <button className="text-btn" onClick={() => cancel(purchase)}>Cancel</button>}<button className="row-delete" type="button" onClick={() => remove(purchase)} aria-label={`Delete ${purchase.id}`}><Trash2 size={14}/> Delete</button><button className="whatsapp-action" type="button" onClick={() => window.open(`https://wa.me/?text=${encodeURIComponent(`GeeBee Purchase Order ${purchase.id}\nSupplier: ${purchase.supplier || "Not assigned"}\nProducts: ${purchase.lines.map((line) => `${line.sku} × ${line.quantity}`).join(", ")}`)}`, "_blank", "noopener,noreferrer")}>WA</button></td></tr>; })}</tbody></table></div> : <div className="purchase-empty"><ClipboardList size={23}/><b>No purchase orders yet</b><span>Create one from a low-stock alert or use New purchase order.</span></div>}</section></section>;
 }
@@ -2111,7 +2143,7 @@ function OrderTable({
               {!compact && <td><span className="order-entry-source" title="Packing instructions">{packingInstructions(o) || "—"}</span></td>}
               {showDispatchDetails && <td><span className="order-entry-source" title="Product remarks">{linesFor(o).map((line) => line.remarks?.trim()).filter(Boolean).join(" · ") || "—"}</span></td>}
               <td>
-                <div className="record-actions">{view && <button className="outline" type="button" onClick={() => view(o)}>View</button>}{confirm && o.status === "Draft" && <button className="dispatch-action" type="button" onClick={() => confirm(o)}>Confirm order</button>}{returnToOrders && (o.status === "Confirmed" || o.status === "Dispatch plan") && <button className="outline" type="button" onClick={() => returnToOrders(o)}>{returnLabel}</button>}{pushToDispatch && o.status === "Confirmed" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{advance && <button className="dispatch-action" type="button" onClick={() => advance(o)}>{advanceLabel || "Continue"}</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>{whatsAppLabel || "WA"}</button>}{readOnly && !hidePrint && <button className="outline" type="button" onClick={() => window.print()}>Print</button>}{!readOnly && <button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>}{!readOnly && cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{!readOnly && selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
+                <div className="record-actions">{view ? <button className="outline" type="button" data-view-action onClick={() => view(o)}>View</button> : <button className="outline" type="button" data-view-action onClick={() => window.dispatchEvent(new CustomEvent("geebee:view-order", { detail: o }))}>View</button>}{confirm && o.status === "Draft" && <button className="dispatch-action" type="button" onClick={() => confirm(o)}>Confirm order</button>}{returnToOrders && (o.status === "Confirmed" || o.status === "Dispatch plan") && <button className="outline" type="button" onClick={() => returnToOrders(o)}>{returnLabel}</button>}{pushToDispatch && o.status === "Confirmed" && <button className="dispatch-action" type="button" onClick={() => pushToDispatch(o)}>Dispatch plan</button>}{advance && <button className="dispatch-action" type="button" onClick={() => advance(o)}>{advanceLabel || "Continue"}</button>}{sendWhatsApp && <button className="whatsapp-action" type="button" onClick={() => sendWhatsApp(o)} aria-label={`Send WhatsApp confirmation for ${o.id}`}>{whatsAppLabel || "WA"}</button>}{readOnly && !hidePrint && <button className="outline" type="button" onClick={() => window.print()}>Print</button>}{!readOnly && <button className="edit-btn" onClick={() => edit(o)} aria-label={`Edit ${o.id}`}><Pencil size={14} /></button>}{!readOnly && cancel && o.status !== "Cancelled" && <button className="row-delete" type="button" onClick={() => cancel(o)} aria-label={`Cancel ${o.id}`}>Cancel</button>}{!readOnly && selectable && <button className="row-delete" type="button" onClick={() => removeOne(o)} aria-label={`Remove ${o.id}`}><Trash2 size={14}/></button>}</div>
               </td>
             </tr>
           ))}
@@ -2124,6 +2156,15 @@ function OrderTable({
 function OrderViewModal({ order, close }: { order: Order; close: () => void }) {
   const lines = linesFor(order);
   return <Shell close={close} printDocument><section className="dispatch-print-document"><div className="order-modal-head"><div className="modal-mark"><PackageCheck size={22}/></div><div><span className="overline">DISPATCH ORDER · {order.id}</span><h2 className="dispatch-customer-name">{order.client}</h2><p>{order.city || "—"}{order.transporter ? ` · ${order.transporter}` : ""}</p></div></div><div className="panel-head"><div><h3>Products to pack</h3></div><button className="outline dispatch-print-button" type="button" onClick={() => window.print()}>Print</button></div><div className="table-wrap"><table className="records dispatch-print-table"><thead><tr><th>SKU</th><th>PRODUCT</th><th>QTY</th><th>REMARKS</th></tr></thead><tbody>{lines.map((line, index) => <tr key={`${line.sku}-${index}`}><td><b>{line.sku}</b></td><td>{line.product}</td><td><b>{line.quantity.toLocaleString("en-IN")}</b></td><td>{line.remarks?.trim() || "—"}</td></tr>)}</tbody></table></div>{packingInstructions(order) && <p className="profile-empty dispatch-packing-note"><b>Packing:</b> {packingInstructions(order)}</p>}</section></Shell>;
+}
+function OrderDetailsModal({ order, close }: { order: Order; close: () => void }) {
+  const lines = linesFor(order);
+  return <Shell close={close} wide><div className="order-modal-head"><div className="modal-mark"><ClipboardList size={22}/></div><div><span className="overline">{order.status.toUpperCase()} ORDER · {order.id}</span><h2 className="dispatch-customer-name">{order.client || "Customer not assigned"}</h2><p>{[order.city, order.transporter].filter(Boolean).join(" · ") || "No city or transporter assigned"}</p></div></div><div className="form-row"><div className="profile-empty"><b>Status</b><br/><Pill value={order.status}/></div><div className="profile-empty"><b>Payment</b><br/><Pill value={order.payment}/></div><div className="profile-empty"><b>Expected arrival</b><br/>{order.eta ? new Date(order.eta).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—"}</div></div><div className="modal-section-title">Order products</div><div className="table-wrap"><table className="records"><thead><tr><th>SKU</th><th>PRODUCT</th><th>QTY</th><th>UNIT PRICE</th><th>AMOUNT</th><th>REMARKS</th></tr></thead><tbody>{lines.map((line, index) => <tr key={`${line.sku}-${index}`}><td><b>{line.sku || "—"}</b></td><td>{line.product || "—"}</td><td><b>{line.quantity.toLocaleString("en-IN")}</b></td><td>{money(line.unitPrice)}</td><td><b>{money(line.quantity * line.unitPrice)}</b></td><td>{line.remarks?.trim() || "—"}</td></tr>)}</tbody></table></div><div className="order-total"><span>Order total</span><b>{money(orderTotal(order))}</b></div>{packingInstructions(order) && <div className="profile-empty"><b>Packing</b><br/>{packingInstructions(order)}</div>}</Shell>;
+}
+function PurchaseOrderViewModal({ purchase, close }: { purchase: PurchaseOrder; close: () => void }) {
+  const ordered = purchase.lines.reduce((sum, line) => sum + line.quantity, 0);
+  const received = purchase.lines.reduce((sum, line) => sum + receivedPurchaseQuantity(line), 0);
+  return <Shell close={close} wide><div className="order-modal-head"><div className="modal-mark"><ShipWheel size={22}/></div><div><span className="overline">PURCHASE ORDER · {purchase.id}</span><h2>{purchase.supplier || "Supplier not assigned"}</h2><p>Created {purchase.createdAt ? new Date(purchase.createdAt).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—"}</p></div></div><div className="form-row"><div className="profile-empty"><b>Status</b><br/><Pill value={purchase.status}/></div><div className="profile-empty"><b>Ordered quantity</b><br/>{ordered.toLocaleString("en-IN")}</div><div className="profile-empty"><b>Received quantity</b><br/>{received.toLocaleString("en-IN")}</div></div><div className="modal-section-title">Products to receive</div><div className="table-wrap"><table className="records"><thead><tr><th>SKU</th><th>PRODUCT</th><th>ORDERED</th><th>RECEIVED</th><th>REMAINING</th></tr></thead><tbody>{purchase.lines.map((line, index) => { const lineReceived = receivedPurchaseQuantity(line); return <tr key={`${line.sku}-${index}`}><td><b>{line.sku || "—"}</b></td><td>{line.product || "—"}</td><td>{line.quantity.toLocaleString("en-IN")}</td><td>{lineReceived.toLocaleString("en-IN")}</td><td><b>{Math.max(0, line.quantity - lineReceived).toLocaleString("en-IN")}</b></td></tr>; })}</tbody></table></div>{purchase.notes && <div className="profile-empty"><b>Notes</b><br/>{purchase.notes}</div>}</Shell>;
 }
 function Clients({
   clients,

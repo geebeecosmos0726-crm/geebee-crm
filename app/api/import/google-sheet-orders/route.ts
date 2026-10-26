@@ -4,7 +4,7 @@ import { google } from "googleapis";
 export const runtime = "nodejs";
 
 type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; remarks?: string };
-type ImportedOrder = { id: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string };
+type ImportedOrder = { id: string; sourceSheetOrderId: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string };
 type CustomerIdentity = { name: string; city: string };
 
 const sheetId = process.env.GOOGLE_ORDER_IMPORT_SHEET_ID;
@@ -13,6 +13,12 @@ const key = (value: unknown) => String(value ?? "").trim().toLowerCase().replace
 const number = (value: unknown) => Number.parseFloat(String(value ?? "").replace(/₹|rs\.?/gi, "").replace(/[\s,]/g, "")) || 0;
 const initials = (value: string) => value.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join("").toUpperCase() || "CU";
 const quoteRange = (title: string) => `'${title.replace(/'/g, "''")}'!A:Z`;
+const nextFetchedDraftId = (orders: Array<{ record_id?: string; id?: string }>) => {
+  const suffix = String(new Date().getFullYear()).slice(-2);
+  const expression = new RegExp(`^E-(\\d+)/${suffix}$`, "i");
+  const next = orders.reduce((highest, order) => Math.max(highest, Number((order.record_id || order.id || "").match(expression)?.[1] || 0)), 0) + 1;
+  return `E-${String(next).padStart(3, "0")}/${suffix}`;
+};
 
 const citySuffixes = [
   "New Delhi", "Greater Noida", "Navi Mumbai", "Ahmedabad", "Bengaluru", "Bangalore", "Bhubaneswar", "Chandigarh", "Coimbatore", "Dehradun", "Ghaziabad", "Hyderabad", "Jabalpur", "Kharagpur", "Kolkata", "Calcutta", "Lucknow", "Ludhiana", "Mumbai", "Nagpur", "Patna", "Jaipur", "Indore", "Jammu", "Jamui", "Pune", "Ranchi", "Surat", "Vadodara", "Varanasi", "Kanpur", "Agra", "Bhopal", "Chennai", "Delhi", "Kochi", "Kota", "Meerut", "Mysore", "Noida", "Raipur", "Rajkot", "Siliguri", "Udaipur",
@@ -140,7 +146,7 @@ export async function POST(request: Request) {
     const auth = new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"] });
     const sheets = google.sheets({ version: "v4", auth });
     const [{ data: existingOrders, error: ordersError }, { data: existingClients, error: clientsError }, { data: productMaster, error: productsError }, metadata] = await Promise.all([
-      db.from("crm_orders").select("record_id").eq("workspace_owner_id", ownerId).limit(100000),
+      db.from("crm_orders").select("record_id, data").eq("workspace_owner_id", ownerId).limit(100000),
       db.from("crm_clients").select("record_id, data").eq("workspace_owner_id", ownerId).limit(100000),
       db.from("crm_stock_inventory").select("data").eq("workspace_owner_id", ownerId).limit(100000),
       sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties" }),
@@ -159,7 +165,9 @@ export async function POST(request: Request) {
       const title = sheet.properties?.title || "";
       const details = tabDetails(title);
       if (!details) { skipped.push(`${title || "Untitled tab"}: use Order ID | Customer | City`); continue; }
-      if (knownOrderIds.has(key(details.id))) { skipped.push(`${details.id}: already in CRM`); continue; }
+      const matchingHistory = (existingOrders || []).filter((row: any) => key(row.record_id) === key(details.id) || key(row.data?.sourceSheetOrderId) === key(details.id));
+      const existingDraft = matchingHistory.find((row: any) => String(row.data?.status || "Draft") === "Draft");
+      if (existingDraft) { skipped.push(`${details.id}: already in Draft as ${existingDraft.record_id}`); continue; }
       const result = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
       const lines = readLines((result.data.values || []) as unknown[][], productMap);
       if (!lines.length) { skipped.push(`${details.id}: no ITEM and QUANTITY rows found`); continue; }
@@ -167,8 +175,13 @@ export async function POST(request: Request) {
       const matchedCustomer = bestCustomerMatch(details.client, details.city, knownCustomers);
       const client = matchedCustomer?.name || details.client;
       const city = details.city || matchedCustomer?.city || "";
-      imported.push({ id: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "" });
-      knownOrderIds.add(key(details.id));
+      // When the Sheet tab's previous CRM order has already been confirmed or
+      // dispatched, keep that history untouched and import the tab again as a
+      // new draft. A draft is deliberately skipped on later fetches until it
+      // moves forward, preventing duplicates from repeated button presses.
+      const id = matchingHistory.length || knownOrderIds.has(key(details.id)) ? nextFetchedDraftId([...(existingOrders || []), ...imported]) : details.id;
+      imported.push({ id, sourceSheetOrderId: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "" });
+      knownOrderIds.add(key(id));
       if (matchedCustomer) {
         reusedCustomers.push(`${details.id}: ${details.client} → ${matchedCustomer.name}`);
       } else {

@@ -100,6 +100,7 @@ type Order = {
   transporter?: string;
   remarks?: string;
   clientApproval?: "Approval pending" | "Approval requested" | "Approved" | "Changes requested" | "Rejected";
+  sourceSheetOrderId?: string;
   // True only after this order's quantities have actually been deducted from
   // Product / SKU available stock on entry to Dispatch Plan.
   inventoryCommitted?: boolean;

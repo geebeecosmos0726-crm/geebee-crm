@@ -350,6 +350,31 @@ const orderTotal = (order: Order) => linesFor(order).reduce((total, line) => tot
 const orderEntrySource = (order: Order) => /imported\s+from/i.test(order.remarks || "") ? "Import" : "Manual";
 const packingInstructions = (order: Order) => /^imported\s+from\s+connected\s+google\s+sheet\.?$/i.test((order.remarks || "").trim()) ? "" : (order.remarks || "").trim();
 const orderQuantity = (order: Order) => linesFor(order).reduce((total, line) => total + line.quantity, 0);
+const describeConfirmedOrderChanges = (before: Order, after: Order) => {
+  const changes: string[] = [];
+  ([
+    ["client", "Customer"], ["city", "City"], ["transporter", "Transporter"], ["eta", "Expected arrival"], ["payment", "Payment status"], ["remarks", "Packing"],
+  ] as const).forEach(([field, label]) => {
+    const previous = String(before[field] || "").trim();
+    const next = String(after[field] || "").trim();
+    if (previous !== next) changes.push(`${label}: ${previous || "—"} → ${next || "—"}`);
+  });
+  const keyFor = (line: ProductLine) => `${skuKey(line.sku)}|${line.product.trim().toLowerCase()}`;
+  const previousLines = new Map(linesFor(before).map((line) => [keyFor(line), line]));
+  const nextLines = new Map(linesFor(after).map((line) => [keyFor(line), line]));
+  new Set([...previousLines.keys(), ...nextLines.keys()]).forEach((key) => {
+    const previous = previousLines.get(key);
+    const next = nextLines.get(key);
+    const label = (next || previous)?.sku || (next || previous)?.product || "Product";
+    if (!previous && next) { changes.push(`Added ${label} × ${next.quantity}`); return; }
+    if (previous && !next) { changes.push(`Removed ${label} × ${previous.quantity}`); return; }
+    if (!previous || !next) return;
+    if (previous.quantity !== next.quantity) changes.push(`${label} qty: ${previous.quantity} → ${next.quantity}`);
+    if (previous.unitPrice !== next.unitPrice) changes.push(`${label} price: ${money(previous.unitPrice)} → ${money(next.unitPrice)}`);
+    if ((previous.remarks || "").trim() !== (next.remarks || "").trim()) changes.push(`${label} remark updated`);
+  });
+  return changes;
+};
 const nextPurchaseOrderNumber = (purchases: PurchaseOrder[]) => {
   const now = new Date();
   // Purchase order numbers are date + month based: 24 October becomes
@@ -1636,6 +1661,7 @@ export default function Home() {
             // Creating an order only records the customer's request. Inventory
             // is intentionally untouched until the user moves it to Dispatch Plan.
             const savedOrder = editing ? { ...o, id: requestedId, status: editing.status } : { ...o, id: requestedId, status: "Draft", backorders: [] };
+            const confirmedChangeSummary = editing?.status === "Confirmed" ? describeConfirmedOrderChanges(editing, savedOrder) : [];
             const orderedLines = o.products?.length ? o.products : [{ product: o.product, sku: o.sku, quantity: o.quantity, unitPrice: o.unitPrice }];
             if (orderedLines.some((line) => !line.product.trim())) { flash("Choose every product from Product / SKU. If it is missing, add it in Stock Master first."); return; }
             const missingLines = orderedLines.filter((line) => !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku)));
@@ -1649,13 +1675,13 @@ export default function Home() {
             });
             if (editing && requestedId !== editing.id) setInvoices((current) => current.map((invoice) => invoice.order === editing.id ? { ...invoice, order: requestedId } : invoice.order === `ADV-${editing.id}` ? { ...invoice, order: `ADV-${requestedId}` } : invoice));
             setModal(null);
-            logActivity(editing ? "Updated order" : "Created order", "Orders", requestedId);
+            logActivity(editing ? (editing.status === "Confirmed" ? "Updated confirmed order" : "Updated order") : "Created order", editing?.status === "Confirmed" ? "Confirmed Orders" : "Orders", editing?.status === "Confirmed" ? `${requestedId} · ${confirmedChangeSummary.join(" | ") || "Order details saved"}` : requestedId);
             flash(editing ? "Order updated successfully" : "Draft order created. Confirm it to reserve available stock and create any backorder.");
           }}
         />
       )}
       {modal === "orderView" && editing && <OrderViewModal order={editing as Order} close={() => setModal(null)} />}
-      {modal === "orderDetails" && editing && <OrderDetailsModal order={editing as Order} close={() => setModal(null)} />}
+      {modal === "orderDetails" && editing && <OrderDetailsModal order={editing as Order} auditEvents={auditEvents} close={() => setModal(null)} />}
       {modal === "client" && (
         <ClientModal
           client={editing}
@@ -2157,9 +2183,19 @@ function OrderViewModal({ order, close }: { order: Order; close: () => void }) {
   const lines = linesFor(order);
   return <Shell close={close} printDocument><section className="dispatch-print-document"><div className="order-modal-head"><div className="modal-mark"><PackageCheck size={22}/></div><div><span className="overline">DISPATCH ORDER · {order.id}</span><h2 className="dispatch-customer-name">{order.client}</h2><p>{order.city || "—"}{order.transporter ? ` · ${order.transporter}` : ""}</p></div></div><div className="panel-head"><div><h3>Products to pack</h3></div><button className="outline dispatch-print-button" type="button" onClick={() => window.print()}>Print</button></div><div className="table-wrap"><table className="records dispatch-print-table"><thead><tr><th>SKU</th><th>PRODUCT</th><th>QTY</th><th>REMARKS</th></tr></thead><tbody>{lines.map((line, index) => <tr key={`${line.sku}-${index}`}><td><b>{line.sku}</b></td><td>{line.product}</td><td><b>{line.quantity.toLocaleString("en-IN")}</b></td><td>{line.remarks?.trim() || "—"}</td></tr>)}</tbody></table></div>{packingInstructions(order) && <p className="profile-empty dispatch-packing-note"><b>Packing:</b> {packingInstructions(order)}</p>}</section></Shell>;
 }
-function OrderDetailsModal({ order, close }: { order: Order; close: () => void }) {
+function OrderDetailsModal({ order, auditEvents, close }: { order: Order; auditEvents: AuditEvent[]; close: () => void }) {
   const lines = linesFor(order);
-  return <Shell close={close} wide><div className="order-modal-head"><div className="modal-mark"><ClipboardList size={22}/></div><div><span className="overline">{order.status.toUpperCase()} ORDER · {order.id}</span><h2 className="dispatch-customer-name">{order.client || "Customer not assigned"}</h2><p>{[order.city, order.transporter].filter(Boolean).join(" · ") || "No city or transporter assigned"}</p></div></div><div className="form-row"><div className="profile-empty"><b>Status</b><br/><Pill value={order.status}/></div><div className="profile-empty"><b>Payment</b><br/><Pill value={order.payment}/></div><div className="profile-empty"><b>Expected arrival</b><br/>{order.eta ? new Date(order.eta).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—"}</div></div><div className="modal-section-title">Order products</div><div className="table-wrap"><table className="records"><thead><tr><th>SKU</th><th>PRODUCT</th><th>QTY</th><th>UNIT PRICE</th><th>AMOUNT</th><th>REMARKS</th></tr></thead><tbody>{lines.map((line, index) => <tr key={`${line.sku}-${index}`}><td><b>{line.sku || "—"}</b></td><td>{line.product || "—"}</td><td><b>{line.quantity.toLocaleString("en-IN")}</b></td><td>{money(line.unitPrice)}</td><td><b>{money(line.quantity * line.unitPrice)}</b></td><td>{line.remarks?.trim() || "—"}</td></tr>)}</tbody></table></div><div className="order-total"><span>Order total</span><b>{money(orderTotal(order))}</b></div>{packingInstructions(order) && <div className="profile-empty"><b>Packing</b><br/>{packingInstructions(order)}</div>}</Shell>;
+  const isConfirmed = order.status === "Confirmed";
+  const orderHistory = isConfirmed ? auditEvents.filter((event) => event.details.toLowerCase().includes(order.id.toLowerCase())).slice(0, 20) : [];
+  return <Shell close={close} wide printDocument={isConfirmed}>
+    <section className={isConfirmed ? "confirmed-order-print-document" : ""}>
+      <div className="order-modal-head"><div className="modal-mark"><ClipboardList size={22}/></div><div><span className="overline">{order.status.toUpperCase()} ORDER · {order.id}</span><h2 className="dispatch-customer-name">{order.client || "Customer not assigned"}</h2><p>{[order.city, order.transporter].filter(Boolean).join(" · ") || "No city or transporter assigned"}</p></div></div>
+      {isConfirmed && <div className="confirmed-order-print-actions"><button className="outline confirmed-order-print-button" type="button" onClick={() => window.print()}>Print packing copy</button></div>}
+      <div className="form-row"><div className="profile-empty"><b>Status</b><br/><Pill value={order.status}/></div><div className="profile-empty"><b>Payment</b><br/><Pill value={order.payment}/></div><div className="profile-empty"><b>Expected arrival</b><br/>{order.eta ? new Date(order.eta).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—"}</div></div>
+      <div className="modal-section-title">Order products</div><div className="table-wrap"><table className="records"><thead><tr><th>SKU</th><th>PRODUCT</th><th>QTY</th><th className="financial-column">UNIT PRICE</th><th className="financial-column">AMOUNT</th><th>REMARKS</th></tr></thead><tbody>{lines.map((line, index) => <tr key={`${line.sku}-${index}`}><td><b>{line.sku || "—"}</b></td><td>{line.product || "—"}</td><td><b>{line.quantity.toLocaleString("en-IN")}</b></td><td className="financial-column">{money(line.unitPrice)}</td><td className="financial-column"><b>{money(line.quantity * line.unitPrice)}</b></td><td>{line.remarks?.trim() || "—"}</td></tr>)}</tbody></table></div><div className="order-total financial-column"><span>Order total</span><b>{money(orderTotal(order))}</b></div>{packingInstructions(order) && <div className="profile-empty"><b>Packing</b><br/>{packingInstructions(order)}</div>}
+      {isConfirmed && <section className="confirmed-order-history"><div><span className="overline">CONFIRMED ORDER HISTORY</span><h3>Changes to this order</h3><p>Who changed what, with the recorded time.</p></div>{orderHistory.length ? orderHistory.map((event) => <article key={event.id}><div><b>{event.action}</b><span>{event.actor_email}{event.details ? ` · ${event.details}` : ""}</span></div><time>{new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</time></article>) : <p className="profile-empty">No confirmed-order changes recorded yet.</p>}</section>}
+    </section>
+  </Shell>;
 }
 function PurchaseOrderViewModal({ purchase, close }: { purchase: PurchaseOrder; close: () => void }) {
   const ordered = purchase.lines.reduce((sum, line) => sum + line.quantity, 0);

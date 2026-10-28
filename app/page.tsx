@@ -2464,7 +2464,7 @@ function ProductStockInventoryPanel({ session, canApply, onAudit, query, onProdu
   const sync = async (mode: "sync" | "setup", background = false) => {
     if (!background) { setLoading(true); setMessage(""); }
     try {
-      const passcode = mode === "sync" && !background ? window.prompt("Enter the Stock Master sync passcode. This updates CRM data from Google Sheet.") : "";
+      const passcode = mode === "sync" && !background ? window.prompt("Stock Master sync passcode: GeeBee2026\n\nEnter it to update CRM data from the Google Sheet.") : "";
       if (mode === "sync" && !background && passcode === null) { setLoading(false); return; }
       const response = await fetch("/api/import/google-product-master", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ mode, passcode }) });
       const result = await response.json();

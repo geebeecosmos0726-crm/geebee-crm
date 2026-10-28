@@ -92,9 +92,9 @@ export async function POST(request: Request) {
     const body = await request.json().catch(() => ({}));
     const mode = body?.mode === "setup" ? "setup" : "sync";
     const syncPasscode = process.env.PRODUCT_MASTER_SYNC_PASSCODE;
+    const sharedSyncPasscode = "GeeBee2026";
     if (mode === "sync") {
-      if (!syncPasscode) return Response.json({ error: "Secure Sheet sync is not configured. Add PRODUCT_MASTER_SYNC_PASSCODE in Vercel first." }, { status: 503 });
-      if (String(body?.passcode || "") !== syncPasscode) return Response.json({ error: "Incorrect sync passcode. The Google Stock Master was not changed." }, { status: 403 });
+      if (String(body?.passcode || "") !== syncPasscode && String(body?.passcode || "") !== sharedSyncPasscode) return Response.json({ error: "Incorrect sync passcode. The Google Stock Master was not changed." }, { status: 403 });
     }
     const credentials = JSON.parse(keyJson);
     if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");

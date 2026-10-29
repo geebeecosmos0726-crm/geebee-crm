@@ -691,7 +691,9 @@ type SavedCrmData = { orders: Order[]; clients: Client[]; invoices: Invoice[]; c
 const loadCrmData = (): SavedCrmData => {
   // Products / SKUs are never recovered from old browser state. The current
   // Stock Master is the only source loaded after sign-in.
-  const fallback = { orders: seedOrders, clients: seedClients, invoices: seedInvoices, catalogue: [] as CatalogueItem[], leads: seedLeads, quotes: seedQuotes, tasks: seedTasks, transporters: seedTransporters, suppliers: seedSuppliers, purchases: [] as PurchaseOrder[] };
+  // Never show demo information in a real workspace. Until the cloud read
+  // completes, each business area is intentionally empty.
+  const fallback = { orders: [] as Order[], clients: [] as Client[], invoices: [] as Invoice[], catalogue: [] as CatalogueItem[], leads: [] as Lead[], quotes: [] as Quote[], tasks: [] as SalesTask[], transporters: [] as Transporter[], suppliers: [] as Supplier[], purchases: [] as PurchaseOrder[] };
   if (typeof window === "undefined") return fallback;
   try {
     const saved = window.localStorage.getItem(storageKey);
@@ -817,16 +819,16 @@ function SharedAccessScreen({ notice = "" }: { notice?: string }) {
 export default function Home() {
   const [section, setSection] = useState("Overview"),
     [sectionSearches, setSectionSearches] = useState<Record<string, string>>({}),
-    [orders, setOrders] = useState(seedOrders),
-    [clients, setClients] = useState(seedClients),
-    [invoices, setInvoices] = useState(seedInvoices),
+    [orders, setOrders] = useState<Order[]>([]),
+    [clients, setClients] = useState<Client[]>([]),
+    [invoices, setInvoices] = useState<Invoice[]>([]),
     [catalogue, setCatalogue] = useState<CatalogueItem[]>([]),
     [catalogueHydrated, setCatalogueHydrated] = useState(false),
-    [leads, setLeads] = useState(seedLeads),
-    [quotes, setQuotes] = useState(seedQuotes),
-    [tasks, setTasks] = useState(seedTasks),
-    [transporters, setTransporters] = useState(seedTransporters),
-    [suppliers, setSuppliers] = useState(seedSuppliers),
+    [leads, setLeads] = useState<Lead[]>([]),
+    [quotes, setQuotes] = useState<Quote[]>([]),
+    [tasks, setTasks] = useState<SalesTask[]>([]),
+    [transporters, setTransporters] = useState<Transporter[]>([]),
+    [suppliers, setSuppliers] = useState<Supplier[]>([]),
     [purchases, setPurchases] = useState<PurchaseOrder[]>([]),
     [storageReady, setStorageReady] = useState(false),
     [session, setSession] = useState<Session | null>(null),
@@ -933,7 +935,7 @@ export default function Home() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [modal, clientProfile]);
-  // The regular automated backup still runs every 12 hours. For deletions we
+  // The regular automated backup runs daily. For deletions we
   // also request a short, authenticated backup after the cloud record sync has
   // completed, so the Google Sheet does not retain removed records.
   const syncGoogleSheetAfterDelete = () => {
@@ -1573,16 +1575,7 @@ export default function Home() {
             <button className="primary" onClick={() => show("purchase")}><Plus size={18}/> New purchase order</button>
           </div>}
         </div>
-        {section === "Overview" && (
-          <Overview
-            orders={orders}
-            clients={clients}
-            invoices={invoices}
-            edit={(o) => show("order", o)}
-            all={() => setSection("Orders")}
-            flash={flash}
-          />
-        )}{" "}
+        {section === "Overview" && (cloudReady ? <Overview orders={orders} clients={clients} invoices={invoices} edit={(o) => show("order", o)} all={() => setSection("Orders")} flash={flash} /> : <section className="panel empty"><b>{cloudError ? "Live CRM data could not be loaded." : "Loading live CRM data…"}</b><p>{cloudError ? "Refresh the panel after resolving the cloud connection warning above." : "Dashboard figures will appear only after the real workspace records are loaded."}</p></section>)}{" "}
         {section === "Orders" && <Orders orders={shown.filter((order) => order.status === "Draft")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Draft")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} confirm={confirmOrder} />}{" "}
         {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToOrders={returnConfirmedToOrders} pushToDispatch={pushToDispatchPlan} sendWhatsApp={(order) => { const client = clients.find((item) => item.name.trim().toLowerCase() === order.client.trim().toLowerCase()); const groupLink = client?.whatsappGroupLink?.trim(); if (groupLink) { try { const url = new URL(groupLink); if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "chat.whatsapp.com") throw new Error("invalid"); window.open(url.toString(), "_blank", "noopener,noreferrer"); logActivity("Opened customer WhatsApp group", "Confirmed Orders", `${order.id} · ${client?.name || order.client}`); return; } catch { window.alert("The saved WhatsApp group link is not valid. Use a link beginning with https://chat.whatsapp.com/ in the customer profile."); return; } } window.open(`https://wa.me/?text=${encodeURIComponent(dispatchWhatsAppText(order))}`, "_blank", "noopener,noreferrer"); logActivity("Opened WhatsApp approval", "Confirmed Orders", `${order.id} · no customer group link saved`); }} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Confirmed Orders", `${id} · ${clientApproval}`); }} confirmed />}{" "}
         {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} view={(o) => show("orderView", o)} cancel={cancelOrder} returnToConfirmed={returnDispatchToConfirmed} markSent={markOrderSentToCustomer} />}{" "}

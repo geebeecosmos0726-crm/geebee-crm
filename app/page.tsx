@@ -881,6 +881,7 @@ export default function Home() {
     explicitCloudDeletes.current[table] = marked;
   };
   const sheetSyncTimer = useRef<number | null>(null);
+  const workspaceDataSnapshot = useRef<string | null>(null);
   const flash = (m: string) => {
       setToast(m);
       setTimeout(() => setToast(""), 2600);
@@ -935,18 +936,20 @@ export default function Home() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [modal, clientProfile]);
-  // The regular automated backup runs daily. For deletions we
-  // also request a short, authenticated backup after the cloud record sync has
-  // completed, so the Google Sheet does not retain removed records.
-  const syncGoogleSheetAfterDelete = () => {
+  // The scheduled backup remains a safety net. This queues a compact live
+  // mirror after a successful cloud write, so adds, edits and deletes reach
+  // the recovery Sheet together without sending a request for every keystroke.
+  const queueGoogleSheetLiveBackup = () => {
     if (!session?.access_token || typeof window === "undefined") return;
     if (sheetSyncTimer.current) window.clearTimeout(sheetSyncTimer.current);
     sheetSyncTimer.current = window.setTimeout(() => {
-      fetch("/api/backup/google-sheets", { headers: { Authorization: `Bearer ${session.access_token}` } })
-        .then((response) => { if (!response.ok) console.warn("Google Sheet sync after deletion was not completed."); })
-        .catch(() => console.warn("Google Sheet sync after deletion was not completed."));
-    }, 1200);
+      fetch("/api/backup/google-sheets?mode=live", { headers: { Authorization: `Bearer ${session.access_token}` } })
+        .then((response) => { if (!response.ok) console.warn("Live Google Sheet backup was not completed."); })
+        .catch(() => console.warn("Live Google Sheet backup was not completed."));
+    }, 1500);
   };
+  // Existing delete actions use this name; all now feed the same live mirror.
+  const syncGoogleSheetAfterDelete = queueGoogleSheetLiveBackup;
   const updateLeadStage = (id: string, status: LeadStage) => {
     const lead = leads.find((item) => item.id === id); if (!lead) return;
     let lostReason = lead.lostReason;
@@ -1045,8 +1048,14 @@ export default function Home() {
         recordSnapshots.current = {};
       }
       const workspaceData = existingWorkspace?.data as { purchases?: PurchaseOrder[]; suppliers?: Supplier[] } | null;
-      if (Array.isArray(workspaceData?.purchases)) setPurchases(workspaceData.purchases);
-      if (Array.isArray(workspaceData?.suppliers)) setSuppliers(workspaceData.suppliers);
+      const loadedPurchases = Array.isArray(workspaceData?.purchases) ? workspaceData.purchases : [];
+      const loadedSuppliers = Array.isArray(workspaceData?.suppliers) ? workspaceData.suppliers : [];
+      // Establish the initial cloud state before the workspace persistence
+      // effect starts. This prevents a browser opening the CRM from writing a
+      // blank purchases/suppliers set back to the backup Sheet.
+      workspaceDataSnapshot.current = JSON.stringify({ purchases: loadedPurchases, suppliers: loadedSuppliers });
+      setPurchases(loadedPurchases);
+      setSuppliers(loadedSuppliers);
       setCloudError(""); setCloudReady(true);
     };
     loadScalableRecords();
@@ -1083,6 +1092,7 @@ export default function Home() {
       const response = await fetch("/api/import/google-product-master", { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ stockUpdates: changed.map((product) => ({ id: product.id, availableQuantity: availableStock(product), reservedStock: product.reservedStock || 0 })) }) });
       if (!response.ok) { const result = await response.json().catch(() => ({})); setCloudError(result.error || "Dispatch stock movement could not be saved to Product / SKU inventory."); return; }
       inventorySnapshots.current = next;
+      queueGoogleSheetLiveBackup();
     }, 450);
     return () => window.clearTimeout(timer);
   }, [catalogue, catalogueHydrated, cloudReady, session?.access_token]);
@@ -1104,6 +1114,7 @@ export default function Home() {
       { table: "crm_clients", items: clients, search: scalableTables[0].search }, { table: "crm_products", items: catalogue, search: scalableTables[1].search }, { table: "crm_orders", items: orders, search: scalableTables[2].search }, { table: "crm_invoices", items: invoices, search: scalableTables[3].search }, { table: "crm_leads", items: leads, search: scalableTables[4].search }, { table: "crm_quotes", items: quotes, search: scalableTables[5].search }, { table: "crm_tasks", items: tasks, search: scalableTables[6].search }, { table: "crm_transporters", items: transporters, search: scalableTables[7].search },
     ].filter((collection) => collection.table !== "crm_products");
     const syncTimer = window.setTimeout(async () => {
+      let didPersist = false;
       for (const { table, items, search } of collections) {
         const previous = recordSnapshots.current[table] || new Map<string, string>();
         const next = new Map(items.map((item) => [String(item.id), JSON.stringify(item)]));
@@ -1115,10 +1126,11 @@ export default function Home() {
         const safeRemoved = table === "crm_clients"
           ? removed.filter((id) => explicitCloudDeletes.current.crm_clients?.has(id))
           : removed;
-        if (changed.length) { const { error } = await cloud.from(table).upsert(changed, { onConflict: "workspace_owner_id,record_id" }); if (error) { setCloudError("A change could not be saved to the cloud. Your local copy is still safe."); return; } }
-        if (safeRemoved.length) { const { error } = await cloud.from(table).delete().eq("workspace_owner_id", workspaceOwnerId).in("record_id", safeRemoved); if (error) { setCloudError("A deleted record could not be synced to the cloud."); return; } if (table === "crm_clients") safeRemoved.forEach((id) => explicitCloudDeletes.current.crm_clients?.delete(id)); }
+        if (changed.length) { const { error } = await cloud.from(table).upsert(changed, { onConflict: "workspace_owner_id,record_id" }); if (error) { setCloudError("A change could not be saved to the cloud. Your local copy is still safe."); return; } didPersist = true; }
+        if (safeRemoved.length) { const { error } = await cloud.from(table).delete().eq("workspace_owner_id", workspaceOwnerId).in("record_id", safeRemoved); if (error) { setCloudError("A deleted record could not be synced to the cloud."); return; } if (table === "crm_clients") safeRemoved.forEach((id) => explicitCloudDeletes.current.crm_clients?.delete(id)); didPersist = true; }
         recordSnapshots.current[table] = next;
       }
+      if (didPersist) queueGoogleSheetLiveBackup();
     }, 650);
     return () => window.clearTimeout(syncTimer);
   // Product / SKU stock is saved through its dedicated stock-master effect
@@ -1128,9 +1140,12 @@ export default function Home() {
   useEffect(() => {
     const cloud = supabase;
     if (!cloud || !session || !cloudReady || !workspaceOwnerId) return;
+    const nextSnapshot = JSON.stringify({ purchases, suppliers });
+    if (workspaceDataSnapshot.current === nextSnapshot) return;
     const timer = window.setTimeout(() => {
       cloud.from("crm_workspaces").update({ data: { normalizedRecords: true, purchases, suppliers }, updated_at: new Date().toISOString() }).eq("owner_id", workspaceOwnerId).then(({ error }) => {
         if (error) setCloudError("Purchase orders or suppliers could not be saved to the cloud. Your local copy is still safe.");
+        else { workspaceDataSnapshot.current = nextSnapshot; queueGoogleSheetLiveBackup(); }
       });
     }, 700);
     return () => window.clearTimeout(timer);
@@ -1216,7 +1231,7 @@ export default function Home() {
     }));
     setPurchases((current) => current.filter((item) => item.id !== purchase.id));
     logActivity("Deleted purchase order and reversed received inventory", "Purchase Orders", `${purchase.id} · ${totalReceived} unit(s) reversed`);
-    syncGoogleSheetAfterDelete();
+    queueGoogleSheetLiveBackup();
     flash(`${purchase.id} permanently deleted. Its received stock was reversed from Product / SKUs.`);
   };
   const fetchProductPurchaseOrders = async () => {
@@ -1315,7 +1330,7 @@ export default function Home() {
     setInvoices((current) => current.filter((invoice) => !removedIds.has(invoice.order)));
     setTasks((current) => current.filter((task) => !task.relatedTo || !removedIds.has(task.relatedTo)));
     logActivity("Removed order and released stock", "Orders", [...removedIds].join(", "));
-    syncGoogleSheetAfterDelete();
+    queueGoogleSheetLiveBackup();
     flash(`${ids.length} order${ids.length === 1 ? "" : "s"} removed; linked backorders, invoices and stock allocations were removed safely too.`);
   };
   const returnConfirmedToOrders = (order: Order) => {
@@ -1623,7 +1638,7 @@ export default function Home() {
             remove={(ids) => { setCatalogue((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed catalogue product", "Catalogue", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} product${ids.length === 1 ? "" : "s"} removed from catalogue`); }}
           />
         )}{" "}
-        {section === "Product Stock Inventory" && <ProductStockInventoryPanel session={session} canApply={isAdmin} onAudit={logActivity} query={search} onProductsSynced={setCatalogue} />}{" "}
+        {section === "Product Stock Inventory" && <ProductStockInventoryPanel session={session} canApply={isAdmin} onAudit={logActivity} query={search} onProductsSynced={setCatalogue} onLiveBackup={queueGoogleSheetLiveBackup} />}{" "}
         {section === "Categories" && <ProductStockCategoriesPanel session={session} query={search} openCategory={(category) => { setSection("Product Stock Inventory"); setSectionSearches((current) => ({ ...current, "Product Stock Inventory": category })); }} />}{" "}
         {section === "Fetch Orders" && <GoogleSheetOrderFetch existingOrders={orders} addOrders={setOrders} onAudit={logActivity} />}{" "}
         {section === "Transporters" && <TransportersPanel transporters={transporters.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.area || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("transporter", item)} add={() => show("transporter")} remove={(ids) => { setTransporters((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed transporter", "Transporters", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} transporter${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
@@ -2475,7 +2490,7 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit }: { existin
   return <section className="panel transfer-panel"><div className="panel-head"><div><span className="overline">CONNECTED ORDER SHEET</span><h2>Fetch new orders from Google Sheets</h2><p>Reads your existing order tabs, such as <b>E-404 SHYAM BALLOON PATNA</b> or <b>E-269 (OR) SHYAM BALLOON STORE, PATNA</b>. Only order IDs not already in the CRM are imported, always as Draft orders. Unmatched customer names stay on the draft only until it is saved.</p></div><button className="primary" type="button" onClick={fetchOrders} disabled={loading}>{loading ? "Fetching orders…" : "Fetch new orders"}</button></div>{message && <p className="transfer-message">{message}</p>}{details.length > 0 && <div className="transfer-fields"><b>Skipped tabs</b><br/>{details.join(" · ")}</div>}</section>;
 }
 
-function ProductStockInventoryPanel({ session, canApply, onAudit, query, onProductsSynced }: { session: Session; canApply: boolean; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>> }) {
+function ProductStockInventoryPanel({ session, canApply, onAudit, query, onProductsSynced, onLiveBackup }: { session: Session; canApply: boolean; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>>; onLiveBackup: () => void }) {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [items, setItems] = useState<CatalogueItem[]>(() => readProductStockCache(session.user.id));
@@ -2507,6 +2522,7 @@ function ProductStockInventoryPanel({ session, canApply, onAudit, query, onProdu
       if (!response.ok) throw new Error(result.error || "Product Stock Inventory could not be updated.");
       if (mode === "setup") { setMessage(result.message || "Blank Sheet headers and test rows are ready."); await load(); return; }
       replaceItems(result.products || []);
+      onLiveBackup();
       const skipped = Array.isArray(result.skippedRows) ? result.skippedRows.length : 0;
       if (!background) {
         setMessage(`${result.scanned || 0} Sheet SKU(s) processed: ${result.updated || 0} updated, ${result.added || 0} added to the separate test inventory.${skipped ? ` ${skipped} incomplete row${skipped === 1 ? " needs" : "s need"} review.` : ""}`);
@@ -2528,7 +2544,7 @@ function ProductStockInventoryPanel({ session, canApply, onAudit, query, onProdu
         const next = current.map((entry) => entry.id === result.item.id ? result.item : entry);
         saveProductStockCache(session.user.id, next);
         return next;
-      }); setEditing(null); setMessage(`${result.item.sku} updated. Available Stock remains controlled by the Google Sheet.`);
+      }); onProductsSynced((current) => current.map((entry) => entry.id === result.item.id ? result.item : entry)); onLiveBackup(); setEditing(null); setMessage(`${result.item.sku} updated. Available Stock remains controlled by the Google Sheet.`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Product could not be updated."); }
     finally { setLoading(false); }
   };

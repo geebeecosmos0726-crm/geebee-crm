@@ -52,6 +52,7 @@ export async function GET(request: Request) {
   const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (!url || !serviceKey || !spreadsheetId || !keyJson) return Response.json({ error: "Backup configuration is incomplete." }, { status: 500 });
   try {
+    const liveMirror = new URL(request.url).searchParams.get("mode") === "live";
     const requestedOwnerId = await authorisedWorkspace(request, url, serviceKey);
     const credentials = JSON.parse(keyJson);
     if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
@@ -99,21 +100,24 @@ export async function GET(request: Request) {
     await sheets.spreadsheets.values.update({ spreadsheetId, range: "'Backup Log'!A1", valueInputOption: "RAW", requestBody: { values: [["Backup timestamp", "Status", "Workspace updated at", "Record counts"]] } });
     const countSummary = Object.entries(backupRows).map(([title, value]) => `${title}: ${value.length}`).join(" | ");
     await sheets.spreadsheets.values.append({ spreadsheetId, range: "'Backup Log'!A:D", valueInputOption: "RAW", requestBody: { values: [[new Date().toISOString(), "Success", workspace.updated_at, countSummary]] } });
-    // Google Sheets is the human-readable recovery copy. Keep a compact server
-    // snapshot at the same moment as a second, exact rollback point.
-    const snapshotData = {
-      ...data,
-      suppliers: Array.isArray((workspace.data || {}).suppliers) ? (workspace.data || {}).suppliers : [],
-      purchases: Array.isArray((workspace.data || {}).purchases) ? (workspace.data || {}).purchases : [],
-    };
-    const { error: snapshotError } = await supabase.from("crm_recovery_snapshots").insert({
-      workspace_owner_id: workspace.owner_id,
-      restored_by: "Automated backup",
-      source: "Google Sheets backup",
-      data: snapshotData,
-    });
-    if (snapshotError) console.error("Server recovery snapshot was not saved:", snapshotError.message);
-    return Response.json({ ok: true, backupAt: new Date().toISOString(), records: countSummary });
+    // Live mirroring happens after every successful CRM save. It deliberately
+    // avoids creating a Supabase recovery snapshot on every keystroke-sized
+    // update; the scheduled backup retains that second rollback point.
+    if (!liveMirror) {
+      const snapshotData = {
+        ...data,
+        suppliers: Array.isArray((workspace.data || {}).suppliers) ? (workspace.data || {}).suppliers : [],
+        purchases: Array.isArray((workspace.data || {}).purchases) ? (workspace.data || {}).purchases : [],
+      };
+      const { error: snapshotError } = await supabase.from("crm_recovery_snapshots").insert({
+        workspace_owner_id: workspace.owner_id,
+        restored_by: "Automated backup",
+        source: "Google Sheets backup",
+        data: snapshotData,
+      });
+      if (snapshotError) console.error("Server recovery snapshot was not saved:", snapshotError.message);
+    }
+    return Response.json({ ok: true, backupAt: new Date().toISOString(), records: countSummary, liveMirror });
   } catch (error) {
     console.error("Google Sheets backup failed:", error instanceof Error ? error.message : error);
     return Response.json({ error: error instanceof Error ? error.message : "Google Sheets backup failed." }, { status: 500 });

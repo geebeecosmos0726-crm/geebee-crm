@@ -74,10 +74,12 @@ function tabDetails(title: string) {
   // Existing GeeBee tabs use titles such as "E-269 (OR) SHYAM BALLOON
   // STORE, PATNA" and "E-404 SHYAM BALLOON PATNA". Read the order number
   // first, then only infer a no-comma city when it is an unambiguous suffix.
-  const match = title.trim().match(/^([A-Za-z]+-\d+[A-Za-z0-9-]*)\s*(?:\((?:OR|ORDER)\))?\s*(.+)$/i);
+  // Sheet tabs are commonly named both as "E-485" and "E - 485".
+  // Accept either spacing style, then store one canonical order ID.
+  const match = title.trim().match(/^([A-Za-z]+)\s*-\s*(\d+[A-Za-z0-9-]*)\s*(?:\((?:OR|ORDER)\))?\s*,?\s*(.+)$/i);
   if (!match) return null;
-  const id = match[1].trim();
-  const remainder = match[2].trim();
+  const id = `${match[1].trim()}-${match[2].trim()}`;
+  const remainder = match[3].trim();
   const comma = remainder.match(/^(.+?),\s*([^,]+)$/);
   if (comma) return { id, client: comma[1].trim(), city: comma[2].trim() };
   const city = citySuffixes.find((candidate) => new RegExp(`\\s${candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i").test(remainder));

@@ -2665,35 +2665,6 @@ function RecoveryPanel({ canManage, session, applyRestore, clearBusinessData }: 
   const [confirm, setConfirm] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
-  // Temporary visible control for validating that the Sheet backup can restore
-  // a deliberately empty CRM. It is removed once this recovery test passes.
-  useEffect(() => {
-    if (!canManage || typeof document === "undefined") return;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = "Test recovery: clear CRM only";
-    button.setAttribute("aria-label", "Test Google Sheet recovery by clearing CRM data only");
-    Object.assign(button.style, { position: "fixed", right: "32px", bottom: "28px", zIndex: "9999", border: "0", borderRadius: "10px", padding: "12px 16px", background: "#7f1d3a", color: "#fff", fontWeight: "700", cursor: "pointer", boxShadow: "0 8px 24px rgba(80, 20, 40, .28)" });
-    button.onclick = async () => {
-      const typed = window.prompt("This temporary test clears CRM business data only. The Google Sheet backup and Products / SKUs stay unchanged.\n\nType TEST SHEET RECOVERY to continue:", "");
-      if (typed !== "TEST SHEET RECOVERY") return;
-      button.disabled = true;
-      button.textContent = "Clearing CRM for test…";
-      try {
-        const response = await fetch("/api/admin/purge-business-data", { method: "POST", headers: { Authorization: `Bearer ${session.access_token}`, "Content-Type": "application/json" }, body: JSON.stringify({ confirm: typed, preserveBackup: true }) });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "Could not clear CRM for the recovery test.");
-        window.alert("CRM business data is now cleared. The Google Sheet backup was preserved. After this page reloads, use Data Recovery → RESTORE GEEBEE to restore it.");
-        window.location.reload();
-      } catch (error) {
-        button.disabled = false;
-        button.textContent = "Test recovery: clear CRM only";
-        window.alert(error instanceof Error ? error.message : "Could not clear CRM for the recovery test.");
-      }
-    };
-    document.body.appendChild(button);
-    return () => button.remove();
-  }, [canManage, session.access_token]);
   if (!canManage) return <section className="panel coming"><div className="modal-mark"><RotateCcw size={22}/></div><h2>Data recovery</h2><p>Only administrators can preview or restore a GeeBee backup.</p></section>;
   const request = async (method: "GET" | "POST") => {
     setLoading(true); setMessage("");

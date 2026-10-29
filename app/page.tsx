@@ -417,6 +417,11 @@ const cleanSheetClient = (value: string) => {
 };
 const isBackorderRecord = (order: Order) => /^ADV-/i.test(order.id) || /advance|back\s*order/i.test(order.status || "");
 const isVisibleBackorder = (order: Order) => isBackorderRecord(order) && (/^ADV-/i.test(order.id) || linesFor(order).some((line) => line.quantity > 0));
+const isFulfilmentOrder = (order?: Order) => Boolean(order && ["Sent to customer", "Received by customer"].includes(order.status));
+const orderWithLines = (order: Order, products: ProductLine[]): Order => {
+  const first = products[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
+  return { ...order, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products };
+};
 const catalogueSku = (item: CatalogueItem) => item.sku?.trim() || "SKU pending";
 const catalogueName = (item: CatalogueItem) => item.name?.trim() || item.description?.trim() || (item.sku?.trim() ? `Product ${item.sku.trim()}` : "Product name pending");
 const productCategories = ["Candles", "Paper Banner", "Ribbon", "Metal & Paper stands", "Cake crown", "Crown & Tiaras", "Led candles", "Balloon pump", "Goggles /LED Goggles", "Caps", "Paper Sets /Props", "Cake topper", "Party popper", "Party items"] as const;
@@ -1255,6 +1260,11 @@ export default function Home() {
     }));
     const cancelledIds = isAdvance ? [order.id] : [primaryId, advanceId];
     setOrders((current) => current.map((item) => {
+      if (isAdvance && item.id === primaryId && !isFulfilmentOrder(primaryOrder)) {
+        // Until the main order reaches fulfilment, its saved shortage mirror
+        // must disappear when the linked backorder is cancelled.
+        return { ...item, backorders: [] };
+      }
       if (!cancelledIds.includes(item.id)) return item;
       const cancelledFromStage = ["Draft", "Confirmed", "Dispatch plan", "Sent to customer", "Received by customer"].includes(item.status) ? item.status as NonNullable<Order["cancelledFromStage"]> : item.cancelledFromStage;
       return { ...item, status: "Cancelled", cancelledFromDispatch: ["Dispatch plan", "Sent to customer", "Received by customer"].includes(item.status), cancelledFromStage };
@@ -1280,6 +1290,9 @@ export default function Home() {
       if (orders.some((item) => item.id === advanceId)) advanceIds.add(advanceId);
     });
     const removedIds = new Set([...primaryIds, ...advanceIds]);
+    const activeBackorderParents = new Set([...advanceIds]
+      .map((id) => id.replace(/^ADV-/, ""))
+      .filter((id) => !primaryIds.has(id) && !isFulfilmentOrder(orders.find((item) => item.id === id))));
     const confirmedLines = [...primaryIds].flatMap((id) => {
       const order = orders.find((item) => item.id === id);
       return order?.status === "Confirmed" ? (order.approvedProducts || linesFor(order)) : [];
@@ -1294,7 +1307,9 @@ export default function Home() {
       if (!reserved && !restore) return product;
       return { ...product, availableQuantity: availableStock(product) + restore, reservedStock: Math.max(0, (product.reservedStock || 0) - reserved) };
     }));
-    setOrders((current) => current.filter((item) => !removedIds.has(item.id)));
+    setOrders((current) => current
+      .filter((item) => !removedIds.has(item.id))
+      .map((item) => activeBackorderParents.has(item.id) ? { ...item, backorders: [] } : item));
     setInvoices((current) => current.filter((invoice) => !removedIds.has(invoice.order)));
     setTasks((current) => current.filter((task) => !task.relatedTo || !removedIds.has(task.relatedTo)));
     logActivity("Removed order and released stock", "Orders", [...removedIds].join(", "));
@@ -1660,20 +1675,48 @@ export default function Home() {
             if (orders.some((item) => item.id !== editing?.id && skuKey(item.id) === skuKey(requestedId))) { flash(`Order ID ${requestedId} is already in use. Choose a unique ID.`); return; }
             // Creating an order only records the customer's request. Inventory
             // is intentionally untouched until the user moves it to Dispatch Plan.
-            const savedOrder = editing ? { ...o, id: requestedId, status: editing.status } : { ...o, id: requestedId, status: "Draft", backorders: [] };
-            const confirmedChangeSummary = editing?.status === "Confirmed" ? describeConfirmedOrderChanges(editing, savedOrder) : [];
+            let savedOrder: Order = editing ? { ...o, id: requestedId, status: editing.status } : { ...o, id: requestedId, status: "Draft", backorders: [] };
             const orderedLines = o.products?.length ? o.products : [{ product: o.product, sku: o.sku, quantity: o.quantity, unitPrice: o.unitPrice }];
             if (orderedLines.some((line) => !line.product.trim())) { flash("Choose every product from Product / SKU. If it is missing, add it in Stock Master first."); return; }
             const missingLines = orderedLines.filter((line) => !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku)));
             if (missingLines.length) { flash(`${missingLines.length} product line${missingLines.length === 1 ? " is" : "s are"} not in Product / SKU. Add it in Stock Master, sync, then save this order.`); return; }
+            const editingBackorder = Boolean(editing && isBackorderRecord(editing));
+            const primaryId = editingBackorder ? editing!.id.replace(/^ADV-/, "") : editing?.id || "";
+            const primaryOrder = editingBackorder ? orders.find((item) => item.id === primaryId) : editing;
+            const linkedBackorder = editingBackorder ? editing : orders.find((item) => item.id === `ADV-${editing?.id}`);
+            const linkedBackorderIsLive = Boolean(editing && linkedBackorder && !isFulfilmentOrder(primaryOrder));
+            let syncedBackorder: Order | null | undefined;
+            if (editing && linkedBackorderIsLive && !editingBackorder) {
+              const nextSkuKeys = new Set(orderedLines.map((line) => skuKey(line.sku)));
+              const removedSkuKeys = new Set(linesFor(editing).filter((line) => !nextSkuKeys.has(skuKey(line.sku))).map((line) => skuKey(line.sku)));
+              if (removedSkuKeys.size) {
+                const remaining = linesFor(linkedBackorder!).filter((line) => !removedSkuKeys.has(skuKey(line.sku)));
+                syncedBackorder = remaining.length ? orderWithLines(linkedBackorder!, remaining) : null;
+                savedOrder = { ...savedOrder, backorders: remaining };
+              }
+            }
+            if (editing && linkedBackorderIsLive && editingBackorder) savedOrder = orderWithLines(savedOrder, orderedLines);
+            const confirmedChangeSummary = editing?.status === "Confirmed" ? describeConfirmedOrderChanges(editing, savedOrder) : [];
             setClients((current) => current.map((client) => client.name.trim().toLowerCase() === savedOrder.client.trim().toLowerCase() ? { ...client, customerStatus: "Active" } : client));
             setOrders((current) => {
               if (!editing) return [...current, savedOrder];
               const previousAdvanceId = `ADV-${editing.id}`;
               const nextAdvanceId = `ADV-${requestedId}`;
-              return current.map((item) => item.id === editing.id ? savedOrder : item.id === previousAdvanceId && requestedId !== editing.id ? { ...item, id: nextAdvanceId } : item);
+              let next = current.map((item) => item.id === editing.id ? savedOrder : item.id === previousAdvanceId && requestedId !== editing.id ? { ...item, id: nextAdvanceId } : item);
+              if (linkedBackorderIsLive && editingBackorder) next = next.map((item) => item.id === primaryId ? { ...item, backorders: orderedLines } : item);
+              if (syncedBackorder !== undefined) {
+                next = syncedBackorder ? next.map((item) => item.id === linkedBackorder!.id ? syncedBackorder! : item) : next.filter((item) => item.id !== linkedBackorder!.id);
+              }
+              return next;
             });
-            if (editing && requestedId !== editing.id) setInvoices((current) => current.map((invoice) => invoice.order === editing.id ? { ...invoice, order: requestedId } : invoice.order === `ADV-${editing.id}` ? { ...invoice, order: `ADV-${requestedId}` } : invoice));
+            if (editing) setInvoices((current) => {
+              let next = current.map((invoice) => requestedId !== editing.id && (invoice.order === editing.id || invoice.order === `ADV-${editing.id}`) ? { ...invoice, order: invoice.order === editing.id ? requestedId : `ADV-${requestedId}` } : invoice);
+              if (linkedBackorderIsLive && editingBackorder) next = next.map((invoice) => invoice.order === editing.id ? { ...invoice, amount: money(orderTotal(savedOrder)) } : invoice);
+              if (syncedBackorder === null) next = next.filter((invoice) => invoice.order !== linkedBackorder!.id);
+              if (syncedBackorder) next = next.map((invoice) => invoice.order === linkedBackorder!.id ? { ...invoice, amount: money(orderTotal(syncedBackorder)) } : invoice);
+              return next;
+            });
+            if (syncedBackorder === null) setTasks((current) => current.filter((task) => task.relatedTo !== linkedBackorder!.id));
             setModal(null);
             logActivity(editing ? (editing.status === "Confirmed" ? "Updated confirmed order" : "Updated order") : "Created order", editing?.status === "Confirmed" ? "Confirmed Orders" : "Orders", editing?.status === "Confirmed" ? `${requestedId} · ${confirmedChangeSummary.join(" | ") || "Order details saved"}` : requestedId);
             flash(editing ? "Order updated successfully" : "Draft order created. Confirm it to reserve available stock and create any backorder.");

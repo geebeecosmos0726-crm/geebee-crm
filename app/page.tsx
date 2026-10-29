@@ -2484,9 +2484,9 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit, showDraftOr
         return [...current, ...cloudDrafts.filter((order) => !known.has(order.id.trim().toLowerCase()))];
       });
       onAudit("Fetched connected Google Sheet orders", "Orders", `${importedOrders.length} new order(s)`);
-      setMessage(importedOrders.length ? `${importedOrders.length} new draft order${importedOrders.length === 1 ? "" : "s"} imported from Google Sheets. New customer names remain only on the draft order and become customer profiles after Save order.` : "No new orders found. Existing order IDs were skipped; your customer list was unchanged.");
+      setMessage(importedOrders.length ? `${importedOrders.length} new draft order${importedOrders.length === 1 ? "" : "s"} imported from Google Sheets. New customer names remain only on the draft order and become customer profiles after Save order.` : cloudDrafts.length ? `No new orders were added. ${cloudDrafts.length} existing Draft order${cloudDrafts.length === 1 ? " was" : "s were"} reloaded from the CRM cloud.` : "No new orders found. Existing order IDs were skipped; your customer list was unchanged.");
       setDetails((result.skipped || []).slice(0, 12));
-      if (importedOrders.length) window.setTimeout(showDraftOrders, 350);
+      if (cloudDrafts.length) window.setTimeout(showDraftOrders, 350);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Connected Sheet could not be fetched."); }
     finally { setLoading(false); }
   };

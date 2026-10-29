@@ -22,7 +22,8 @@ export async function POST(request: Request) {
   const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
   const body = await request.json().catch(() => ({}));
-  if (body.confirm !== "DELETE ALL BUSINESS DATA") return Response.json({ error: "Confirmation is required." }, { status: 400 });
+  const preserveBackupForTest = body.confirm === "TEST SHEET RECOVERY" && body.preserveBackup === true;
+  if (body.confirm !== "DELETE ALL BUSINESS DATA" && !preserveBackupForTest) return Response.json({ error: "Confirmation is required." }, { status: 400 });
   if (!url || !serviceKey || !token) return Response.json({ error: "Reset service is not configured." }, { status: 500 });
 
   const auth = createClient(url, serviceKey, { auth: { persistSession: false } });
@@ -37,7 +38,7 @@ export async function POST(request: Request) {
   if (!ownerId) return Response.json({ error: "Only a GeeBee administrator can clear business data." }, { status: 403 });
 
   try {
-    const tables = ["crm_clients", "crm_orders", "crm_invoices", "crm_leads", "crm_quotes", "crm_tasks", "crm_transporters", "crm_audit_events", "crm_recovery_snapshots"];
+    const tables = ["crm_clients", "crm_orders", "crm_invoices", "crm_leads", "crm_quotes", "crm_tasks", "crm_transporters", "crm_audit_events", ...(preserveBackupForTest ? [] : ["crm_recovery_snapshots"])];
     const counts = await Promise.all(tables.map(async (table) => {
       const { count, error } = await db.from(table).select("*", { count: "exact", head: true }).eq("workspace_owner_id", ownerId);
       if (error) throw error;
@@ -50,7 +51,9 @@ export async function POST(request: Request) {
     const { error: workspaceError } = await db.from("crm_workspaces").update({ data: { normalizedRecords: true, purchases: [], resetAt: new Date().toISOString() }, updated_at: new Date().toISOString() }).eq("owner_id", ownerId);
     if (workspaceError) throw workspaceError;
 
-    if (spreadsheetId && keyJson) {
+    // The recovery test clears CRM only. Its whole purpose is to prove that
+    // the Sheet can rebuild the workspace, so the backup must stay untouched.
+    if (!preserveBackupForTest && spreadsheetId && keyJson) {
       const credentials = JSON.parse(keyJson);
       if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
       const sheets = google.sheets({ version: "v4", auth: new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/spreadsheets"] }) });
@@ -63,7 +66,7 @@ export async function POST(request: Request) {
       await sheets.spreadsheets.values.clear({ spreadsheetId, range: "'Backup Log'!A:Z" });
       await sheets.spreadsheets.values.update({ spreadsheetId, range: "'Backup Log'!A1", valueInputOption: "RAW", requestBody: { values: [["Backup timestamp", "Status", "Workspace updated at", "Record counts"], [new Date().toISOString(), "Business data permanently cleared", "", "Products preserved"]] } });
     }
-    return Response.json({ ok: true, cleared: Object.fromEntries(counts), productsPreserved: true });
+    return Response.json({ ok: true, cleared: Object.fromEntries(counts), productsPreserved: true, backupPreserved: preserveBackupForTest });
   } catch (error) {
     console.error("Business data purge failed:", error instanceof Error ? error.message : error);
     return Response.json({ error: error instanceof Error ? error.message : "Could not clear business data." }, { status: 500 });

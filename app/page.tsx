@@ -1641,7 +1641,7 @@ export default function Home() {
         )}{" "}
         {section === "Product Stock Inventory" && <ProductStockInventoryPanel session={session} canApply={isAdmin} onAudit={logActivity} query={search} onProductsSynced={setCatalogue} onLiveBackup={queueGoogleSheetLiveBackup} />}{" "}
         {section === "Categories" && <ProductStockCategoriesPanel session={session} query={search} openCategory={(category) => { setSection("Product Stock Inventory"); setSectionSearches((current) => ({ ...current, "Product Stock Inventory": category })); }} />}{" "}
-        {section === "Fetch Orders" && <GoogleSheetOrderFetch existingOrders={orders} addOrders={setOrders} onAudit={logActivity} />}{" "}
+        {section === "Fetch Orders" && <GoogleSheetOrderFetch existingOrders={orders} addOrders={setOrders} onAudit={logActivity} showDraftOrders={() => { setSectionSearches((current) => ({ ...current, Orders: "" })); setSection("Orders"); }} />}{" "}
         {section === "Transporters" && <TransportersPanel transporters={transporters.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.area || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("transporter", item)} add={() => show("transporter")} remove={(ids) => { markForCloudDeletion("crm_transporters", ids); setTransporters((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed transporter", "Transporters", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} transporter${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
         {section === "Suppliers" && <SuppliersPanel suppliers={suppliers.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.country || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("supplier", item)} add={() => show("supplier")} remove={(ids) => { setSuppliers((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed supplier", "Suppliers", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} supplier${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
         {section === "Settings" && <TeamAccess members={members} requests={accessRequests} workspaceOwnerId={workspaceOwnerId} canManage={isAdmin} onChange={setMembers} onRequestsChange={setAccessRequests} onAudit={logActivity} auditEvents={auditEvents} />}{" "}
@@ -2460,7 +2460,7 @@ function ClientProfile({ client, orders, invoices, catalogue, auditEvents, close
     <section className="profile-section"><div className="profile-section-head"><h3>Customer timeline</h3><span>Latest activity</span></div><div className="customer-timeline">{timelineEvents.map((event) => <article key={event.id}><span className="timeline-dot"/><div><b>{event.action}</b><p>{event.actor_email} · {event.module}</p></div><time>{new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</time></article>)}{clientInvoices.slice(0, 3).map((invoice) => <article key={`invoice-${invoice.id}`}><span className="timeline-dot invoice"/><div><b>Invoice {invoice.id} is {invoice.status.toLowerCase()}</b><p>{displayMoney(invoice.amount)} · Due {invoice.due}</p></div></article>)}{clientOrders.slice(0, 3).map((order) => <article key={`order-${order.id}`}><span className="timeline-dot order"/><div><b>Order {order.id}</b><p>{order.product} · {money(orderTotal(order))}</p></div></article>)}{!timelineEvents.length && !clientInvoices.length && !clientOrders.length && <p className="profile-empty">Activity will appear here as this customer is engaged.</p>}</div></section>
   </Shell>;
 }
-function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit }: { existingOrders: Order[]; addOrders: React.Dispatch<React.SetStateAction<Order[]>>; onAudit: (action: string, module: string, details: string) => void }) {
+function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit, showDraftOrders }: { existingOrders: Order[]; addOrders: React.Dispatch<React.SetStateAction<Order[]>>; onAudit: (action: string, module: string, details: string) => void; showDraftOrders: () => void }) {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [details, setDetails] = useState<string[]>([]);
@@ -2485,6 +2485,7 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit }: { existin
       onAudit("Fetched connected Google Sheet orders", "Orders", `${importedOrders.length} new order(s)`);
       setMessage(importedOrders.length ? `${importedOrders.length} new draft order${importedOrders.length === 1 ? "" : "s"} imported from Google Sheets. New customer names remain only on the draft order and become customer profiles after Save order.` : "No new orders found. Existing order IDs were skipped; your customer list was unchanged.");
       setDetails((result.skipped || []).slice(0, 12));
+      if (importedOrders.length) window.setTimeout(showDraftOrders, 350);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Connected Sheet could not be fetched."); }
     finally { setLoading(false); }
   };

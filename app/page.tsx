@@ -2475,12 +2475,13 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit, showDraftOr
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Connected Sheet could not be fetched.");
       const importedOrders = (result.orders || []) as Order[];
+      const cloudDrafts = (result.draftOrders || importedOrders) as Order[];
       // Use the live state inside each setter.  Props can be a moment behind
       // after a cloud refresh, and customer master data must always merge —
       // never be replaced — when Sheet orders are fetched.
       addOrders((current) => {
         const known = new Set(current.map((order) => order.id.trim().toLowerCase()));
-        return [...current, ...importedOrders.filter((order) => !known.has(order.id.trim().toLowerCase()))];
+        return [...current, ...cloudDrafts.filter((order) => !known.has(order.id.trim().toLowerCase()))];
       });
       onAudit("Fetched connected Google Sheet orders", "Orders", `${importedOrders.length} new order(s)`);
       setMessage(importedOrders.length ? `${importedOrders.length} new draft order${importedOrders.length === 1 ? "" : "s"} imported from Google Sheets. New customer names remain only on the draft order and become customer profiles after Save order.` : "No new orders found. Existing order IDs were skipped; your customer list was unchanged.");

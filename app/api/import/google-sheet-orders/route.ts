@@ -196,7 +196,14 @@ export async function POST(request: Request) {
       if (error) throw error;
       await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched connected Google Sheet orders", module: "Orders", details: `${imported.length} new draft order(s) imported; ${reusedCustomers.length} customer match(es); ${pendingCustomers.length} customer profile(s) pending order save; ${skipped.length} tab(s) skipped` });
     }
-    return Response.json({ orders: imported, clients: [], reusedCustomers, pendingCustomers, skipped, scanned: metadata.data.sheets?.length || 0 });
+    // Also return the current server-side Drafts. A prior fetch can have
+    // successfully saved a draft while a browser refresh left its local list
+    // stale; reconciling these records on every fetch keeps Orders truthful.
+    const draftOrders = [
+      ...(existingOrders || []).map((row: any) => row.data as ImportedOrder),
+      ...imported,
+    ].filter((order) => order && order.status === "Draft");
+    return Response.json({ orders: imported, draftOrders, clients: [], reusedCustomers, pendingCustomers, skipped, scanned: metadata.data.sheets?.length || 0 });
   } catch (error) {
     console.error("Google order import failed:", error instanceof Error ? error.message : error);
     return Response.json({ error: error instanceof Error ? error.message : "Could not fetch the connected Google Sheet." }, { status: 400 });

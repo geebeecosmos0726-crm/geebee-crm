@@ -1410,7 +1410,13 @@ export default function Home() {
     if (!window.confirm(`Confirm ${order.id}? CRM will reserve Sheet stock now and shortages will be made into backorders.`)) return;
     const shortages: ProductLine[] = [];
     const dispatchLines: ProductLine[] = [];
-    const remainingStock = new Map(catalogue.map((product) => [skuKey(product.sku), freeStock(product)]));
+    // The current Confirmed Orders are the reservation source of truth. Do
+    // not let a stale stored reservedStock turn available stock into a false
+    // backorder (for example, BA 301 showing 744 free but being treated as 0).
+    const remainingStock = new Map(catalogue.map((product) => {
+      const liveReserved = confirmedReservationsForSku(orders, product.sku).reduce((total, entry) => total + entry.quantity, 0);
+      return [skuKey(product.sku), Math.max(0, availableStock(product) - liveReserved)];
+    }));
     requestedLines.forEach((line) => {
       const key = skuKey(line.sku); const available = remainingStock.get(key) || 0;
       const dispatchNow = Math.max(0, Math.min(line.quantity, available)); const short = Math.max(0, line.quantity - dispatchNow);
@@ -1422,7 +1428,9 @@ export default function Home() {
       const dispatched = dispatchLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       // Only quantities that physically exist are reserved. A shortage lives
       // only in Backorders and must never consume stock from another order.
-      return !dispatched ? product : { ...product, reservedStock: (product.reservedStock || 0) + dispatched };
+      if (!dispatched) return product;
+      const liveReserved = confirmedReservationsForSku(orders, product.sku).reduce((total, entry) => total + entry.quantity, 0);
+      return { ...product, reservedStock: liveReserved + dispatched };
     }));
     const firstDispatch = dispatchLines[0] || requestedLines[0];
     const confirmedOrder: Order = { ...order, product: firstDispatch.product, sku: firstDispatch.sku, quantity: firstDispatch.quantity, unitPrice: firstDispatch.unitPrice, products: dispatchLines, approvedProducts: dispatchLines, status: "Confirmed", backorders: shortages };

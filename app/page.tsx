@@ -890,6 +890,8 @@ export default function Home() {
     explicitCloudDeletes.current[table] = marked;
   };
   const sheetSyncTimer = useRef<number | null>(null);
+  const sheetBackupInFlight = useRef(false);
+  const sheetBackupPending = useRef(false);
   const workspaceDataSnapshot = useRef<string | null>(null);
   const flash = (m: string) => {
       setToast(m);
@@ -945,17 +947,23 @@ export default function Home() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [modal, clientProfile]);
-  // The scheduled backup remains a safety net. This queues a compact live
-  // mirror after a successful cloud write, so adds, edits and deletes reach
-  // the recovery Sheet together without sending a request for every keystroke.
+  // The scheduled backup remains a safety net. Live mirrors are batched and
+  // throttled so a series of CRM saves cannot exceed Google Sheets' per-user
+  // write quota. The most recent pending change is always mirrored next.
   const queueGoogleSheetLiveBackup = () => {
     if (!session?.access_token || typeof window === "undefined") return;
     if (sheetSyncTimer.current) window.clearTimeout(sheetSyncTimer.current);
     sheetSyncTimer.current = window.setTimeout(() => {
+      if (sheetBackupInFlight.current) { sheetBackupPending.current = true; return; }
+      sheetBackupInFlight.current = true;
       fetch("/api/backup/google-sheets?mode=live", { headers: { Authorization: `Bearer ${session.access_token}` } })
         .then((response) => { if (!response.ok) console.warn("Live Google Sheet backup was not completed."); })
-        .catch(() => console.warn("Live Google Sheet backup was not completed."));
-    }, 1500);
+        .catch(() => console.warn("Live Google Sheet backup was not completed."))
+        .finally(() => {
+          sheetBackupInFlight.current = false;
+          if (sheetBackupPending.current) { sheetBackupPending.current = false; queueGoogleSheetLiveBackup(); }
+        });
+    }, 12000);
   };
   // Existing delete actions use this name; all now feed the same live mirror.
   const syncGoogleSheetAfterDelete = queueGoogleSheetLiveBackup;

@@ -91,13 +91,18 @@ export async function GET(request: Request) {
     };
     const titles = ["README", "Backup Log", ...Object.keys(headers)];
     await ensureSheets(sheets, spreadsheetId, titles);
-    for (const [title, header] of Object.entries(headers)) {
-      await sheets.spreadsheets.values.clear({ spreadsheetId, range: `'${title}'!A:ZZ` });
-      await sheets.spreadsheets.values.update({ spreadsheetId, range: `'${title}'!A1`, valueInputOption: "RAW", requestBody: { values: [header, ...backupRows[title]] } });
-    }
-    await sheets.spreadsheets.values.clear({ spreadsheetId, range: "'README'!A:Z" });
-    await sheets.spreadsheets.values.update({ spreadsheetId, range: "'README'!A1", valueInputOption: "RAW", requestBody: { values: [["GeeBee CRM Recovery Backup"], ["Do not rename column headers. Restore imports validate these tabs and columns."], ["Latest backup", new Date().toISOString()], ["Workspace updated at", workspace.updated_at]] } });
-    await sheets.spreadsheets.values.update({ spreadsheetId, range: "'Backup Log'!A1", valueInputOption: "RAW", requestBody: { values: [["Backup timestamp", "Status", "Workspace updated at", "Record counts"]] } });
+    // One mirror used to clear and rewrite each tab separately (roughly 28
+    // write requests). Batch the whole workbook into three requests instead:
+    // clear, write current data, then append the log entry.
+    await sheets.spreadsheets.values.batchClear({ spreadsheetId, requestBody: { ranges: [...Object.keys(headers).map((title) => `'${title}'!A:ZZ`), "'README'!A:Z", "'Backup Log'!A:Z"] } });
+    await sheets.spreadsheets.values.batchUpdate({ spreadsheetId, requestBody: {
+      valueInputOption: "RAW",
+      data: [
+        ...Object.entries(headers).map(([title, header]) => ({ range: `'${title}'!A1`, values: [header, ...backupRows[title]] })),
+        { range: "'README'!A1", values: [["GeeBee CRM Recovery Backup"], ["Do not rename column headers. Restore imports validate these tabs and columns."], ["Latest backup", new Date().toISOString()], ["Workspace updated at", workspace.updated_at]] },
+        { range: "'Backup Log'!A1", values: [["Backup timestamp", "Status", "Workspace updated at", "Record counts"]] },
+      ],
+    } });
     const countSummary = Object.entries(backupRows).map(([title, value]) => `${title}: ${value.length}`).join(" | ");
     await sheets.spreadsheets.values.append({ spreadsheetId, range: "'Backup Log'!A:D", valueInputOption: "RAW", requestBody: { values: [[new Date().toISOString(), "Success", workspace.updated_at, countSummary]] } });
     // Live mirroring happens after every successful CRM save. It deliberately

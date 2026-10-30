@@ -2531,7 +2531,7 @@ function ProductStockInventoryPanel({ session, canApply, onAudit, query, onProdu
       onLiveBackup();
       const skipped = Array.isArray(result.skippedRows) ? result.skippedRows.length : 0;
       if (!background) {
-        setMessage(`${result.scanned || 0} Sheet SKU(s) processed: ${result.updated || 0} updated, ${result.added || 0} added to the separate test inventory.${skipped ? ` ${skipped} incomplete row${skipped === 1 ? " needs" : "s need"} review.` : ""}`);
+        setMessage(`${result.scanned || 0} Sheet SKU(s) processed: ${result.updated || 0} updated, ${result.added || 0} added to the separate test inventory.${result.cleanedPlaceholders ? ` ${result.cleanedPlaceholders} old incomplete product card${result.cleanedPlaceholders === 1 ? " was" : "s were"} removed.` : ""}${skipped ? ` ${skipped} incomplete Sheet row${skipped === 1 ? " needs" : "s need"} a Product Name or SKU ID.` : ""}`);
         onAudit("Synced test Product Stock Inventory", "Products", `${result.updated || 0} updated · ${result.added || 0} added`);
       }
     } catch (error) { setMessage(error instanceof Error ? error.message : "Product Stock Inventory could not be updated."); }

@@ -72,10 +72,13 @@ function readProducts(values: unknown[][]) {
     // into the isolated testing module and report these rows instead of
     // blocking the complete sync.
     const sourceRow = head + offset + 2;
-    if (!sku || !name) skippedRows.push({ row: sourceRow, reason: !sku ? "Missing SKU ID" : "Missing Product Name" });
-    // Save a visible placeholder instead of silently losing a non-empty Sheet
-    // row. The user can open the test product and complete its missing details.
-    products.push({ sku: sku || `MISSING-SKU-${sourceRow}`, name: name || `Missing product name (row ${sourceRow})`, category: get(row, columns.category), unit: get(row, columns.unit), innerQty: get(row, columns.innerQty), outerQty: get(row, columns.outerQty), sellingPrice: number(get(row, columns.sellingPrice)), availableStock: number(get(row, columns.availableStock)), lowStockAlert: number(get(row, columns.lowStockAlert)), imageUrl: get(row, columns.imageUrl), row: sourceRow });
+    if (!sku || !name) {
+      // Never manufacture a second product from a partly filled row. A blank
+      // name beside an existing SKU is an incomplete Sheet row, not a new SKU.
+      skippedRows.push({ row: sourceRow, reason: !sku ? "Missing SKU ID" : "Missing Product Name" });
+      continue;
+    }
+    products.push({ sku, name, category: get(row, columns.category), unit: get(row, columns.unit), innerQty: get(row, columns.innerQty), outerQty: get(row, columns.outerQty), sellingPrice: number(get(row, columns.sellingPrice)), availableStock: number(get(row, columns.availableStock)), lowStockAlert: number(get(row, columns.lowStockAlert)), imageUrl: get(row, columns.imageUrl), row: sourceRow });
   }
   if (!products.length) return { error: "No complete product rows were found. Each imported row needs SKU ID and Product Name.", products: [] as SheetProduct[], skippedRows };
   return { error: "", products, skippedRows };
@@ -123,7 +126,15 @@ export async function POST(request: Request) {
     // inventory master and never alters the live Product / SKU catalogue.
     const { data: existingRows, error: existingError } = await db.from("crm_stock_inventory").select("record_id, data").eq("workspace_owner_id", ownerId).limit(100000);
     if (existingError) throw existingError;
-    const existing = (existingRows || []).map((row: any) => ({ recordId: row.record_id, product: row.data as ProductData }));
+    const allExisting = (existingRows || []).map((row: any) => ({ recordId: row.record_id, product: row.data as ProductData }));
+    // Remove only the old placeholders produced by the former sync behaviour.
+    // They are not real products and are the source of the duplicate SKU cards.
+    const placeholderIds = allExisting.filter((record) => /^missing product name \(row \d+\)$/i.test(display(record.product.name))).map((record) => record.recordId);
+    if (placeholderIds.length) {
+      const { error: cleanupError } = await db.from("crm_stock_inventory").delete().eq("workspace_owner_id", ownerId).in("record_id", placeholderIds);
+      if (cleanupError) throw cleanupError;
+    }
+    const existing = allExisting.filter((record) => !placeholderIds.includes(record.recordId));
     const existingByRow = new Map<string, { recordId: string; product: ProductData }>();
     existing.forEach((record) => { const key = rowKey(record.product); if (key) existingByRow.set(key, record); });
     const existingByIdentity = new Map<string, Array<{ recordId: string; product: ProductData }>>();
@@ -154,8 +165,8 @@ export async function POST(request: Request) {
       if (upsertError) throw upsertError;
     }
     const crmOnly = existing.map((record) => record.product).filter((product) => product.sku && (!rowKey(product) || !sheetKeys.has(rowKey(product)))).map((product) => ({ sku: product.sku || "", name: product.name || "" }));
-    await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Synced Product Stock Inventory", module: "Products", details: `${updated} updated · ${added} added · ${crmOnly.length} CRM-only SKU(s)` });
-    return Response.json({ sheetTitle: title, products: records.map((record) => record.data), updated, added, crmOnly, skippedRows: parsed.skippedRows || [], scanned: parsed.products.length });
+    await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Synced Product Stock Inventory", module: "Products", details: `${updated} updated · ${added} added · ${placeholderIds.length} incomplete placeholder(s) removed · ${crmOnly.length} CRM-only SKU(s)` });
+    return Response.json({ sheetTitle: title, products: records.map((record) => record.data), updated, added, cleanedPlaceholders: placeholderIds.length, crmOnly, skippedRows: parsed.skippedRows || [], scanned: parsed.products.length });
   } catch (error) {
     console.error("Google product master sync failed:", error instanceof Error ? error.message : error);
     return Response.json({ error: error instanceof Error ? error.message : "Could not sync the Product Stock Inventory sheet." }, { status: 400 });

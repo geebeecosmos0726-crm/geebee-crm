@@ -346,6 +346,15 @@ const receivedPurchaseQuantity = (line: Partial<PurchaseLine>) => {
 // each other between stock syncs.
 const freeStock = (product: CatalogueItem) => Math.max(0, availableStock(product) - (product.reservedStock || 0));
 const linesFor = (order: Order): ProductLine[] => order.products || [{ product: order.product, sku: order.sku, quantity: order.quantity, unitPrice: order.unitPrice }];
+const confirmedReservationsForSku = (orders: Order[], sku: string) => orders
+  .filter((order) => order.status === "Confirmed")
+  .flatMap((order) => (order.approvedProducts || linesFor(order)).filter((line) => skuKey(line.sku) === skuKey(sku)).map((line) => ({ orderId: order.id, quantity: line.quantity })));
+function ProductReservationSummary({ product, orders }: { product: CatalogueItem; orders: Order[] }) {
+  const reservations = confirmedReservationsForSku(orders, product.sku);
+  const reserved = reservations.reduce((total, entry) => total + entry.quantity, 0);
+  const free = Math.max(0, availableStock(product) - reserved);
+  return <><p className="catalogue-stock">Reserved: <b>{reserved.toLocaleString("en-IN")}</b> · Free: <b>{free.toLocaleString("en-IN")}</b></p>{reservations.length > 0 && <p className="catalogue-stock">Reserved by: <b>{reservations.map((entry) => `${entry.orderId} (${entry.quantity.toLocaleString("en-IN")})`).join(", ")}</b></p>}</>;
+}
 const orderTotal = (order: Order) => linesFor(order).reduce((total, line) => total + line.quantity * line.unitPrice, 0);
 const orderEntrySource = (order: Order) => /imported\s+from/i.test(order.remarks || "") ? "Import" : "Manual";
 const packingInstructions = (order: Order) => /^imported\s+from\s+connected\s+google\s+sheet\.?$/i.test((order.remarks || "").trim()) ? "" : (order.remarks || "").trim();
@@ -1346,11 +1355,14 @@ export default function Home() {
       return !released ? product : { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - released) };
     }));
     const first = restoredLines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
-    setOrders((current) => current.filter((item) => item.id !== advanceId).map((item) => item.id === order.id ? { ...item, ...first, products: restoredLines, approvedProducts: undefined, backorders: undefined, clientApproval: undefined, status: "Draft" } : item));
-    setInvoices((current) => current.filter((invoice) => invoice.order !== advanceId));
-    setTasks((current) => current.filter((task) => task.relatedTo !== advanceId));
+    setOrders((current) => current.map((item) => {
+      if (item.id === advanceId) return { ...item, status: "Cancelled", cancelledFromStage: "Confirmed" };
+      return item.id === order.id ? { ...item, ...first, products: restoredLines, approvedProducts: undefined, backorders: undefined, clientApproval: undefined, status: "Draft", inventoryCommitted: false } : item;
+    }));
+    setInvoices((current) => current.map((invoice) => invoice.order === advanceId ? { ...invoice, status: "Cancelled" } : invoice));
+    setTasks((current) => current.map((task) => task.relatedTo === advanceId ? { ...task, status: "Done" } : task));
     logActivity("Returned confirmed order to Orders", "Orders", order.id);
-    flash(`${order.id} returned to Orders. Inventory allocation and backorder reservation were released.`);
+    flash(`${order.id} returned to Orders. Its linked backorder was cancelled and all stock reservation was released.`);
   };
   const returnDispatchToConfirmed = (order: Order) => {
     if (order.status !== "Dispatch plan") return;
@@ -1382,10 +1394,19 @@ export default function Home() {
     logActivity("Reset demo inventory", "Catalogue", `${result.updated || 0} products set to ${quantity.toLocaleString("en-IN")} available units`);
     flash(`Demo inventory reset: ${result.updated || 0} products now have ${quantity.toLocaleString("en-IN")} available units.`);
   };
+  const releaseAllReservations = () => {
+    if (!window.confirm("Release all Product / SKU reservations? Use this only after confirming there are no active reservations.")) return;
+    setCatalogue((current) => current.map((product) => ({ ...product, reservedStock: 0 })));
+    logActivity("Released all product reservations", "Products", "Admin reset after stock review");
+    flash("All Product / SKU reservations were released. Available Stock was not changed.");
+  };
   const confirmOrder = (order: Order) => {
     if (order.status !== "Draft" || isBackorderRecord(order)) return;
+    if (!catalogueHydrated) { flash("Product / SKU inventory is still loading. Please wait a moment, then confirm the order again."); return; }
     const requestedLines = linesFor(order);
     if (!requestedLines.length) { flash("Add at least one product line before confirming this order."); return; }
+    const missingSkus = [...new Set(requestedLines.filter((line) => !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku))).map((line) => line.sku || line.product))];
+    if (missingSkus.length) { flash(`Cannot confirm ${order.id}: ${missingSkus.join(", ")} is not in Product / SKUs. Add it to the Stock Master first.`); return; }
     if (!window.confirm(`Confirm ${order.id}? CRM will reserve Sheet stock now and shortages will be made into backorders.`)) return;
     const shortages: ProductLine[] = [];
     const dispatchLines: ProductLine[] = [];
@@ -1413,7 +1434,8 @@ export default function Home() {
       setTasks((current) => [...current, { id: `TASK-${Date.now()}`, title: `Arrange future dispatch for advance order ${advanceOrder.id}`, time: "10:00", dueDate: new Date().toISOString().slice(0, 10), assignee: "Rahul", type: "Follow-up", status: "Open", relatedTo: advanceOrder.id }]);
     }
     logActivity("Confirmed order and reserved inventory", "Orders", shortages.length ? `${order.id} · ${shortages.length} shortage line(s) moved to backorder` : order.id);
-    flash(shortages.length ? `${order.id} confirmed; CRM reserved Sheet stock and created a backorder.` : `${order.id} confirmed and CRM stock reserved.`);
+    const fullyShortLines = shortages.filter((shortage) => shortage.quantity === (requestedLines.find((line) => skuKey(line.sku) === skuKey(shortage.sku))?.quantity || 0));
+    flash(shortages.length ? `${order.id} confirmed; CRM reserved Sheet stock and created a backorder.${fullyShortLines.length ? ` No free stock was available for: ${fullyShortLines.map((line) => line.sku).join(", ")}.` : ""}` : `${order.id} confirmed and CRM stock reserved.`);
   };
   const pushToDispatchPlan = (order: Order) => {
     if (order.status !== "Confirmed") return;
@@ -1639,7 +1661,7 @@ export default function Home() {
             remove={(ids) => { setCatalogue((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed catalogue product", "Catalogue", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} product${ids.length === 1 ? "" : "s"} removed from catalogue`); }}
           />
         )}{" "}
-        {section === "Product Stock Inventory" && <ProductStockInventoryPanel session={session} canApply={isAdmin} onAudit={logActivity} query={search} onProductsSynced={setCatalogue} onLiveBackup={queueGoogleSheetLiveBackup} />}{" "}
+        {section === "Product Stock Inventory" && <ProductStockInventoryPanel session={session} canApply={isAdmin} orders={orders} releaseAllReservations={releaseAllReservations} onAudit={logActivity} query={search} onProductsSynced={setCatalogue} onLiveBackup={queueGoogleSheetLiveBackup} />}{" "}
         {section === "Categories" && <ProductStockCategoriesPanel session={session} query={search} openCategory={(category) => { setSection("Product Stock Inventory"); setSectionSearches((current) => ({ ...current, "Product Stock Inventory": category })); }} />}{" "}
         {section === "Fetch Orders" && <GoogleSheetOrderFetch existingOrders={orders} addOrders={setOrders} onAudit={logActivity} showDraftOrders={() => { setSectionSearches((current) => ({ ...current, Orders: "" })); setSection("Orders"); }} />}{" "}
         {section === "Transporters" && <TransportersPanel transporters={transporters.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.area || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("transporter", item)} add={() => show("transporter")} remove={(ids) => { markForCloudDeletion("crm_transporters", ids); setTransporters((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed transporter", "Transporters", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} transporter${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
@@ -2496,7 +2518,7 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit, showDraftOr
   return <section className="panel transfer-panel"><div className="panel-head"><div><span className="overline">CONNECTED ORDER SHEET</span><h2>Fetch new orders from Google Sheets</h2><p>Reads your existing order tabs, such as <b>E-404 SHYAM BALLOON PATNA</b> or <b>E-269 (OR) SHYAM BALLOON STORE, PATNA</b>. Only order IDs not already in the CRM are imported, always as Draft orders. Unmatched customer names stay on the draft only until it is saved.</p></div><button className="primary" type="button" onClick={fetchOrders} disabled={loading}>{loading ? "Fetching orders…" : "Fetch new orders"}</button></div>{message && <p className="transfer-message">{message}</p>}{details.length > 0 && <div className="transfer-fields"><b>Skipped tabs</b><br/>{details.join(" · ")}</div>}</section>;
 }
 
-function ProductStockInventoryPanel({ session, canApply, onAudit, query, onProductsSynced, onLiveBackup }: { session: Session; canApply: boolean; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>>; onLiveBackup: () => void }) {
+function ProductStockInventoryPanel({ session, canApply, orders, releaseAllReservations, onAudit, query, onProductsSynced, onLiveBackup }: { session: Session; canApply: boolean; orders: Order[]; releaseAllReservations: () => void; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>>; onLiveBackup: () => void }) {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [items, setItems] = useState<CatalogueItem[]>(() => readProductStockCache(session.user.id));
@@ -2554,7 +2576,7 @@ function ProductStockInventoryPanel({ session, canApply, onAudit, query, onProdu
     } catch (error) { setMessage(error instanceof Error ? error.message : "Product could not be updated."); }
     finally { setLoading(false); }
   };
-  return <><section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT MASTER</span><h2>Products / SKUs</h2><p>Your Google Sheet inventory is the product master for this section. Sync it only when the sheet has changed.</p></div><div className="catalogue-count"><b>{items.length}</b><span>SKUs</span></div></div><section className="catalogue-actions"><div className="catalogue-tip"><b>Google Sheet product master</b><p>Fields: SKU ID, Product Name, Category, Unit, Inner Qty, Outer Qty, Selling Price, Available Stock, Low Stock Alert, Image URL.</p></div><div className="button-row">{canApply && <button className="outline" type="button" disabled={loading} onClick={() => sync("setup")}>Set up blank sheet + test rows</button>}<span className="sync-stock-action"><button className="primary" type="button" disabled={loading} onClick={() => sync("sync")}>{loading ? "Syncing…" : "Sync Google Sheet"}</button><small>Update CRM from Sheet</small></span></div></section>{message && <p className="inventory-recon-message success">{message}</p>}<section className="catalogue-grid">{visibleItems.map((item) => <article className="catalogue-card" key={item.id} onClick={() => canApply && setEditing(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={item.name} onError={(event) => { event.currentTarget.style.display = "none"; }}/> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><small title={item.sku}>{item.sku}</small><h3 title={item.name}>{item.name}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / ${item.unit || "pc"}` : "Price to be added"}</p><p className="catalogue-stock">Available: <b>{availableStock(item).toLocaleString("en-IN")}</b></p><p className="catalogue-stock">Low alert: <b>{item.reorderThreshold ?? 0}</b></p>{canApply && <button className="edit-product" type="button" onClick={(event) => { event.stopPropagation(); setEditing(item); }}><Pencil size={13}/> Edit product</button>}</div></article>)}{!loading && !visibleItems.length && <div className="empty">No products match this search. Sync Google Sheet if the product master has changed.</div>}</section></section>{editing && <StockInventoryModal item={editing} close={() => setEditing(null)} save={saveEdit}/>}</>;
+  return <><section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT MASTER</span><h2>Products / SKUs</h2><p>Your Google Sheet inventory is the product master for this section. Sync it only when the sheet has changed.</p></div><div className="catalogue-count"><b>{items.length}</b><span>SKUs</span></div></div><section className="catalogue-actions"><div className="catalogue-tip"><b>Google Sheet product master</b><p>Fields: SKU ID, Product Name, Category, Unit, Inner Qty, Outer Qty, Selling Price, Available Stock, Low Stock Alert, Image URL.</p></div><div className="button-row">{canApply && <button className="outline" type="button" disabled={loading} onClick={() => sync("setup")}>Set up blank sheet + test rows</button>}{canApply && <button className="outline" type="button" disabled={loading} onClick={releaseAllReservations}>Release all reservations</button>}<span className="sync-stock-action"><button className="primary" type="button" disabled={loading} onClick={() => sync("sync")}>{loading ? "Syncing…" : "Sync Google Sheet"}</button><small>Update CRM from Sheet</small></span></div></section>{message && <p className="inventory-recon-message success">{message}</p>}<section className="catalogue-grid">{visibleItems.map((item) => <article className="catalogue-card" key={item.id} onClick={() => canApply && setEditing(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={item.name} onError={(event) => { event.currentTarget.style.display = "none"; }}/> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><small title={item.sku}>{item.sku}</small><h3 title={item.name}>{item.name}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / ${item.unit || "pc"}` : "Price to be added"}</p><p className="catalogue-stock">Available: <b>{availableStock(item).toLocaleString("en-IN")}</b></p><ProductReservationSummary product={item} orders={orders}/><p className="catalogue-stock">Low alert: <b>{item.reorderThreshold ?? 0}</b></p>{canApply && <button className="edit-product" type="button" onClick={(event) => { event.stopPropagation(); setEditing(item); }}><Pencil size={13}/> Edit product</button>}</div></article>)}{!loading && !visibleItems.length && <div className="empty">No products match this search. Sync Google Sheet if the product master has changed.</div>}</section></section>{editing && <StockInventoryModal item={editing} close={() => setEditing(null)} save={saveEdit}/>}</>;
 }
 
 function ProductStockCategoriesPanel({ session, query, openCategory }: { session: Session; query: string; openCategory: (category: string) => void }) {

@@ -2137,6 +2137,10 @@ function Orders({
   confirmed?: boolean;
 }) {
   const [showCancelled, setShowCancelled] = useState(false);
+  // Linked advance/backorder records can be cancelled automatically when the
+  // main order returns to Draft. They are internal stock records, not a
+  // cancelled customer order, so keep them out of this customer-facing list.
+  const visibleCancelledOrders = cancelledOrders.filter((order) => !isBackorderRecord(order));
   return (
     <section className="panel record-panel">
       <div className="panel-head">
@@ -2148,7 +2152,7 @@ function Orders({
       {confirmed && orders.length > 0 && <section className="dispatch-approval-required"><b>Customer approval before dispatch</b><span>Send the GeeBee order on WhatsApp from this approved-order stage, then record the customer’s reply before moving it to Dispatch Plan.</span></section>}
       <OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} returnToOrders={returnToOrders} returnLabel={returnLabel} pushToDispatch={pushToDispatch} confirm={confirm} sendWhatsApp={sendWhatsApp} whatsAppLabel={confirmed ? "WhatsApp approval" : undefined} />
       {confirmed && updateApproval && <section className="dispatch-approval-list">{orders.map((order) => <article key={order.id}><div><b>{order.id} · {order.client}</b><small>{order.clientApproval || "Approval pending"} · Send the exact order text to the customer’s WhatsApp group before Dispatch Plan.</small></div><div><button className="outline" type="button" onClick={() => updateApproval(order.id, "Approval requested")}>Mark sent on WhatsApp</button><label>Client approval<select value={order.clientApproval || "Approval pending"} onChange={(event) => updateApproval(order.id, event.target.value as NonNullable<Order["clientApproval"]>)}><option>Approval pending</option><option>Approval requested</option><option>Approved</option><option>Changes requested</option><option>Rejected</option></select></label></div></article>)}</section>}
-      {cancelledOrders.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled {confirmed ? "Confirmed Orders" : "Orders"} <b>{cancelledOrders.length}</b></button>{showCancelled && <OrderTable orders={cancelledOrders} edit={edit} cancel={cancel} remove={remove} />}</section>}
+      {visibleCancelledOrders.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled {confirmed ? "Confirmed Orders" : "Orders"} <b>{visibleCancelledOrders.length}</b></button>{showCancelled && <OrderTable orders={visibleCancelledOrders} edit={edit} cancel={cancel} remove={remove} />}</section>}
     </section>
   );
 }

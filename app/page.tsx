@@ -425,7 +425,7 @@ const cleanSheetClient = (value: string) => {
   return withoutDate.replace(/^['’]/, "").trim();
 };
 const isBackorderRecord = (order: Order) => /^ADV-/i.test(order.id) || /advance|back\s*order/i.test(order.status || "");
-const isVisibleBackorder = (order: Order) => isBackorderRecord(order) && (/^ADV-/i.test(order.id) || linesFor(order).some((line) => line.quantity > 0));
+const isVisibleBackorder = (order: Order) => order.status !== "Cancelled" && isBackorderRecord(order) && (/^ADV-/i.test(order.id) || linesFor(order).some((line) => line.quantity > 0));
 const isFulfilmentOrder = (order?: Order) => Boolean(order && ["Sent to customer", "Received by customer"].includes(order.status));
 const orderWithLines = (order: Order, products: ProductLine[]): Order => {
   const first = products[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };

@@ -1350,19 +1350,24 @@ export default function Home() {
     const shortageLines = order.backorders?.length ? order.backorders : (orders.find((item) => item.id === advanceId)?.products || []);
     const confirmedLines = linesFor(order);
     const restoredLines = [...confirmedLines, ...shortageLines];
+    const advanceInvoiceIds = invoices.filter((invoice) => invoice.order === advanceId).map((invoice) => invoice.id);
+    const advanceTaskIds = tasks.filter((task) => task.relatedTo === advanceId).map((task) => task.id);
+    // Returning the main order to Draft absorbs its shortage lines back into
+    // that draft. The linked ADV record is no longer a separate business
+    // record, so remove it from the cloud as well as the current screen.
+    markForCloudDeletion("crm_orders", [advanceId]);
+    markForCloudDeletion("crm_invoices", advanceInvoiceIds);
+    markForCloudDeletion("crm_tasks", advanceTaskIds);
     setCatalogue((current) => current.map((product) => {
       const released = confirmedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       return !released ? product : { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - released) };
     }));
     const first = restoredLines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
-    setOrders((current) => current.map((item) => {
-      if (item.id === advanceId) return { ...item, status: "Cancelled", cancelledFromStage: "Confirmed" };
-      return item.id === order.id ? { ...item, ...first, products: restoredLines, approvedProducts: undefined, backorders: undefined, clientApproval: undefined, status: "Draft", inventoryCommitted: false } : item;
-    }));
-    setInvoices((current) => current.map((invoice) => invoice.order === advanceId ? { ...invoice, status: "Cancelled" } : invoice));
-    setTasks((current) => current.map((task) => task.relatedTo === advanceId ? { ...task, status: "Done" } : task));
+    setOrders((current) => current.filter((item) => item.id !== advanceId).map((item) => item.id === order.id ? { ...item, ...first, products: restoredLines, approvedProducts: undefined, backorders: undefined, clientApproval: undefined, status: "Draft", inventoryCommitted: false } : item));
+    setInvoices((current) => current.filter((invoice) => invoice.order !== advanceId));
+    setTasks((current) => current.filter((task) => task.relatedTo !== advanceId));
     logActivity("Returned confirmed order to Orders", "Orders", order.id);
-    flash(`${order.id} returned to Orders. Its linked backorder was cancelled and all stock reservation was released.`);
+    flash(`${order.id} returned to Orders. Its linked backorder and related records were removed, and all stock reservation was released.`);
   };
   const returnDispatchToConfirmed = (order: Order) => {
     if (order.status !== "Dispatch plan") return;

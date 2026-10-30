@@ -13,13 +13,6 @@ const key = (value: unknown) => String(value ?? "").trim().toLowerCase().replace
 const number = (value: unknown) => Number.parseFloat(String(value ?? "").replace(/₹|rs\.?/gi, "").replace(/[\s,]/g, "")) || 0;
 const initials = (value: string) => value.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join("").toUpperCase() || "CU";
 const quoteRange = (title: string) => `'${title.replace(/'/g, "''")}'!A:Z`;
-const nextFetchedDraftId = (orders: Array<{ record_id?: string; id?: string }>) => {
-  const suffix = String(new Date().getFullYear()).slice(-2);
-  const expression = new RegExp(`^E-(\\d+)/${suffix}$`, "i");
-  const next = orders.reduce((highest, order) => Math.max(highest, Number((order.record_id || order.id || "").match(expression)?.[1] || 0)), 0) + 1;
-  return `E-${String(next).padStart(3, "0")}/${suffix}`;
-};
-
 const citySuffixes = [
   "New Delhi", "Greater Noida", "Navi Mumbai", "Ahmedabad", "Bengaluru", "Bangalore", "Bhubaneswar", "Chandigarh", "Coimbatore", "Dehradun", "Ghaziabad", "Hyderabad", "Jabalpur", "Kharagpur", "Kolkata", "Calcutta", "Lucknow", "Ludhiana", "Mumbai", "Nagpur", "Patna", "Jaipur", "Indore", "Jammu", "Jamui", "Pune", "Ranchi", "Surat", "Vadodara", "Varanasi", "Kanpur", "Agra", "Bhopal", "Chennai", "Delhi", "Kochi", "Kota", "Meerut", "Mysore", "Noida", "Raipur", "Rajkot", "Siliguri", "Udaipur",
 ].sort((a, b) => b.length - a.length);
@@ -181,7 +174,6 @@ export async function POST(request: Request) {
       sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties" }),
     ]);
     if (ordersError || clientsError || productsError) throw ordersError || clientsError || productsError;
-    const knownOrderIds = new Set((existingOrders || []).map((row) => key(row.record_id)));
     const knownCustomers: CustomerIdentity[] = (existingClients || []).map((row: any) => ({ name: String(row.data?.name || "").trim(), city: String(row.data?.city || "").trim() })).filter((customer) => customer.name);
     // Order imports must resolve the SKU from the current Product / SKU
     // master, never from the retired catalogue table.
@@ -191,6 +183,7 @@ export async function POST(request: Request) {
     const reusedCustomers: string[] = [];
     const pendingCustomers: string[] = [];
     const skipped: string[] = [];
+    const obsoleteGeneratedDraftIds: string[] = [];
     for (const sheet of metadata.data.sheets || []) {
       const title = sheet.properties?.title || "";
       const details = tabDetails(title);
@@ -200,6 +193,23 @@ export async function POST(request: Request) {
       const lines = readLines(values, productMap);
       if (!lines.length) { skipped.push(`${details.id}: no ITEM and QUANTITY rows found`); continue; }
       const matchingHistory = (existingOrders || []).filter((row: any) => key(row.record_id) === key(details.id) || key(row.data?.sourceSheetOrderId) === key(details.id));
+      const progressedOrder = matchingHistory.find((row: any) => String(row.data?.status || "Draft") !== "Draft");
+      // An order Sheet is only an intake source. Once that original order ID
+      // has progressed beyond Draft, never bring it back into Orders. Earlier
+      // versions generated E-001/26 drafts here; clean only those generated
+      // duplicate drafts as they are discovered.
+      if (progressedOrder) {
+        for (const row of matchingHistory) {
+          const recordId = String(row.record_id || "");
+          const isGeneratedDraft = String(row.data?.status || "Draft") === "Draft"
+            && key(recordId) !== key(details.id)
+            && /\/\d{2}$/i.test(recordId)
+            && key(row.data?.sourceSheetOrderId) === key(details.id);
+          if (isGeneratedDraft) obsoleteGeneratedDraftIds.push(recordId);
+        }
+        skipped.push(`${details.id}: already ${String(progressedOrder.data?.status || "progressed").toLowerCase()}`);
+        continue;
+      }
       const existingDraft = matchingHistory.find((row: any) => String(row.data?.status || "Draft") === "Draft");
       const first = lines[0];
       const matchedCustomer = bestCustomerMatch(details.client, details.city, knownCustomers);
@@ -234,13 +244,8 @@ export async function POST(request: Request) {
         else pendingCustomers.push(`${details.id}: ${client}`);
         continue;
       }
-      // When the Sheet tab's previous CRM order has already been confirmed or
-      // dispatched, keep that history untouched and import the tab again as a
-      // new draft. A draft is deliberately skipped on later fetches until it
-      // moves forward, preventing duplicates from repeated button presses.
-      const id = matchingHistory.length || knownOrderIds.has(key(details.id)) ? nextFetchedDraftId([...(existingOrders || []), ...imported]) : details.id;
+      const id = details.id;
       imported.push({ id, sourceSheetOrderId: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "", transporter });
-      knownOrderIds.add(key(id));
       if (matchedCustomer) {
         reusedCustomers.push(`${details.id}: ${details.client} → ${matchedCustomer.name}`);
       } else {
@@ -264,15 +269,20 @@ export async function POST(request: Request) {
       const failed = updates.find((result) => result.error)?.error;
       if (failed) throw failed;
     }
-    if (imported.length || updatedDrafts.length) {
-      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched connected Google Sheet orders", module: "Orders", details: `${imported.length} new draft order(s) imported; ${updatedDrafts.length} existing draft order(s) refreshed; ${reusedCustomers.length} customer match(es); ${pendingCustomers.length} customer profile(s) pending order save; ${skipped.length} tab(s) skipped` });
+    if (obsoleteGeneratedDraftIds.length) {
+      const { error } = await db.from("crm_orders").delete().eq("workspace_owner_id", ownerId).in("record_id", [...new Set(obsoleteGeneratedDraftIds)]);
+      if (error) throw error;
+    }
+    if (imported.length || updatedDrafts.length || obsoleteGeneratedDraftIds.length) {
+      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched connected Google Sheet orders", module: "Orders", details: `${imported.length} new draft order(s) imported; ${updatedDrafts.length} existing draft order(s) refreshed; ${obsoleteGeneratedDraftIds.length} obsolete generated draft(s) removed; ${reusedCustomers.length} customer match(es); ${pendingCustomers.length} customer profile(s) pending order save; ${skipped.length} tab(s) skipped` });
     }
     // Also return the current server-side Drafts. A prior fetch can have
     // successfully saved a draft while a browser refresh left its local list
     // stale; reconciling these records on every fetch keeps Orders truthful.
     const draftById = new Map<string, ImportedOrder>();
+    const removedDrafts = new Set(obsoleteGeneratedDraftIds.map(key));
     for (const order of (existingOrders || []).map((row: any) => row.data as ImportedOrder)) {
-      if (order && order.status === "Draft") draftById.set(key(order.id), order);
+      if (order && order.status === "Draft" && !removedDrafts.has(key(order.id))) draftById.set(key(order.id), order);
     }
     for (const order of [...updatedDrafts, ...imported]) draftById.set(key(order.id), order);
     const draftOrders = [...draftById.values()];

@@ -160,6 +160,7 @@ export async function POST(request: Request) {
     // master, never from the retired catalogue table.
     const productMap = new Map((productMaster || []).map((row: any) => [key(row.data?.sku), row.data as { name?: string }]));
     const imported: ImportedOrder[] = [];
+    const updatedDrafts: ImportedOrder[] = [];
     const reusedCustomers: string[] = [];
     const pendingCustomers: string[] = [];
     const skipped: string[] = [];
@@ -167,16 +168,42 @@ export async function POST(request: Request) {
       const title = sheet.properties?.title || "";
       const details = tabDetails(title);
       if (!details) { skipped.push(`${title || "Untitled tab"}: use Order ID | Customer | City`); continue; }
-      const matchingHistory = (existingOrders || []).filter((row: any) => key(row.record_id) === key(details.id) || key(row.data?.sourceSheetOrderId) === key(details.id));
-      const existingDraft = matchingHistory.find((row: any) => String(row.data?.status || "Draft") === "Draft");
-      if (existingDraft) { skipped.push(`${details.id}: already in Draft as ${existingDraft.record_id}`); continue; }
       const result = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
       const lines = readLines((result.data.values || []) as unknown[][], productMap);
       if (!lines.length) { skipped.push(`${details.id}: no ITEM and QUANTITY rows found`); continue; }
+      const matchingHistory = (existingOrders || []).filter((row: any) => key(row.record_id) === key(details.id) || key(row.data?.sourceSheetOrderId) === key(details.id));
+      const existingDraft = matchingHistory.find((row: any) => String(row.data?.status || "Draft") === "Draft");
       const first = lines[0];
       const matchedCustomer = bestCustomerMatch(details.client, details.city, knownCustomers);
       const client = matchedCustomer?.name || details.client;
       const city = details.city || matchedCustomer?.city || "";
+      // A sheet is the source of truth for an order while it is still a Draft.
+      // Re-fetching its tab must refresh the draft rather than silently skip it.
+      // Once moved forward, the historic record stays immutable and this creates
+      // a new E-XXX/YY draft as before.
+      if (existingDraft) {
+        const current = existingDraft.data as Partial<ImportedOrder>;
+        updatedDrafts.push({
+          ...current,
+          id: String(existingDraft.record_id),
+          sourceSheetOrderId: details.id,
+          client,
+          city,
+          product: first.product,
+          sku: first.sku,
+          quantity: first.quantity,
+          unitPrice: first.unitPrice,
+          products: lines,
+          eta: String(current.eta || ""),
+          status: "Draft",
+          payment: (current.payment as "Partial") || "Partial",
+          avatar: initials(client),
+          remarks: String(current.remarks || ""),
+        });
+        if (matchedCustomer) reusedCustomers.push(`${details.id}: ${details.client} → ${matchedCustomer.name}`);
+        else pendingCustomers.push(`${details.id}: ${client}`);
+        continue;
+      }
       // When the Sheet tab's previous CRM order has already been confirmed or
       // dispatched, keep that history untouched and import the tab again as a
       // new draft. A draft is deliberately skipped on later fetches until it
@@ -196,16 +223,30 @@ export async function POST(request: Request) {
       const now = new Date().toISOString();
       const { error } = await db.from("crm_orders").insert(imported.map((order) => ({ workspace_owner_id: ownerId, record_id: order.id, search_key: `${order.id} ${order.client} ${order.city} ${order.sku}`.toLowerCase(), data: order, created_at: now, updated_at: now })));
       if (error) throw error;
-      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched connected Google Sheet orders", module: "Orders", details: `${imported.length} new draft order(s) imported; ${reusedCustomers.length} customer match(es); ${pendingCustomers.length} customer profile(s) pending order save; ${skipped.length} tab(s) skipped` });
+    }
+    if (updatedDrafts.length) {
+      const now = new Date().toISOString();
+      const updates = await Promise.all(updatedDrafts.map((order) => db.from("crm_orders").update({
+        search_key: `${order.id} ${order.client} ${order.city} ${order.sku}`.toLowerCase(),
+        data: order,
+        updated_at: now,
+      }).eq("workspace_owner_id", ownerId).eq("record_id", order.id)));
+      const failed = updates.find((result) => result.error)?.error;
+      if (failed) throw failed;
+    }
+    if (imported.length || updatedDrafts.length) {
+      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Fetched connected Google Sheet orders", module: "Orders", details: `${imported.length} new draft order(s) imported; ${updatedDrafts.length} existing draft order(s) refreshed; ${reusedCustomers.length} customer match(es); ${pendingCustomers.length} customer profile(s) pending order save; ${skipped.length} tab(s) skipped` });
     }
     // Also return the current server-side Drafts. A prior fetch can have
     // successfully saved a draft while a browser refresh left its local list
     // stale; reconciling these records on every fetch keeps Orders truthful.
-    const draftOrders = [
-      ...(existingOrders || []).map((row: any) => row.data as ImportedOrder),
-      ...imported,
-    ].filter((order) => order && order.status === "Draft");
-    return Response.json({ orders: imported, draftOrders, clients: [], reusedCustomers, pendingCustomers, skipped, scanned: metadata.data.sheets?.length || 0 });
+    const draftById = new Map<string, ImportedOrder>();
+    for (const order of (existingOrders || []).map((row: any) => row.data as ImportedOrder)) {
+      if (order && order.status === "Draft") draftById.set(key(order.id), order);
+    }
+    for (const order of [...updatedDrafts, ...imported]) draftById.set(key(order.id), order);
+    const draftOrders = [...draftById.values()];
+    return Response.json({ orders: imported, updated: updatedDrafts, draftOrders, clients: [], reusedCustomers, pendingCustomers, skipped, scanned: metadata.data.sheets?.length || 0 });
   } catch (error) {
     console.error("Google order import failed:", error instanceof Error ? error.message : error);
     return Response.json({ error: error instanceof Error ? error.message : "Could not fetch the connected Google Sheet." }, { status: 400 });

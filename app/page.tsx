@@ -2475,16 +2475,19 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit, showDraftOr
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Connected Sheet could not be fetched.");
       const importedOrders = (result.orders || []) as Order[];
-      const cloudDrafts = (result.draftOrders || importedOrders) as Order[];
+      const updatedOrders = (result.updated || []) as Order[];
+      const cloudDrafts = (result.draftOrders || [...updatedOrders, ...importedOrders]) as Order[];
       // Use the live state inside each setter.  Props can be a moment behind
       // after a cloud refresh, and customer master data must always merge —
       // never be replaced — when Sheet orders are fetched.
       addOrders((current) => {
+        const refreshed = new Map(cloudDrafts.map((order) => [order.id.trim().toLowerCase(), order]));
+        const merged = current.map((order) => refreshed.get(order.id.trim().toLowerCase()) || order);
         const known = new Set(current.map((order) => order.id.trim().toLowerCase()));
-        return [...current, ...cloudDrafts.filter((order) => !known.has(order.id.trim().toLowerCase()))];
+        return [...merged, ...cloudDrafts.filter((order) => !known.has(order.id.trim().toLowerCase()))];
       });
-      onAudit("Fetched connected Google Sheet orders", "Orders", `${importedOrders.length} new order(s)`);
-      setMessage(importedOrders.length ? `${importedOrders.length} new draft order${importedOrders.length === 1 ? "" : "s"} imported from Google Sheets. New customer names remain only on the draft order and become customer profiles after Save order.` : cloudDrafts.length ? `No new orders were added. ${cloudDrafts.length} existing Draft order${cloudDrafts.length === 1 ? " was" : "s were"} reloaded from the CRM cloud.` : "No new orders found. Existing order IDs were skipped; your customer list was unchanged.");
+      onAudit("Fetched connected Google Sheet orders", "Orders", `${importedOrders.length} new; ${updatedOrders.length} draft order(s) refreshed`);
+      setMessage(importedOrders.length || updatedOrders.length ? `${importedOrders.length ? `${importedOrders.length} new draft order${importedOrders.length === 1 ? "" : "s"} imported` : ""}${importedOrders.length && updatedOrders.length ? "; " : ""}${updatedOrders.length ? `${updatedOrders.length} existing draft order${updatedOrders.length === 1 ? " was" : "s were"} refreshed from the Sheet` : ""}. New customer names remain only on the draft order and become customer profiles after Save order.` : cloudDrafts.length ? `No new orders were added. ${cloudDrafts.length} existing Draft order${cloudDrafts.length === 1 ? " was" : "s were"} reloaded from the CRM cloud.` : "No new orders found. Existing order IDs were skipped; your customer list was unchanged.");
       setDetails((result.skipped || []).slice(0, 12));
       if (cloudDrafts.length) window.setTimeout(showDraftOrders, 350);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Connected Sheet could not be fetched."); }

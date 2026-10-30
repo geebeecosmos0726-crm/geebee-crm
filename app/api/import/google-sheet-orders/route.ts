@@ -4,7 +4,7 @@ import { google } from "googleapis";
 export const runtime = "nodejs";
 
 type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; remarks?: string };
-type ImportedOrder = { id: string; sourceSheetOrderId: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string };
+type ImportedOrder = { id: string; sourceSheetOrderId: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string; transporter?: string };
 type CustomerIdentity = { name: string; city: string };
 
 const sheetId = process.env.GOOGLE_ORDER_IMPORT_SHEET_ID;
@@ -122,6 +122,33 @@ function readLines(values: unknown[][], products: Map<string, { name?: string }>
   return lines;
 }
 
+// GeeBee order tabs place the transporter in the footer row, normally in the
+// cells immediately before TOTAL. It may be a merged cell such as
+// "9BC Transport", a labelled "Transporter | Name" pair, or simply a name
+// such as "PORTER" next to TOTAL. Read that footer without treating totals or
+// numeric amounts as transporter names.
+function readTransporter(values: unknown[][]) {
+  const rows = values.map((row) => Array.isArray(row) ? row.map((value) => String(value ?? "").trim()) : []);
+  const headerIndex = rows.findIndex((row) => findColumn(row, ["item", "sku", "product", "productsku"]) >= 0 && findColumn(row, ["quantity", "qty"]) >= 0);
+  if (headerIndex < 0) return "";
+  for (const row of rows.slice(headerIndex + 1)) {
+    const compact = row.map(key);
+    const totalIndex = compact.findIndex((cell) => cell === "total" || cell.startsWith("total"));
+    const labelIndex = compact.findIndex((cell) => cell === "transporter" || cell === "transport");
+    const namedTransport = row.find((cell) => /\btransport(?:er)?\b/i.test(cell) && !/^\s*transport(?:er)?\s*$/i.test(cell));
+    if (namedTransport) return namedTransport.replace(/\s+/g, " ").trim();
+    if (labelIndex >= 0) {
+      const following = row.slice(labelIndex + 1).find((cell) => cell && !/^total$/i.test(cell) && !/^\d[\d,.]*$/.test(cell));
+      if (following) return following.replace(/\s+/g, " ").trim();
+    }
+    if (totalIndex >= 0) {
+      const candidate = row.slice(0, totalIndex).find((cell) => cell && !/^\d[\d,.]*$/.test(cell) && !/^(?:total|remarks?)$/i.test(cell));
+      if (candidate) return candidate.replace(/\s+/g, " ").trim();
+    }
+  }
+  return "";
+}
+
 async function administrator(request: Request, url: string, serviceKey: string) {
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
   if (!token) throw new Error("Sign in again before fetching orders.");
@@ -169,7 +196,8 @@ export async function POST(request: Request) {
       const details = tabDetails(title);
       if (!details) { skipped.push(`${title || "Untitled tab"}: use Order ID | Customer | City`); continue; }
       const result = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
-      const lines = readLines((result.data.values || []) as unknown[][], productMap);
+      const values = (result.data.values || []) as unknown[][];
+      const lines = readLines(values, productMap);
       if (!lines.length) { skipped.push(`${details.id}: no ITEM and QUANTITY rows found`); continue; }
       const matchingHistory = (existingOrders || []).filter((row: any) => key(row.record_id) === key(details.id) || key(row.data?.sourceSheetOrderId) === key(details.id));
       const existingDraft = matchingHistory.find((row: any) => String(row.data?.status || "Draft") === "Draft");
@@ -177,6 +205,7 @@ export async function POST(request: Request) {
       const matchedCustomer = bestCustomerMatch(details.client, details.city, knownCustomers);
       const client = matchedCustomer?.name || details.client;
       const city = details.city || matchedCustomer?.city || "";
+      const transporter = readTransporter(values);
       // A sheet is the source of truth for an order while it is still a Draft.
       // Re-fetching its tab must refresh the draft rather than silently skip it.
       // Once moved forward, the historic record stays immutable and this creates
@@ -199,6 +228,7 @@ export async function POST(request: Request) {
           payment: (current.payment as "Partial") || "Partial",
           avatar: initials(client),
           remarks: String(current.remarks || ""),
+          transporter: transporter || String(current.transporter || ""),
         });
         if (matchedCustomer) reusedCustomers.push(`${details.id}: ${details.client} → ${matchedCustomer.name}`);
         else pendingCustomers.push(`${details.id}: ${client}`);
@@ -209,7 +239,7 @@ export async function POST(request: Request) {
       // new draft. A draft is deliberately skipped on later fetches until it
       // moves forward, preventing duplicates from repeated button presses.
       const id = matchingHistory.length || knownOrderIds.has(key(details.id)) ? nextFetchedDraftId([...(existingOrders || []), ...imported]) : details.id;
-      imported.push({ id, sourceSheetOrderId: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "" });
+      imported.push({ id, sourceSheetOrderId: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "", transporter });
       knownOrderIds.add(key(id));
       if (matchedCustomer) {
         reusedCustomers.push(`${details.id}: ${details.client} → ${matchedCustomer.name}`);

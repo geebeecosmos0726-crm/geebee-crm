@@ -1117,6 +1117,21 @@ export default function Home() {
       .catch(() => { /* The old table is inactive; retry next sign-in if needed. */ });
   }, [isAdmin, catalogueHydrated, catalogue.length, session?.access_token, workspaceOwnerId]);
   useEffect(() => {
+    if (!cloudReady) return;
+    // A backorder exists only while its parent is Confirmed or further along.
+    // Older releases could leave ADV records behind after the parent returned
+    // to Draft. Remove those orphan records, their invoice and task safely.
+    const orphanAdvanceIds = orders.filter((order) => isBackorderRecord(order) && orders.some((parent) => parent.id === order.id.replace(/^ADV-/, "") && parent.status === "Draft")).map((order) => order.id);
+    if (!orphanAdvanceIds.length) return;
+    const orphanSet = new Set(orphanAdvanceIds);
+    markForCloudDeletion("crm_orders", orphanAdvanceIds);
+    markForCloudDeletion("crm_invoices", invoices.filter((invoice) => orphanSet.has(invoice.order)).map((invoice) => invoice.id));
+    markForCloudDeletion("crm_tasks", tasks.filter((task) => task.relatedTo && orphanSet.has(task.relatedTo)).map((task) => task.id));
+    setOrders((current) => current.filter((order) => !orphanSet.has(order.id)));
+    setInvoices((current) => current.filter((invoice) => !orphanSet.has(invoice.order)));
+    setTasks((current) => current.filter((task) => !task.relatedTo || !orphanSet.has(task.relatedTo)));
+  }, [orders, invoices, tasks, cloudReady]);
+  useEffect(() => {
     const cloud = supabase;
     if (!cloud || !session || !cloudReady || !workspaceOwnerId) return;
     const collections: Array<{ table: string; items: any[]; search: (item: any) => string }> = [

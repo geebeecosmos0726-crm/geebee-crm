@@ -107,6 +107,10 @@ type Order = {
   // True only after this order's quantities have actually been deducted from
   // Product / SKU available stock on entry to Dispatch Plan.
   inventoryCommitted?: boolean;
+  // Immutable quantities deducted when the order entered Dispatch Plan. These
+  // are the only quantities allowed to be added back on a Dispatch reversal.
+  dispatchStockLines?: ProductLine[];
+  dispatchReversedAt?: string;
   cancelledFromDispatch?: boolean;
   cancelledFromStage?: "Draft" | "Confirmed" | "Dispatch plan" | "Sent to customer" | "Received by customer";
   avatar: string;
@@ -1398,16 +1402,21 @@ export default function Home() {
   };
   const returnDispatchToConfirmed = (order: Order) => {
     if (order.status !== "Dispatch plan") return;
+    if (order.dispatchReversedAt) { flash(`${order.id} has already had its dispatch stock returned once. No stock was changed.`); return; }
     if (!window.confirm(`Return ${order.id} to Confirmed Orders? Its dispatched quantity will be restored to available stock and reserved again.`)) return;
     const lines = linesFor(order);
+    // Never infer a reversal from freshly synced stock or from an editable
+    // order line. Restore only the exact quantities deducted at dispatch.
+    const dispatchedSnapshot = order.dispatchStockLines?.length ? order.dispatchStockLines : lines;
     const first = lines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
     if (order.inventoryCommitted) setCatalogue((current) => current.map((product) => {
-      const quantity = lines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      const quantity = dispatchedSnapshot.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       return quantity ? { ...product, availableQuantity: availableStock(product) + quantity, reservedStock: (product.reservedStock || 0) + quantity } : product;
     }));
-    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...first, products: lines, approvedProducts: lines, status: "Confirmed", inventoryCommitted: false } : item));
-    logActivity("Returned dispatch order to Confirmed Orders", "Dispatch Plan", order.id);
-    flash(`${order.id} returned to Confirmed Orders. Stock is restored and reserved until it is dispatched again.`);
+    const restoredQuantity = dispatchedSnapshot.reduce((sum, line) => sum + line.quantity, 0);
+    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...first, products: lines, approvedProducts: lines, status: "Confirmed", inventoryCommitted: false, dispatchReversedAt: new Date().toISOString() } : item));
+    logActivity("Returned dispatch order to Confirmed Orders", "Dispatch Plan", `${order.id} · restored ${restoredQuantity.toLocaleString("en-IN")} unit(s) from saved dispatch quantity`);
+    flash(`${order.id} returned to Confirmed Orders. Exactly ${restoredQuantity.toLocaleString("en-IN")} dispatched unit(s) were added back to Product / SKUs and the Stock Master sheet.`);
   };
   const markOrderSentToCustomer = (order: Order) => {
     if (order.status !== "Dispatch plan") return;
@@ -1515,7 +1524,7 @@ export default function Home() {
       };
     }));
     const first = dispatchLines[0] || approvedLines[0];
-    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, status: "Dispatch plan", inventoryCommitted: true } : item));
+    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, dispatchStockLines: dispatchLines.map((line) => ({ ...line })), dispatchReversedAt: undefined, status: "Dispatch plan", inventoryCommitted: true } : item));
     logActivity("Sent confirmed order to Dispatch Plan", "Dispatch Plan", releasedLines.length ? `${order.id} · reduced CRM reservation released` : order.id);
     flash(releasedLines.length ? `${order.id} sent to Dispatch Plan; reduced quantities were released from CRM reservation.` : `${order.id} sent to Dispatch Plan for Operations.`);
   };

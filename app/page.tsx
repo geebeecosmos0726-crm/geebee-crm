@@ -86,7 +86,7 @@ const memberModuleAccess = (tokens: string[] | undefined, module: CrmModule): Mo
 };
 type AccessRequest = { user_id: string; full_name: string; phone: string; email: string; created_at: string };
 type AuditEvent = { id: number; actor_email: string; action: string; module: string; details: string; created_at: string };
-type ProductStockMovement = { orderId: string; direction: "Dispatch" | "Return"; sku: string; product: string; quantity: number; before: number; after: number };
+type ProductStockMovement = { orderId: string; client?: string; direction: "Dispatch" | "Return"; sku: string; product: string; quantity: number; before: number; after: number };
 type Order = {
   id: string;
   client: string;
@@ -1422,7 +1422,7 @@ export default function Home() {
     const stockMovements = [...restoredBySku.values()].map((line) => {
       const product = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));
       const before = product ? availableStock(product) : 0;
-      return { orderId: order.id, direction: "Return" as const, sku: line.sku, product: line.product || product?.name || "", quantity: line.quantity, before, after: before + line.quantity };
+      return { orderId: order.id, client: order.client, direction: "Return" as const, sku: line.sku, product: line.product || product?.name || "", quantity: line.quantity, before, after: before + line.quantity };
     });
     if (order.inventoryCommitted) setCatalogue((current) => current.map((product) => {
       const quantity = dispatchedSnapshot.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
@@ -1531,7 +1531,7 @@ export default function Home() {
     const stockMovements = [...dispatchedBySku.values()].map((line) => {
       const product = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));
       const before = product ? availableStock(product) : 0;
-      return { orderId: order.id, direction: "Dispatch" as const, sku: line.sku, product: line.product || product?.name || "", quantity: line.quantity, before, after: Math.max(0, before - line.quantity) };
+      return { orderId: order.id, client: order.client, direction: "Dispatch" as const, sku: line.sku, product: line.product || product?.name || "", quantity: line.quantity, before, after: Math.max(0, before - line.quantity) };
     });
     setCatalogue((current) => current.map((product) => {
       const dispatched = dispatchLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
@@ -1740,7 +1740,7 @@ export default function Home() {
           />
         )}{" "}
         {section === "Product Stock Inventory" && <ProductStockInventoryPanel session={session} canApply={isAdmin} orders={orders} releaseAllReservations={releaseAllReservations} onAudit={logActivity} query={search} onProductsSynced={setCatalogue} onLiveBackup={queueGoogleSheetLiveBackup} />}{" "}
-        {section === "Product Stock History" && <ProductStockHistoryPanel auditEvents={auditEvents} query={search} canView={isAdmin} />}{" "}
+        {section === "Product Stock History" && <ProductStockHistoryPanel auditEvents={auditEvents} orders={orders} query={search} canView={isAdmin} />}{" "}
         {section === "Categories" && <ProductStockCategoriesPanel session={session} query={search} openCategory={(category) => { setSection("Product Stock Inventory"); setSectionSearches((current) => ({ ...current, "Product Stock Inventory": category })); }} />}{" "}
         {section === "Fetch Orders" && <GoogleSheetOrderFetch existingOrders={orders} addOrders={setOrders} onAudit={logActivity} showDraftOrders={() => { setSectionSearches((current) => ({ ...current, Orders: "" })); setSection("Orders"); }} />}{" "}
         {section === "Transporters" && <TransportersPanel transporters={transporters.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.area || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("transporter", item)} add={() => show("transporter")} remove={(ids) => { markForCloudDeletion("crm_transporters", ids); setTransporters((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed transporter", "Transporters", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} transporter${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
@@ -2208,6 +2208,7 @@ function Orders({
   confirmed?: boolean;
 }) {
   const [showCancelled, setShowCancelled] = useState(false);
+  const [showApprovalControls, setShowApprovalControls] = useState(false);
   // Linked advance/backorder records can be cancelled automatically when the
   // main order returns to Draft. They are internal stock records, not a
   // cancelled customer order, so keep them out of this customer-facing list.
@@ -2217,12 +2218,11 @@ function Orders({
       <div className="panel-head">
         <div>
           <h2>{confirmed ? "Confirmed orders" : "Order register"}</h2>
-          <p>{confirmed ? "Inventory is reserved. Send the customer approval on WhatsApp here, then move the approved order to Dispatch Plan." : "Orders are rough drafts. Confirm an order to reserve available stock and automatically create any backorder."}</p>
+          <p>{confirmed ? "Reserved stock · approval required before dispatch." : "Orders are rough drafts. Confirm an order to reserve available stock and automatically create any backorder."}</p>
         </div>
       </div>
-      {confirmed && orders.length > 0 && <section className="dispatch-approval-required"><b>Customer approval before dispatch</b><span>Send the GeeBee order on WhatsApp from this approved-order stage, then record the customer’s reply before moving it to Dispatch Plan.</span></section>}
       <OrderTable orders={orders} edit={edit} cancel={cancel} remove={remove} returnToOrders={returnToOrders} returnLabel={returnLabel} pushToDispatch={pushToDispatch} confirm={confirm} sendWhatsApp={sendWhatsApp} whatsAppLabel={confirmed ? "WhatsApp approval" : undefined} />
-      {confirmed && updateApproval && <section className="dispatch-approval-list">{orders.map((order) => <article key={order.id}><div><b>{order.id} · {order.client}</b><small>{order.clientApproval || "Approval pending"} · Send the exact order text to the customer’s WhatsApp group before Dispatch Plan.</small></div><div><button className="outline" type="button" onClick={() => updateApproval(order.id, "Approval requested")}>Mark sent on WhatsApp</button><label>Client approval<select value={order.clientApproval || "Approval pending"} onChange={(event) => updateApproval(order.id, event.target.value as NonNullable<Order["clientApproval"]>)}><option>Approval pending</option><option>Approval requested</option><option>Approved</option><option>Changes requested</option><option>Rejected</option></select></label></div></article>)}</section>}
+      {confirmed && updateApproval && orders.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowApprovalControls((current) => !current)}><span>{showApprovalControls ? "⌄" : "›"}</span> Client approval controls <b>{orders.length}</b></button>{showApprovalControls && <section className="dispatch-approval-list">{orders.map((order) => <article key={order.id}><div><b>{order.id} · {order.client}</b><small>{order.clientApproval || "Approval pending"}</small></div><div><button className="outline" type="button" onClick={() => updateApproval(order.id, "Approval requested")}>Mark sent</button><label>Approval<select value={order.clientApproval || "Approval pending"} onChange={(event) => updateApproval(order.id, event.target.value as NonNullable<Order["clientApproval"]>)}><option>Approval pending</option><option>Approval requested</option><option>Approved</option><option>Changes requested</option><option>Rejected</option></select></label></div></article>)}</section>}</section>}
       {visibleCancelledOrders.length > 0 && <section className="dispatch-cancelled"><button type="button" onClick={() => setShowCancelled((current) => !current)}><span>{showCancelled ? "⌄" : "›"}</span> Cancelled {confirmed ? "Confirmed Orders" : "Orders"} <b>{visibleCancelledOrders.length}</b></button>{showCancelled && <OrderTable orders={visibleCancelledOrders} edit={edit} cancel={cancel} remove={remove} />}</section>}
     </section>
   );
@@ -2601,17 +2601,30 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit, showDraftOr
   return <section className="panel transfer-panel"><div className="panel-head"><div><span className="overline">CONNECTED ORDER SHEET</span><h2>Fetch new orders from Google Sheets</h2><p>Reads your existing order tabs, such as <b>E-404 SHYAM BALLOON PATNA</b> or <b>E-269 (OR) SHYAM BALLOON STORE, PATNA</b>. Only order IDs not already in the CRM are imported, always as Draft orders. Unmatched customer names stay on the draft only until it is saved.</p></div><button className="primary" type="button" onClick={fetchOrders} disabled={loading}>{loading ? "Fetching orders…" : "Fetch new orders"}</button></div>{message && <p className="transfer-message">{message}</p>}{details.length > 0 && <div className="transfer-fields"><b>Skipped tabs</b><br/>{details.join(" · ")}</div>}</section>;
 }
 
-function ProductStockHistoryPanel({ auditEvents, query, canView }: { auditEvents: AuditEvent[]; query: string; canView: boolean }) {
+function ProductStockHistoryPanel({ auditEvents, orders, query, canView }: { auditEvents: AuditEvent[]; orders: Order[]; query: string; canView: boolean }) {
+  type RecordedMovement = ProductStockMovement & { actor: string; createdAt: string };
+  const clientByOrder = new Map(orders.map((order) => [order.id, order.client]));
   const movements = auditEvents.flatMap((event) => {
-    if (event.action !== "Recorded Product / SKU stock movement") return [] as Array<ProductStockMovement & { actor: string; createdAt: string }>;
+    if (event.action !== "Recorded Product / SKU stock movement") return [] as RecordedMovement[];
     try {
       const parsed = JSON.parse(event.details) as { orderId?: string; direction?: ProductStockMovement["direction"]; lines?: ProductStockMovement[] };
       if (!Array.isArray(parsed.lines) || !parsed.orderId || (parsed.direction !== "Dispatch" && parsed.direction !== "Return")) return [];
-      return parsed.lines.filter((line) => line && line.sku).map((line) => ({ ...line, orderId: parsed.orderId || line.orderId, direction: parsed.direction || line.direction, actor: event.actor_email, createdAt: event.created_at }));
+      return parsed.lines.filter((line) => line && line.sku).map((line) => ({ ...line, orderId: parsed.orderId || line.orderId, client: line.client || clientByOrder.get(parsed.orderId || line.orderId) || "Previous / unknown client", direction: parsed.direction || line.direction, actor: event.actor_email, createdAt: event.created_at }));
     } catch { return []; }
-  }).filter((movement) => `${movement.orderId} ${movement.sku} ${movement.product} ${movement.direction} ${movement.actor}`.toLowerCase().includes(query.toLowerCase()));
+  });
+  const grouped = new Map<string, { client: string; orderId: string; sku: string; product: string; dispatch?: RecordedMovement; returned?: RecordedMovement; latest: string }>();
+  movements.forEach((movement) => {
+    const key = `${movement.orderId}::${skuKey(movement.sku)}`;
+    const current = grouped.get(key) || { client: movement.client || "Previous / unknown client", orderId: movement.orderId, sku: movement.sku, product: movement.product, latest: movement.createdAt };
+    if (movement.direction === "Dispatch" && (!current.dispatch || movement.createdAt > current.dispatch.createdAt)) current.dispatch = movement;
+    if (movement.direction === "Return" && (!current.returned || movement.createdAt > current.returned.createdAt)) current.returned = movement;
+    if (movement.createdAt > current.latest) current.latest = movement.createdAt;
+    grouped.set(key, current);
+  });
+  const rows = [...grouped.values()].filter((row) => `${row.client} ${row.orderId} ${row.sku} ${row.product}`.toLowerCase().includes(query.toLowerCase())).sort((a, b) => b.latest.localeCompare(a.latest));
+  const clientGroups = Array.from(rows.reduce((map, row) => { const group = map.get(row.client) || []; group.push(row); map.set(row.client, group); return map; }, new Map<string, typeof rows>()).entries());
   if (!canView) return <section className="panel empty"><b>Product stock history is available to administrators.</b><p>Ask an administrator for a stock-movement audit.</p></section>;
-  return <section className="panel record-panel"><div className="panel-head"><div><span className="overline">PRODUCT / SKU AUDIT</span><h2>Stock history</h2><p>Every new dispatch and return records the exact stock quantity before and after the movement. This history does not change when the Stock Master is later synced.</p></div></div><div className="table-wrap"><table className="records"><thead><tr><th>TIME</th><th>ORDER</th><th>SKU</th><th>PRODUCT</th><th>MOVEMENT</th><th>QTY</th><th>STOCK</th><th>BY</th></tr></thead><tbody>{movements.map((movement, index) => <tr key={`${movement.createdAt}-${movement.orderId}-${movement.sku}-${index}`}><td>{new Date(movement.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</td><td><b>{movement.orderId}</b></td><td><b>{movement.sku}</b></td><td>{movement.product || "—"}</td><td><Pill value={movement.direction === "Dispatch" ? "Deducted" : "Returned"}/></td><td><b>{movement.direction === "Dispatch" ? "−" : "+"}{movement.quantity.toLocaleString("en-IN")}</b></td><td>{movement.before.toLocaleString("en-IN")} → <b>{movement.after.toLocaleString("en-IN")}</b></td><td>{movement.actor}</td></tr>)}</tbody></table>{!movements.length && <div className="empty">No stock movements have been recorded yet. New dispatches and returns will appear here automatically.</div>}</div></section>;
+  return <section className="panel record-panel"><div className="panel-head"><div><span className="overline">PRODUCT / SKU AUDIT</span><h2>Stock history</h2><p>Client groups are kept closed. Open a client only when you need to review its dispatched products or a valid stock return.</p></div></div>{clientGroups.map(([client, clientRows]) => <details className="dispatch-cancelled" key={client}><summary><span>›</span> <b>{client}</b><small>{clientRows.length} product movement{clientRows.length === 1 ? "" : "s"}</small></summary><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>SKU</th><th>PRODUCT</th><th>STOCK OUT</th><th>STOCK RETURNED</th></tr></thead><tbody>{clientRows.map((row) => <tr key={`${row.orderId}-${row.sku}`}><td><b>{row.orderId}</b></td><td><b>{row.sku}</b></td><td>{row.product || "—"}</td><td>{row.dispatch ? <><b>−{row.dispatch.quantity.toLocaleString("en-IN")}</b><small className="table-subtext">{row.dispatch.before.toLocaleString("en-IN")} → {row.dispatch.after.toLocaleString("en-IN")} · {new Date(row.dispatch.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td><td>{row.returned ? <><b>+{row.returned.quantity.toLocaleString("en-IN")}</b><small className="table-subtext">{row.returned.before.toLocaleString("en-IN")} → {row.returned.after.toLocaleString("en-IN")} · {new Date(row.returned.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td></tr>)}</tbody></table></div></details>)}{!clientGroups.length && <div className="empty">No stock movements have been recorded yet. New dispatches and returns will appear here automatically.</div>}</section>;
 }
 
 function ProductStockInventoryPanel({ session, canApply, orders, releaseAllReservations, onAudit, query, onProductsSynced, onLiveBackup }: { session: Session; canApply: boolean; orders: Order[]; releaseAllReservations: () => void; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>>; onLiveBackup: () => void }) {

@@ -86,6 +86,7 @@ const memberModuleAccess = (tokens: string[] | undefined, module: CrmModule): Mo
 };
 type AccessRequest = { user_id: string; full_name: string; phone: string; email: string; created_at: string };
 type AuditEvent = { id: number; actor_email: string; action: string; module: string; details: string; created_at: string };
+type ProductStockMovement = { orderId: string; direction: "Dispatch" | "Return"; sku: string; product: string; quantity: number; before: number; after: number };
 type Order = {
   id: string;
   client: string;
@@ -900,6 +901,7 @@ export default function Home() {
   const sheetBackupInFlight = useRef(false);
   const sheetBackupPending = useRef(false);
   const workspaceDataSnapshot = useRef<string | null>(null);
+  const pendingStockMovementAudits = useRef<Array<{ orderId: string; direction: ProductStockMovement["direction"]; lines: ProductStockMovement[] }>>([]);
   const flash = (m: string) => {
       setToast(m);
       setTimeout(() => setToast(""), 2600);
@@ -1113,9 +1115,15 @@ export default function Home() {
     const changed = catalogue.filter((product) => inventorySnapshots.current.get(String(product.id)) !== next.get(String(product.id)));
     if (!changed.length) return;
     const timer = window.setTimeout(async () => {
+      const movementsForThisSave = [...pendingStockMovementAudits.current];
       const response = await fetch("/api/import/google-product-master", { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ stockUpdates: changed.map((product) => ({ id: product.id, availableQuantity: availableStock(product), reservedStock: product.reservedStock || 0 })) }) });
       if (!response.ok) { const result = await response.json().catch(() => ({})); setCloudError(result.error || "Dispatch stock movement could not be saved to Product / SKU inventory."); return; }
       inventorySnapshots.current = next;
+      // Only commit the audit after both the Stock Master write and CRM stock
+      // update succeeded. A failed Sheet write therefore never creates a
+      // misleading "deducted" history entry.
+      pendingStockMovementAudits.current = pendingStockMovementAudits.current.filter((movement) => !movementsForThisSave.includes(movement));
+      movementsForThisSave.forEach((movement) => logActivity("Recorded Product / SKU stock movement", "Products", JSON.stringify(movement)));
       queueGoogleSheetLiveBackup();
     }, 450);
     return () => window.clearTimeout(timer);
@@ -1197,7 +1205,7 @@ export default function Home() {
   useEffect(() => {
     const cloud = supabase;
     if (!cloud || !isAdmin || !workspaceOwnerId) return;
-    cloud.from("crm_audit_events").select("id, actor_email, action, module, details, created_at").eq("workspace_owner_id", workspaceOwnerId).order("created_at", { ascending: false }).limit(100).then(({ data }) => setAuditEvents((data || []) as AuditEvent[]));
+    cloud.from("crm_audit_events").select("id, actor_email, action, module, details, created_at").eq("workspace_owner_id", workspaceOwnerId).order("created_at", { ascending: false }).limit(1000).then(({ data }) => setAuditEvents((data || []) as AuditEvent[]));
   }, [isAdmin, workspaceOwnerId]);
   const shown = useMemo(
     () =>
@@ -1409,6 +1417,13 @@ export default function Home() {
     // order line. Restore only the exact quantities deducted at dispatch.
     const dispatchedSnapshot = order.dispatchStockLines?.length ? order.dispatchStockLines : lines;
     const first = lines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
+    const restoredBySku = new Map<string, ProductLine>();
+    dispatchedSnapshot.forEach((line) => { const key = skuKey(line.sku); const prior = restoredBySku.get(key); restoredBySku.set(key, prior ? { ...prior, quantity: prior.quantity + line.quantity } : { ...line }); });
+    const stockMovements = [...restoredBySku.values()].map((line) => {
+      const product = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));
+      const before = product ? availableStock(product) : 0;
+      return { orderId: order.id, direction: "Return" as const, sku: line.sku, product: line.product || product?.name || "", quantity: line.quantity, before, after: before + line.quantity };
+    });
     if (order.inventoryCommitted) setCatalogue((current) => current.map((product) => {
       const quantity = dispatchedSnapshot.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       return quantity ? { ...product, availableQuantity: availableStock(product) + quantity, reservedStock: (product.reservedStock || 0) + quantity } : product;
@@ -1416,6 +1431,7 @@ export default function Home() {
     const restoredQuantity = dispatchedSnapshot.reduce((sum, line) => sum + line.quantity, 0);
     setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...first, products: lines, approvedProducts: lines, status: "Confirmed", inventoryCommitted: false, dispatchReversedAt: new Date().toISOString() } : item));
     logActivity("Returned dispatch order to Confirmed Orders", "Dispatch Plan", `${order.id} · restored ${restoredQuantity.toLocaleString("en-IN")} unit(s) from saved dispatch quantity`);
+    if (order.inventoryCommitted && stockMovements.length) pendingStockMovementAudits.current.push({ orderId: order.id, direction: "Return", lines: stockMovements });
     flash(`${order.id} returned to Confirmed Orders. Exactly ${restoredQuantity.toLocaleString("en-IN")} dispatched unit(s) were added back to Product / SKUs and the Stock Master sheet.`);
   };
   const markOrderSentToCustomer = (order: Order) => {
@@ -1511,6 +1527,12 @@ export default function Home() {
       if (releasedQuantity) releasedLines.push({ ...approved, quantity: releasedQuantity });
     });
     if (!window.confirm(`Send ${order.id} to Dispatch Plan? Any quantity reduced by Operations will be released from CRM reservation.`)) return;
+    const dispatchedBySku = summariseBySku(dispatchLines);
+    const stockMovements = [...dispatchedBySku.values()].map((line) => {
+      const product = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));
+      const before = product ? availableStock(product) : 0;
+      return { orderId: order.id, direction: "Dispatch" as const, sku: line.sku, product: line.product || product?.name || "", quantity: line.quantity, before, after: Math.max(0, before - line.quantity) };
+    });
     setCatalogue((current) => current.map((product) => {
       const dispatched = dispatchLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       const released = releasedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
@@ -1526,6 +1548,7 @@ export default function Home() {
     const first = dispatchLines[0] || approvedLines[0];
     setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, dispatchStockLines: dispatchLines.map((line) => ({ ...line })), dispatchReversedAt: undefined, status: "Dispatch plan", inventoryCommitted: true } : item));
     logActivity("Sent confirmed order to Dispatch Plan", "Dispatch Plan", releasedLines.length ? `${order.id} · reduced CRM reservation released` : order.id);
+    if (stockMovements.length) pendingStockMovementAudits.current.push({ orderId: order.id, direction: "Dispatch", lines: stockMovements });
     flash(releasedLines.length ? `${order.id} sent to Dispatch Plan; reduced quantities were released from CRM reservation.` : `${order.id} sent to Dispatch Plan for Operations.`);
   };
   const navigationGroups = [
@@ -1534,7 +1557,7 @@ export default function Home() {
     { label: "Enquiries", module: "Enquiries" as CrmModule, icon: Target, items: [{ label: "Enquiries", section: "Leads", count: String(leads.filter((lead) => lead.status !== "Lost" && lead.status !== "Order Created").length) }, { label: "Lost Leads", section: "Lost Leads" }] },
     { label: "Daily Tasks", module: "Daily Tasks" as CrmModule, icon: ClipboardList, items: [{ label: "Daily Tasks", section: "Follow-ups", count: String(activeTasks.length) }] },
     { label: "Sales", module: "Sales" as CrmModule, icon: BriefcaseBusiness, items: [{ label: "Orders", section: "Orders", count: String(orders.filter((order) => order.status === "Draft").length) }, { label: "Fetch Orders", section: "Fetch Orders" }, { label: "Confirmed Orders", section: "Confirmed Orders", count: String(orders.filter((order) => order.status === "Confirmed").length) }, { label: "Backorders", section: "Backorders", count: String(orders.filter(isVisibleBackorder).length) }, { label: "Returns", section: "Returns" }] },
-    { label: "Products", module: "Products" as CrmModule, icon: Boxes, items: [{ label: "Products / SKUs", section: "Product Stock Inventory" }, { label: "Categories", section: "Categories" }, { label: "Price Lists", section: "Price Lists" }] },
+    { label: "Products", module: "Products" as CrmModule, icon: Boxes, items: [{ label: "Products / SKUs", section: "Product Stock Inventory" }, { label: "Stock history", section: "Product Stock History" }, { label: "Categories", section: "Categories" }, { label: "Price Lists", section: "Price Lists" }] },
     { label: "Inventory", module: "Inventory" as CrmModule, icon: Warehouse, items: [{ label: "Stock Overview", section: "Stock Overview" }, { label: "Stock Movements", section: "Stock Movements" }, { label: "Low Stock", section: "Low Stock" }, { label: "Reserved Stock", section: "Reserved Stock" }, { label: "Warehouses", section: "Warehouses" }] },
     { label: "Operations", module: "Operations" as CrmModule, icon: Truck, items: [{ label: "Dispatch Plan", section: "Dispatch Plan", count: String(orders.filter((order) => order.status === "Dispatch plan").length) }, { label: "Transporters", section: "Transporters", count: String(transporters.length) }, { label: "Picking", section: "Picking" }, { label: "Packing", section: "Packing" }] },
     { label: "Fulfilment", module: "Fulfilment" as CrmModule, icon: Truck, items: [{ label: "Sent to Customer", section: "Sent to Customer", count: String(orders.filter((order) => order.status === "Sent to customer").length) }] },
@@ -1552,7 +1575,7 @@ export default function Home() {
     ...auditEvents.filter((event) => event.action !== "Confirmed order returned to Draft").slice(0, 4).map((event) => ({ title: event.action, detail: `${event.actor_email} · ${event.module}`, time: new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) })),
     ...invoices.filter((invoice) => invoice.status !== "Paid").slice(0, 2).map((invoice) => ({ title: `${invoice.status} invoice ${invoice.id}`, detail: `${invoice.client} · ${displayMoney(invoice.amount)} due ${invoice.due}`, time: "Needs attention" })),
   ].slice(0, 6);
-  const liveSections = new Set(["Overview", "Clients", "Leads", "Follow-ups", "Lost Leads", "Quotations", "Orders", "Confirmed Orders", "Dispatch Plan", "Sent to Customer", "Backorders", "Invoices", "Catalogue", "Categories", "Product Stock Inventory", "Fetch Orders", "Transporters", "Suppliers", "Purchase Orders", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report", "Settings", "Recovery", "Data Transfer"]);
+  const liveSections = new Set(["Overview", "Clients", "Leads", "Follow-ups", "Lost Leads", "Quotations", "Orders", "Confirmed Orders", "Dispatch Plan", "Sent to Customer", "Backorders", "Invoices", "Catalogue", "Categories", "Product Stock Inventory", "Product Stock History", "Fetch Orders", "Transporters", "Suppliers", "Purchase Orders", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report", "Settings", "Recovery", "Data Transfer"]);
   const activeModule = navigationGroups.find((group) => group.items.some((item) => item.section === section))?.module || "Dashboard";
   const currentModuleAccess = isAdmin ? "edit" : memberModuleAccess(allowedModules, activeModule);
   const isViewOnly = currentModuleAccess === "view";
@@ -1717,6 +1740,7 @@ export default function Home() {
           />
         )}{" "}
         {section === "Product Stock Inventory" && <ProductStockInventoryPanel session={session} canApply={isAdmin} orders={orders} releaseAllReservations={releaseAllReservations} onAudit={logActivity} query={search} onProductsSynced={setCatalogue} onLiveBackup={queueGoogleSheetLiveBackup} />}{" "}
+        {section === "Product Stock History" && <ProductStockHistoryPanel auditEvents={auditEvents} query={search} canView={isAdmin} />}{" "}
         {section === "Categories" && <ProductStockCategoriesPanel session={session} query={search} openCategory={(category) => { setSection("Product Stock Inventory"); setSectionSearches((current) => ({ ...current, "Product Stock Inventory": category })); }} />}{" "}
         {section === "Fetch Orders" && <GoogleSheetOrderFetch existingOrders={orders} addOrders={setOrders} onAudit={logActivity} showDraftOrders={() => { setSectionSearches((current) => ({ ...current, Orders: "" })); setSection("Orders"); }} />}{" "}
         {section === "Transporters" && <TransportersPanel transporters={transporters.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.area || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("transporter", item)} add={() => show("transporter")} remove={(ids) => { markForCloudDeletion("crm_transporters", ids); setTransporters((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed transporter", "Transporters", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} transporter${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
@@ -1726,7 +1750,7 @@ export default function Home() {
         {section === "Recovery" && <RecoveryPanel canManage={isAdmin} session={session} clearBusinessData={() => { markForCloudDeletion("crm_clients", clients.map((client) => client.id)); markForCloudDeletion("crm_orders", orders.map((order) => order.id)); markForCloudDeletion("crm_invoices", invoices.map((invoice) => invoice.id)); markForCloudDeletion("crm_leads", leads.map((lead) => lead.id)); markForCloudDeletion("crm_quotes", quotes.map((quote) => quote.id)); markForCloudDeletion("crm_tasks", tasks.map((task) => task.id)); markForCloudDeletion("crm_transporters", transporters.map((transporter) => transporter.id)); setOrders([]); setClients([]); setInvoices([]); setLeads([]); setQuotes([]); setTasks([]); setTransporters([]); setPurchases([]); flash("Business records have been permanently cleared. SKU catalogue was preserved."); }} applyRestore={(data) => { setOrders(data.orders); setClients(data.clients); setInvoices(data.invoices); setCatalogue(data.catalogue); setLeads(data.leads); setQuotes(data.quotes); setTasks(data.tasks); setTransporters(data.transporters || []); logActivity("Applied Google Sheets recovery", "Data recovery", "Recovery snapshot created before restore"); flash("Backup restored. Your previous CRM state is saved as a recovery snapshot."); }} />}{" "}
         {section === "Purchase Orders" && <PurchaseOrdersPanel purchases={purchases.filter((purchase) => `${purchase.id} ${purchase.supplier} ${purchase.lines.map((line) => `${line.sku} ${line.product}`).join(" ")}`.toLowerCase().includes(search.toLowerCase()))} catalogue={catalogue} lowStockProducts={lowStockProducts} add={(product) => show("purchase", product ? { lines: [{ sku: product.sku, product: catalogueName(product), quantity: Math.max(1, (product.reorderThreshold || 0) * 2 - availableStock(product)), receivedQuantity: 0 }], supplier: product.supplier || "" } : null)} edit={(purchase) => show("purchase", purchase)} receive={receivePurchase} cancel={(purchase) => { if (!window.confirm(`Cancel purchase order ${purchase.id}? No stock will be changed.`)) return; setPurchases((current) => current.map((item) => item.id === purchase.id ? { ...item, status: "Cancelled" } : item)); logActivity("Cancelled purchase order", "Purchase Orders", purchase.id); flash("Purchase order cancelled."); }} remove={deletePurchase} />} {" "}
         {section === "Notifications" && <AutomationPanel />}{" "}
-        {!(["Overview", "Orders", "Confirmed Orders", "Dispatch Plan", "Clients", "Leads", "Enquiries", "Follow-ups", "Lost Leads", "Quotations", "Backorders", "Invoices", "Catalogue", "Product Stock Inventory", "Categories", "Fetch Orders", "Transporters", "Suppliers", "Purchase Orders", "Settings", "Recovery", "Data Transfer", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report"].includes(section)) && (
+        {!(["Overview", "Orders", "Confirmed Orders", "Dispatch Plan", "Clients", "Leads", "Enquiries", "Follow-ups", "Lost Leads", "Quotations", "Backorders", "Invoices", "Catalogue", "Product Stock Inventory", "Product Stock History", "Categories", "Fetch Orders", "Transporters", "Suppliers", "Purchase Orders", "Settings", "Recovery", "Data Transfer", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report"].includes(section)) && (
           <section className="panel coming">
             <div className="modal-mark">
               <ClipboardList size={22} />
@@ -2575,6 +2599,19 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit, showDraftOr
     finally { setLoading(false); }
   };
   return <section className="panel transfer-panel"><div className="panel-head"><div><span className="overline">CONNECTED ORDER SHEET</span><h2>Fetch new orders from Google Sheets</h2><p>Reads your existing order tabs, such as <b>E-404 SHYAM BALLOON PATNA</b> or <b>E-269 (OR) SHYAM BALLOON STORE, PATNA</b>. Only order IDs not already in the CRM are imported, always as Draft orders. Unmatched customer names stay on the draft only until it is saved.</p></div><button className="primary" type="button" onClick={fetchOrders} disabled={loading}>{loading ? "Fetching orders…" : "Fetch new orders"}</button></div>{message && <p className="transfer-message">{message}</p>}{details.length > 0 && <div className="transfer-fields"><b>Skipped tabs</b><br/>{details.join(" · ")}</div>}</section>;
+}
+
+function ProductStockHistoryPanel({ auditEvents, query, canView }: { auditEvents: AuditEvent[]; query: string; canView: boolean }) {
+  const movements = auditEvents.flatMap((event) => {
+    if (event.action !== "Recorded Product / SKU stock movement") return [] as Array<ProductStockMovement & { actor: string; createdAt: string }>;
+    try {
+      const parsed = JSON.parse(event.details) as { orderId?: string; direction?: ProductStockMovement["direction"]; lines?: ProductStockMovement[] };
+      if (!Array.isArray(parsed.lines) || !parsed.orderId || (parsed.direction !== "Dispatch" && parsed.direction !== "Return")) return [];
+      return parsed.lines.filter((line) => line && line.sku).map((line) => ({ ...line, orderId: parsed.orderId || line.orderId, direction: parsed.direction || line.direction, actor: event.actor_email, createdAt: event.created_at }));
+    } catch { return []; }
+  }).filter((movement) => `${movement.orderId} ${movement.sku} ${movement.product} ${movement.direction} ${movement.actor}`.toLowerCase().includes(query.toLowerCase()));
+  if (!canView) return <section className="panel empty"><b>Product stock history is available to administrators.</b><p>Ask an administrator for a stock-movement audit.</p></section>;
+  return <section className="panel record-panel"><div className="panel-head"><div><span className="overline">PRODUCT / SKU AUDIT</span><h2>Stock history</h2><p>Every new dispatch and return records the exact stock quantity before and after the movement. This history does not change when the Stock Master is later synced.</p></div></div><div className="table-wrap"><table className="records"><thead><tr><th>TIME</th><th>ORDER</th><th>SKU</th><th>PRODUCT</th><th>MOVEMENT</th><th>QTY</th><th>STOCK</th><th>BY</th></tr></thead><tbody>{movements.map((movement, index) => <tr key={`${movement.createdAt}-${movement.orderId}-${movement.sku}-${index}`}><td>{new Date(movement.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</td><td><b>{movement.orderId}</b></td><td><b>{movement.sku}</b></td><td>{movement.product || "—"}</td><td><Pill value={movement.direction === "Dispatch" ? "Deducted" : "Returned"}/></td><td><b>{movement.direction === "Dispatch" ? "−" : "+"}{movement.quantity.toLocaleString("en-IN")}</b></td><td>{movement.before.toLocaleString("en-IN")} → <b>{movement.after.toLocaleString("en-IN")}</b></td><td>{movement.actor}</td></tr>)}</tbody></table>{!movements.length && <div className="empty">No stock movements have been recorded yet. New dispatches and returns will appear here automatically.</div>}</div></section>;
 }
 
 function ProductStockInventoryPanel({ session, canApply, orders, releaseAllReservations, onAudit, query, onProductsSynced, onLiveBackup }: { session: Session; canApply: boolean; orders: Order[]; releaseAllReservations: () => void; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>>; onLiveBackup: () => void }) {

@@ -250,8 +250,10 @@ export async function PATCH(request: Request) {
         // disambiguate those rows; never guess a row and risk corrupting stock.
         const nameMatches = skuMatches.filter((row) => compact(row.name) === compact(product.name));
         if (nameMatches.length === 1) return { row: nameMatches[0].row, value: Number(product.availableQuantity || 0) };
-        if (!skuMatches.length) throw new Error(`SKU ${display(product.sku) || "(blank)"} was not found in the current Google Stock Master. Sync the Sheet before dispatching this order.`);
-        throw new Error(`SKU ${display(product.sku)} appears more than once in the Google Stock Master and cannot be matched safely. Give those rows unique SKU IDs or matching Product Names, then retry.`);
+        const productLabel = `${display(product.sku) || "(blank SKU)"} · ${display(product.name) || "(blank product name)"}`;
+        if (!skuMatches.length) throw new Error(`${productLabel} was not found in the current Google Stock Master. Sync the Sheet before dispatching this order.`);
+        const candidates = skuMatches.map((row) => `row ${row.row}${row.name ? ` (${row.name})` : ""}`).join(", ");
+        throw new Error(`${productLabel} cannot be matched safely because this SKU appears on ${candidates}. Give those rows unique SKU IDs or ensure one Product Name matches exactly, then retry.`);
       });
       await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: sheetId, requestBody: { valueInputOption: "USER_ENTERED", data: sheetUpdates.map((item) => ({ range: `'${title.replace(/'/g, "''")}'!${column(stockColumn)}${item.row}`, values: [[item.value]] })) } });
       if (records.length) {

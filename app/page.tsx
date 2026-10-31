@@ -100,6 +100,9 @@ type Order = {
   transporter?: string;
   remarks?: string;
   clientApproval?: "Approval pending" | "Approval requested" | "Approved" | "Changes requested" | "Rejected";
+  // A permanent, human-readable confirmation reference. It is assigned only
+  // the first time a Draft becomes Confirmed and survives a return to Draft.
+  confirmationSequence?: number;
   sourceSheetOrderId?: string;
   // True only after this order's quantities have actually been deducted from
   // Product / SKU available stock on entry to Dispatch Plan.
@@ -1389,8 +1392,9 @@ export default function Home() {
     setOrders((current) => current.filter((item) => item.id !== advanceId).map((item) => item.id === order.id ? { ...item, ...first, products: restoredLines, approvedProducts: undefined, backorders: undefined, clientApproval: undefined, status: "Draft", inventoryCommitted: false } : item));
     setInvoices((current) => current.filter((invoice) => invoice.order !== advanceId));
     setTasks((current) => current.filter((task) => task.relatedTo !== advanceId));
-    logActivity("Returned confirmed order to Orders", "Orders", order.id);
-    flash(`${order.id} returned to Orders. Its linked backorder and related records were removed, and all stock reservation was released.`);
+    const confirmationReference = order.confirmationSequence ? `Confirmation #${order.confirmationSequence}` : "No confirmation number";
+    logActivity("Confirmed order returned to Draft", "Orders", `${order.id} · ${confirmationReference} sent back to Orders`);
+    flash(`${order.id} (${confirmationReference}) returned to Orders. Its linked backorder and related records were removed, and all stock reservation was released.`);
   };
   const returnDispatchToConfirmed = (order: Order) => {
     if (order.status !== "Dispatch plan") return;
@@ -1461,7 +1465,10 @@ export default function Home() {
       return { ...product, reservedStock: liveReserved + dispatched };
     }));
     const firstDispatch = dispatchLines[0] || requestedLines[0];
-    const confirmedOrder: Order = { ...order, product: firstDispatch.product, sku: firstDispatch.sku, quantity: firstDispatch.quantity, unitPrice: firstDispatch.unitPrice, products: dispatchLines, approvedProducts: dispatchLines, status: "Confirmed", backorders: shortages };
+    // Allocate a confirmation number once. If the order was returned to Draft,
+    // reuse its earlier number instead of creating a second reference.
+    const nextConfirmationSequence = order.confirmationSequence || (Math.max(0, ...orders.map((item) => item.confirmationSequence || 0)) + 1);
+    const confirmedOrder: Order = { ...order, confirmationSequence: nextConfirmationSequence, product: firstDispatch.product, sku: firstDispatch.sku, quantity: firstDispatch.quantity, unitPrice: firstDispatch.unitPrice, products: dispatchLines, approvedProducts: dispatchLines, status: "Confirmed", backorders: shortages };
     const advanceOrder = shortages.length ? { ...order, id: `ADV-${order.id}`, product: shortages[0].product, sku: shortages[0].sku, quantity: shortages[0].quantity, unitPrice: shortages[0].unitPrice, products: shortages, status: "Advance order", payment: "Partial" } : null;
     setOrders((current) => [...current.filter((item) => item.id !== order.id && item.id !== `ADV-${order.id}`), confirmedOrder, ...(advanceOrder ? [advanceOrder] : [])]);
     if (advanceOrder) {
@@ -1469,7 +1476,7 @@ export default function Home() {
       setInvoices((current) => [...current.filter((invoice) => invoice.order !== advanceOrder.id), { id: advanceOrder.id, client: order.client, order: advanceOrder.id, amount: money(advanceAmount), due: "Advance payment", status: "Partial" }]);
       setTasks((current) => [...current, { id: `TASK-${Date.now()}`, title: `Arrange future dispatch for advance order ${advanceOrder.id}`, time: "10:00", dueDate: new Date().toISOString().slice(0, 10), assignee: "Rahul", type: "Follow-up", status: "Open", relatedTo: advanceOrder.id }]);
     }
-    logActivity("Confirmed order and reserved inventory", "Orders", shortages.length ? `${order.id} · ${shortages.length} shortage line(s) moved to backorder` : order.id);
+    logActivity("Confirmed order and reserved inventory", "Orders", shortages.length ? `${order.id} · Confirmation #${nextConfirmationSequence} · ${shortages.length} shortage line(s) moved to backorder` : `${order.id} · Confirmation #${nextConfirmationSequence}`);
     const fullyShortLines = shortages.filter((shortage) => shortage.quantity === (requestedLines.find((line) => skuKey(line.sku) === skuKey(shortage.sku))?.quantity || 0));
     flash(shortages.length ? `${order.id} confirmed; CRM reserved Sheet stock and created a backorder.${fullyShortLines.length ? ` No free stock was available for: ${fullyShortLines.map((line) => line.sku).join(", ")}.` : ""}` : `${order.id} confirmed and CRM stock reserved.`);
   };
@@ -1529,8 +1536,11 @@ export default function Home() {
     { label: "Settings", module: "Settings" as CrmModule, icon: Settings, items: [{ label: "Users", section: "Settings" }, { label: "Roles", section: "Settings" }, { label: "Import / Export", section: "Data Transfer" }, { label: "Data recovery", section: "Recovery" }, { label: "GST", section: "GST" }, { label: "Warehouses", section: "Warehouses" }, { label: "WhatsApp", section: "WhatsApp" }, { label: "Integrations", section: "Integrations" }] },
   ];
   const notifications = [
+    // Order returns are operationally important and must not be pushed out of
+    // the bell by a long list of low-stock alerts.
+    ...auditEvents.filter((event) => event.action === "Confirmed order returned to Draft").slice(0, 2).map((event) => ({ title: event.action, detail: `${event.details} · ${event.actor_email}`, time: new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) })),
     ...lowStockProducts.map((product) => ({ title: `Low stock: ${catalogueName(product)}`, detail: `${catalogueSku(product)} · ${availableStock(product).toLocaleString("en-IN")} available / alert at ${(product.reorderThreshold || 0).toLocaleString("en-IN")}`, time: "Create a purchase order" })),
-    ...auditEvents.slice(0, 4).map((event) => ({ title: event.action, detail: `${event.actor_email} · ${event.module}`, time: new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) })),
+    ...auditEvents.filter((event) => event.action !== "Confirmed order returned to Draft").slice(0, 4).map((event) => ({ title: event.action, detail: `${event.actor_email} · ${event.module}`, time: new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) })),
     ...invoices.filter((invoice) => invoice.status !== "Paid").slice(0, 2).map((invoice) => ({ title: `${invoice.status} invoice ${invoice.id}`, detail: `${invoice.client} · ${displayMoney(invoice.amount)} due ${invoice.due}`, time: "Needs attention" })),
   ].slice(0, 6);
   const liveSections = new Set(["Overview", "Clients", "Leads", "Follow-ups", "Lost Leads", "Quotations", "Orders", "Confirmed Orders", "Dispatch Plan", "Sent to Customer", "Backorders", "Invoices", "Catalogue", "Categories", "Product Stock Inventory", "Fetch Orders", "Transporters", "Suppliers", "Purchase Orders", "Notifications", "Sales Team Report", "Sales Report", "Customer Report", "Product Report", "Inventory Report", "Payment Report", "Settings", "Recovery", "Data Transfer"]);
@@ -2303,7 +2313,7 @@ function OrderDetailsModal({ order, auditEvents, close }: { order: Order; auditE
   const orderHistory = isConfirmed ? auditEvents.filter((event) => event.details.toLowerCase().includes(order.id.toLowerCase())).slice(0, 20) : [];
   return <Shell close={close} wide printDocument={isConfirmed}>
     <section className={isConfirmed ? "confirmed-order-print-document" : ""}>
-      <div className="order-modal-head"><div className="modal-mark"><ClipboardList size={22}/></div><div><span className="overline">{order.status.toUpperCase()} ORDER · {order.id}</span><h2 className="dispatch-customer-name">{order.client || "Customer not assigned"}</h2><p>{[order.city, order.transporter].filter(Boolean).join(" · ") || "No city or transporter assigned"}</p></div></div>
+      <div className="order-modal-head"><div className="modal-mark"><ClipboardList size={22}/></div><div>{isConfirmed && <span className="overline">CONFIRMATION NO. {order.confirmationSequence || "—"}</span>}<span className="overline">{order.status.toUpperCase()} ORDER · {order.id}</span><h2 className="dispatch-customer-name">{order.client || "Customer not assigned"}</h2><p>{[order.city, order.transporter].filter(Boolean).join(" · ") || "No city or transporter assigned"}</p></div></div>
       {isConfirmed && <div className="confirmed-order-print-actions"><button className="outline confirmed-order-print-button" type="button" onClick={() => window.print()}>Print packing copy</button></div>}
       <div className="form-row"><div className="profile-empty"><b>Status</b><br/><Pill value={order.status}/></div><div className="profile-empty"><b>Payment</b><br/><Pill value={order.payment}/></div><div className="profile-empty"><b>Expected arrival</b><br/>{order.eta ? new Date(order.eta).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—"}</div></div>
       <div className="modal-section-title">Order products</div><div className="table-wrap"><table className="records"><thead><tr><th>SKU</th><th>PRODUCT</th><th>QTY</th><th className="financial-column">UNIT PRICE</th><th className="financial-column">AMOUNT</th><th>REMARKS</th></tr></thead><tbody>{lines.map((line, index) => <tr key={`${line.sku}-${index}`}><td><b>{line.sku || "—"}</b></td><td>{line.product || "—"}</td><td><b>{line.quantity.toLocaleString("en-IN")}</b></td><td className="financial-column">{money(line.unitPrice)}</td><td className="financial-column"><b>{money(line.quantity * line.unitPrice)}</b></td><td>{line.remarks?.trim() || "—"}</td></tr>)}</tbody></table></div><div className="order-total financial-column"><span>Order total</span><b>{money(orderTotal(order))}</b></div>{packingInstructions(order) && <div className="profile-empty"><b>Packing</b><br/>{packingInstructions(order)}</div>}

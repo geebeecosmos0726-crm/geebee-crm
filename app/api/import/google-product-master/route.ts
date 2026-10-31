@@ -225,12 +225,34 @@ export async function PATCH(request: Request) {
       if (!title) throw new Error("The Google Stock Master has no worksheet.");
       const values = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
       const sheetRows = (values.data.values || []).map((row) => Array.isArray(row) ? row.map(display) : []);
-      const headerRow = sheetRows.find((row) => headerIndex(row, ["skuid", "sku"]) >= 0 && headerIndex(row, ["availablestock", "availablequantity", "stock"]) >= 0);
+      const headerRowIndex = sheetRows.findIndex((row) => headerIndex(row, ["skuid", "sku"]) >= 0 && headerIndex(row, ["availablestock", "availablequantity", "stock"]) >= 0);
+      const headerRow = headerRowIndex >= 0 ? sheetRows[headerRowIndex] : undefined;
+      const skuColumn = headerRow ? headerIndex(headerRow, ["skuid", "sku"]) : -1;
+      const nameColumn = headerRow ? headerIndex(headerRow, ["productname", "product"]) : -1;
       const stockColumn = headerRow ? headerIndex(headerRow, ["availablestock", "availablequantity", "stock"]) : -1;
-      if (stockColumn < 0) throw new Error("Google Stock Master needs an Available Stock column before dispatch can update it.");
+      if (skuColumn < 0 || stockColumn < 0) throw new Error("Google Stock Master needs SKU ID and Available Stock columns before dispatch can update it.");
       const column = (index: number) => { let value = index + 1; let letters = ""; while (value) { const remainder = (value - 1) % 26; letters = String.fromCharCode(65 + remainder) + letters; value = Math.floor((value - 1) / 26); } return letters; };
-      const sheetUpdates = records.map((record) => ({ row: Number((record.data as ProductData).sourceRow), value: Number((record.data as ProductData).availableQuantity || 0) })).filter((item) => item.row > 0);
-      if (sheetUpdates.length !== records.length) throw new Error("Some Product / SKU rows are not linked to the Google Stock Master. Sync the Sheet before dispatching this order.");
+      // Never use a remembered Sheet row here. Users regularly insert rows in
+      // Stock Master, which makes an old sourceRow unsafe. Resolve each stock
+      // write against the Sheet's current SKU ID instead. compact() makes
+      // AB-204-1, AB 204 1 and ab2041 the same SKU for this lookup.
+      const liveSheetRows = sheetRows.slice(headerRowIndex + 1).map((row, index) => ({
+        row: headerRowIndex + index + 2,
+        sku: display(row[skuColumn]),
+        name: nameColumn >= 0 ? display(row[nameColumn]) : "",
+      })).filter((row) => row.sku);
+      const sheetUpdates = records.map((record) => {
+        const product = record.data as ProductData;
+        const sku = compact(product.sku);
+        const skuMatches = liveSheetRows.filter((row) => compact(row.sku) === sku);
+        if (skuMatches.length === 1) return { row: skuMatches[0].row, value: Number(product.availableQuantity || 0) };
+        // A repeated SKU can exist for variants. Use the matching name only to
+        // disambiguate those rows; never guess a row and risk corrupting stock.
+        const nameMatches = skuMatches.filter((row) => compact(row.name) === compact(product.name));
+        if (nameMatches.length === 1) return { row: nameMatches[0].row, value: Number(product.availableQuantity || 0) };
+        if (!skuMatches.length) throw new Error(`SKU ${display(product.sku) || "(blank)"} was not found in the current Google Stock Master. Sync the Sheet before dispatching this order.`);
+        throw new Error(`SKU ${display(product.sku)} appears more than once in the Google Stock Master and cannot be matched safely. Give those rows unique SKU IDs or matching Product Names, then retry.`);
+      });
       await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: sheetId, requestBody: { valueInputOption: "USER_ENTERED", data: sheetUpdates.map((item) => ({ range: `'${title.replace(/'/g, "''")}'!${column(stockColumn)}${item.row}`, values: [[item.value]] })) } });
       if (records.length) {
         const { error: updateError } = await db.from("crm_stock_inventory").upsert(records, { onConflict: "workspace_owner_id,record_id" });

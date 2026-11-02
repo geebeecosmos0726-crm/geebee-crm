@@ -409,14 +409,14 @@ const confirmedOrderProductChanges = (before: ProductLine[], after: ProductLine[
   };
   const previous = summarise(before);
   const next = summarise(after);
-  return [...new Set([...previous.keys(), ...next.keys()])].flatMap((key) => {
+  return [...new Set([...previous.keys(), ...next.keys()])].reduce<ConfirmedOrderProductChange[]>((changes, key) => {
     const oldLine = previous.get(key);
     const newLine = next.get(key);
-    if (!oldLine && newLine) return [{ sku: newLine.sku, product: newLine.product, change: "Added" as const, before: 0, after: newLine.quantity }];
-    if (oldLine && !newLine) return [{ sku: oldLine.sku, product: oldLine.product, change: "Removed" as const, before: oldLine.quantity, after: 0 }];
-    if (!oldLine || !newLine || oldLine.quantity === newLine.quantity) return [];
-    return [{ sku: newLine.sku || oldLine.sku, product: newLine.product || oldLine.product, change: newLine.quantity > oldLine.quantity ? "Quantity increased" as const : "Quantity reduced" as const, before: oldLine.quantity, after: newLine.quantity }];
-  });
+    if (!oldLine && newLine) changes.push({ sku: newLine.sku, product: newLine.product, change: "Added", before: 0, after: newLine.quantity });
+    else if (oldLine && !newLine) changes.push({ sku: oldLine.sku, product: oldLine.product, change: "Removed", before: oldLine.quantity, after: 0 });
+    else if (oldLine && newLine && oldLine.quantity !== newLine.quantity) changes.push({ sku: newLine.sku || oldLine.sku, product: newLine.product || oldLine.product, change: newLine.quantity > oldLine.quantity ? "Quantity increased" : "Quantity reduced", before: oldLine.quantity, after: newLine.quantity });
+    return changes;
+  }, []);
 };
 const nextPurchaseOrderNumber = (purchases: PurchaseOrder[]) => {
   const now = new Date();

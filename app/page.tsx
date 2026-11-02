@@ -87,6 +87,7 @@ const memberModuleAccess = (tokens: string[] | undefined, module: CrmModule): Mo
 type AccessRequest = { user_id: string; full_name: string; phone: string; email: string; created_at: string };
 type AuditEvent = { id: number; actor_email: string; action: string; module: string; details: string; created_at: string };
 type ProductStockMovement = { orderId: string; client?: string; direction: "Dispatch" | "Return"; sku: string; product: string; quantity: number; before: number; after: number };
+type ConfirmedOrderProductChange = { sku: string; product: string; change: "Confirmed" | "Added" | "Removed" | "Quantity increased" | "Quantity reduced"; before: number; after: number };
 type Order = {
   id: string;
   client: string;
@@ -391,6 +392,31 @@ const describeConfirmedOrderChanges = (before: Order, after: Order) => {
     if ((previous.remarks || "").trim() !== (next.remarks || "").trim()) changes.push(`${label} remark updated`);
   });
   return changes;
+};
+// This is deliberately SKU based (not product-name based): product names can
+// repeat, while a confirmed order must leave an auditable history for the
+// exact Stock Master SKU that was changed.
+const confirmedOrderProductChanges = (before: ProductLine[], after: ProductLine[]): ConfirmedOrderProductChange[] => {
+  const summarise = (lines: ProductLine[]) => {
+    const result = new Map<string, ProductLine>();
+    lines.forEach((line) => {
+      const key = skuKey(line.sku);
+      if (!key) return;
+      const existing = result.get(key);
+      result.set(key, existing ? { ...existing, quantity: existing.quantity + line.quantity } : { ...line });
+    });
+    return result;
+  };
+  const previous = summarise(before);
+  const next = summarise(after);
+  return [...new Set([...previous.keys(), ...next.keys()])].flatMap((key) => {
+    const oldLine = previous.get(key);
+    const newLine = next.get(key);
+    if (!oldLine && newLine) return [{ sku: newLine.sku, product: newLine.product, change: "Added" as const, before: 0, after: newLine.quantity }];
+    if (oldLine && !newLine) return [{ sku: oldLine.sku, product: oldLine.product, change: "Removed" as const, before: oldLine.quantity, after: 0 }];
+    if (!oldLine || !newLine || oldLine.quantity === newLine.quantity) return [];
+    return [{ sku: newLine.sku || oldLine.sku, product: newLine.product || oldLine.product, change: newLine.quantity > oldLine.quantity ? "Quantity increased" as const : "Quantity reduced" as const, before: oldLine.quantity, after: newLine.quantity }];
+  });
 };
 const nextPurchaseOrderNumber = (purchases: PurchaseOrder[]) => {
   const now = new Date();
@@ -1501,6 +1527,14 @@ export default function Home() {
       setInvoices((current) => [...current.filter((invoice) => invoice.order !== advanceOrder.id), { id: advanceOrder.id, client: order.client, order: advanceOrder.id, amount: money(advanceAmount), due: "Advance payment", status: "Partial" }]);
       setTasks((current) => [...current, { id: `TASK-${Date.now()}`, title: `Arrange future dispatch for advance order ${advanceOrder.id}`, time: "10:00", dueDate: new Date().toISOString().slice(0, 10), assignee: "Rahul", type: "Follow-up", status: "Open", relatedTo: advanceOrder.id }]);
     }
+    // Confirmation is the start of the product-level order history. The
+    // record stays with the SKU even after the order moves through Dispatch
+    // Plan and Fulfilment, so the product card always explains its journey.
+    logActivity("Recorded confirmed order product change", "Products", JSON.stringify({
+      orderId: order.id,
+      client: order.client,
+      changes: dispatchLines.map((line) => ({ sku: line.sku, product: line.product, change: "Confirmed", before: 0, after: line.quantity })),
+    }));
     logActivity("Confirmed order and reserved inventory", "Orders", shortages.length ? `${order.id} · Confirmation #${nextConfirmationSequence} · ${shortages.length} shortage line(s) moved to backorder` : `${order.id} · Confirmation #${nextConfirmationSequence}`);
     const fullyShortLines = shortages.filter((shortage) => shortage.quantity === (requestedLines.find((line) => skuKey(line.sku) === skuKey(shortage.sku))?.quantity || 0));
     flash(shortages.length ? `${order.id} confirmed; CRM reserved Sheet stock and created a backorder.${fullyShortLines.length ? ` No free stock was available for: ${fullyShortLines.map((line) => line.sku).join(", ")}.` : ""}` : `${order.id} confirmed and CRM stock reserved.`);
@@ -1806,6 +1840,9 @@ export default function Home() {
             }
             if (editing && linkedBackorderIsLive && editingBackorder) savedOrder = orderWithLines(savedOrder, orderedLines);
             const confirmedChangeSummary = editing?.status === "Confirmed" ? describeConfirmedOrderChanges(editing, savedOrder) : [];
+            const confirmedProductChanges = editing?.status === "Confirmed" && !editingBackorder
+              ? confirmedOrderProductChanges(linesFor(editing), orderedLines)
+              : [];
             setClients((current) => current.map((client) => client.name.trim().toLowerCase() === savedOrder.client.trim().toLowerCase() ? { ...client, customerStatus: "Active" } : client));
             setOrders((current) => {
               if (!editing) return [...current, savedOrder];
@@ -1828,6 +1865,9 @@ export default function Home() {
             if (syncedBackorder === null) setTasks((current) => current.filter((task) => task.relatedTo !== linkedBackorder!.id));
             setModal(null);
             logActivity(editing ? (editing.status === "Confirmed" ? "Updated confirmed order" : "Updated order") : "Created order", editing?.status === "Confirmed" ? "Confirmed Orders" : "Orders", editing?.status === "Confirmed" ? `${requestedId} · ${confirmedChangeSummary.join(" | ") || "Order details saved"}` : requestedId);
+            if (confirmedProductChanges.length) {
+              logActivity("Recorded confirmed order product change", "Products", JSON.stringify({ orderId: requestedId, client: savedOrder.client, changes: confirmedProductChanges }));
+            }
             flash(editing ? "Order updated successfully" : "Draft order created. Confirm it to reserve available stock and create any backorder.");
           }}
         />
@@ -2602,6 +2642,7 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit, showDraftOr
 
 function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }: { sku: string; auditEvents: AuditEvent[]; orders: Order[]; currentAvailable: number }) {
   type RecordedMovement = ProductStockMovement & { actor: string; createdAt: string };
+  type RecordedOrderChange = ConfirmedOrderProductChange & { orderId: string; client: string; actor: string; createdAt: string };
   const clientByOrder = new Map(orders.map((order) => [order.id, order.client]));
   const movements = auditEvents.flatMap((event) => {
     if (event.action !== "Recorded Product / SKU stock movement") return [] as RecordedMovement[];
@@ -2611,6 +2652,14 @@ function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }:
       return parsed.lines.filter((line) => line && line.sku).map((line) => ({ ...line, orderId: parsed.orderId || line.orderId, client: line.client || clientByOrder.get(parsed.orderId || line.orderId) || "Previous / unknown client", direction: parsed.direction || line.direction, actor: event.actor_email, createdAt: event.created_at }));
     } catch { return []; }
   });
+  const orderChanges = auditEvents.flatMap((event) => {
+    if (event.action !== "Recorded confirmed order product change") return [] as RecordedOrderChange[];
+    try {
+      const parsed = JSON.parse(event.details) as { orderId?: string; client?: string; changes?: ConfirmedOrderProductChange[] };
+      if (!parsed.orderId || !Array.isArray(parsed.changes)) return [];
+      return parsed.changes.filter((change) => change && change.sku).map((change) => ({ ...change, orderId: parsed.orderId!, client: parsed.client || clientByOrder.get(parsed.orderId!) || "Previous / unknown client", actor: event.actor_email, createdAt: event.created_at }));
+    } catch { return []; }
+  }).filter((change) => skuKey(change.sku) === skuKey(sku)).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const grouped = new Map<string, { client: string; orderId: string; dispatch?: RecordedMovement; returned?: RecordedMovement; first: string; latest: string }>();
   movements.filter((movement) => skuKey(movement.sku) === skuKey(sku)).forEach((movement) => {
     const key = movement.orderId;
@@ -2623,7 +2672,7 @@ function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }:
   });
   const rows = [...grouped.values()].sort((a, b) => a.first.localeCompare(b.first));
   const startingBalance = rows[0]?.dispatch?.before ?? rows[0]?.returned?.before;
-  return <section className="product-stock-history"><div><span className="overline">THIS SKU · ORDER HISTORY</span><h3>Stock movement</h3><p>{startingBalance === undefined ? "No dispatch or return has been recorded for this SKU yet." : <>Tracked balance began at <b>{startingBalance.toLocaleString("en-IN")}</b>; current available balance is <b>{currentAvailable.toLocaleString("en-IN")}</b>.</>}</p></div>{rows.length > 0 && <div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>SUBTRACTED</th><th>REMAINING</th><th>REVERSED</th><th>REMAINING</th></tr></thead><tbody>{rows.map((row) => <tr key={row.orderId}><td><b>{row.orderId}</b></td><td>{row.client}</td><td>{row.dispatch ? <b>−{row.dispatch.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.dispatch ? <><b>{row.dispatch.after.toLocaleString("en-IN")}</b><small className="table-subtext">{new Date(row.dispatch.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td><td>{row.returned ? <b>+{row.returned.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.returned ? <><b>{row.returned.after.toLocaleString("en-IN")}</b><small className="table-subtext">{new Date(row.returned.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td></tr>)}</tbody></table></div>}</section>;
+  return <section className="product-stock-history"><div><span className="overline">THIS SKU · ORDER HISTORY</span><h3>Order and stock history</h3><p>{startingBalance === undefined ? "No dispatch or return has been recorded for this SKU yet." : <>Tracked balance began at <b>{startingBalance.toLocaleString("en-IN")}</b>; current available balance is <b>{currentAvailable.toLocaleString("en-IN")}</b>.</>}</p></div>{orderChanges.length > 0 && <><h4>Confirmed-order changes</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>CHANGE</th><th>QTY</th><th>BY</th></tr></thead><tbody>{orderChanges.map((change, index) => <tr key={`${change.orderId}-${change.createdAt}-${index}`}><td><b>{change.orderId}</b><small className="table-subtext">{new Date(change.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></td><td>{change.client}</td><td>{change.change}</td><td><b>{change.change === "Confirmed" ? change.after.toLocaleString("en-IN") : `${change.before.toLocaleString("en-IN")} → ${change.after.toLocaleString("en-IN")}`}</b></td><td>{change.actor}</td></tr>)}</tbody></table></div></>}{rows.length > 0 && <><h4>Actual stock movement</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>SUBTRACTED</th><th>REMAINING</th><th>REVERSED</th><th>REMAINING</th></tr></thead><tbody>{rows.map((row) => <tr key={row.orderId}><td><b>{row.orderId}</b></td><td>{row.client}</td><td>{row.dispatch ? <b>−{row.dispatch.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.dispatch ? <><b>{row.dispatch.after.toLocaleString("en-IN")}</b><small className="table-subtext">{new Date(row.dispatch.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td><td>{row.returned ? <b>+{row.returned.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.returned ? <><b>{row.returned.after.toLocaleString("en-IN")}</b><small className="table-subtext">{new Date(row.returned.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td></tr>)}</tbody></table></div></>}</section>;
 }
 
 function ProductStockInventoryPanel({ session, canApply, auditEvents, orders, releaseAllReservations, onAudit, query, onProductsSynced, onLiveBackup }: { session: Session; canApply: boolean; auditEvents: AuditEvent[]; orders: Order[]; releaseAllReservations: () => void; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>>; onLiveBackup: () => void }) {

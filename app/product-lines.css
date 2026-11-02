@@ -3,4 +3,5 @@
 .product-line-remark{flex:0 0 180px;min-width:180px;margin:0!important;padding:8px!important;font-size:10px!important;background:#fffdfb!important}
 @media(max-width:560px){.product-line-remark{flex-basis:150px;min-width:150px}}
 .line-available{grid-column:1 / -1;color:#39755f;font-size:9px;padding:0 2px}
+.product-stock-history{margin-top:18px;border-top:1px solid #eee2df;padding-top:14px}.product-stock-history h3{margin:3px 0;font-size:14px}.product-stock-history p{margin:0 0 10px;color:#786970;font-size:11px}
 .purchase-register-tabs{display:flex;gap:7px;margin-top:10px}.purchase-register-tabs button{border:1px solid #ead9dd;background:#fff;color:#765762;border-radius:999px;padding:6px 10px;font-size:10px;font-weight:700;cursor:pointer}.purchase-register-tabs button.active{background:#7e1f36;color:#fff;border-color:#7e1f36}

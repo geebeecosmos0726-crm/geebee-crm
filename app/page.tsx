@@ -353,7 +353,10 @@ const receivedPurchaseQuantity = (line: Partial<PurchaseLine>) => {
 // Available quantity belongs to the Product Stock Inventory Sheet. CRM orders
 // only reserve part of that quantity, so the Sheet and the CRM never overwrite
 // each other between stock syncs.
-const freeStock = (product: CatalogueItem) => Math.max(0, availableStock(product) - (product.reservedStock || 0));
+// Do not hide an over-allocation. A negative free balance is an operational
+// warning that a confirmed order has been manually increased beyond the stock
+// recorded in the Stock Master; the linked backorder continues as normal.
+const freeStock = (product: CatalogueItem) => availableStock(product) - (product.reservedStock || 0);
 const linesFor = (order: Order): ProductLine[] => order.products || [{ product: order.product, sku: order.sku, quantity: order.quantity, unitPrice: order.unitPrice }];
 const confirmedReservationsForSku = (orders: Order[], sku: string) => orders
   .filter((order) => order.status === "Confirmed")
@@ -361,8 +364,8 @@ const confirmedReservationsForSku = (orders: Order[], sku: string) => orders
 function ProductReservationSummary({ product, orders }: { product: CatalogueItem; orders: Order[] }) {
   const reservations = confirmedReservationsForSku(orders, product.sku);
   const reserved = reservations.reduce((total, entry) => total + entry.quantity, 0);
-  const free = Math.max(0, availableStock(product) - reserved);
-  return <><p className="catalogue-stock">Reserved: <b>{reserved.toLocaleString("en-IN")}</b> · Free: <b>{free.toLocaleString("en-IN")}</b></p>{reservations.length > 0 && <p className="catalogue-stock">Reserved by: <b>{reservations.map((entry) => `${entry.orderId} (${entry.quantity.toLocaleString("en-IN")})`).join(", ")}</b></p>}</>;
+  const free = availableStock(product) - reserved;
+  return <><p className="catalogue-stock">Reserved: <b>{reserved.toLocaleString("en-IN")}</b> · Free: <b className={free < 0 ? "negative-stock" : ""}>{free.toLocaleString("en-IN")}</b></p>{free < 0 && <p className="catalogue-stock negative-stock">Over-allocated by {Math.abs(free).toLocaleString("en-IN")} · linked backorder remains active.</p>}{reservations.length > 0 && <p className="catalogue-stock">Reserved by: <b>{reservations.map((entry) => `${entry.orderId} (${entry.quantity.toLocaleString("en-IN")})`).join(", ")}</b></p>}</>;
 }
 const orderTotal = (order: Order) => linesFor(order).reduce((total, line) => total + line.quantity * line.unitPrice, 0);
 const orderEntrySource = (order: Order) => /imported\s+from/i.test(order.remarks || "") ? "Import" : "Manual";
@@ -1839,10 +1842,24 @@ export default function Home() {
               }
             }
             if (editing && linkedBackorderIsLive && editingBackorder) savedOrder = orderWithLines(savedOrder, orderedLines);
+            // A manual confirmed-order edit is an intentional allocation
+            // decision. Keep those exact lines as the confirmed reservation,
+            // even if the resulting free balance is negative; the shortage's
+            // linked backorder remains separately visible and actionable.
+            if (editing?.status === "Confirmed" && !editingBackorder) savedOrder = { ...savedOrder, products: orderedLines, approvedProducts: orderedLines };
             const confirmedChangeSummary = editing?.status === "Confirmed" ? describeConfirmedOrderChanges(editing, savedOrder) : [];
+            const draftChangeSummary = editing?.status === "Draft" ? describeConfirmedOrderChanges(editing, savedOrder) : [];
             const confirmedProductChanges = editing?.status === "Confirmed" && !editingBackorder
               ? confirmedOrderProductChanges(linesFor(editing), orderedLines)
               : [];
+            if (confirmedProductChanges.length) {
+              const reservationDeltaBySku = new Map<string, number>();
+              confirmedProductChanges.forEach((change) => reservationDeltaBySku.set(skuKey(change.sku), (reservationDeltaBySku.get(skuKey(change.sku)) || 0) + change.after - change.before));
+              setCatalogue((current) => current.map((product) => {
+                const delta = reservationDeltaBySku.get(skuKey(product.sku)) || 0;
+                return delta ? { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) + delta) } : product;
+              }));
+            }
             setClients((current) => current.map((client) => client.name.trim().toLowerCase() === savedOrder.client.trim().toLowerCase() ? { ...client, customerStatus: "Active" } : client));
             setOrders((current) => {
               if (!editing) return [...current, savedOrder];
@@ -1864,7 +1881,7 @@ export default function Home() {
             });
             if (syncedBackorder === null) setTasks((current) => current.filter((task) => task.relatedTo !== linkedBackorder!.id));
             setModal(null);
-            logActivity(editing ? (editing.status === "Confirmed" ? "Updated confirmed order" : "Updated order") : "Created order", editing?.status === "Confirmed" ? "Confirmed Orders" : "Orders", editing?.status === "Confirmed" ? `${requestedId} · ${confirmedChangeSummary.join(" | ") || "Order details saved"}` : requestedId);
+            logActivity(editing ? (editing.status === "Confirmed" ? "Updated confirmed order" : "Updated order") : "Created order", editing?.status === "Confirmed" ? "Confirmed Orders" : "Orders", editing?.status === "Confirmed" ? `${requestedId} · ${confirmedChangeSummary.join(" | ") || "Order details saved"}` : editing?.status === "Draft" ? `${requestedId} · ${draftChangeSummary.join(" | ") || "Order details saved"}` : requestedId);
             if (confirmedProductChanges.length) {
               logActivity("Recorded confirmed order product change", "Products", JSON.stringify({ orderId: requestedId, client: savedOrder.client, changes: confirmedProductChanges }));
             }
@@ -2382,14 +2399,18 @@ function OrderViewModal({ order, close }: { order: Order; close: () => void }) {
 function OrderDetailsModal({ order, auditEvents, close }: { order: Order; auditEvents: AuditEvent[]; close: () => void }) {
   const lines = linesFor(order);
   const isConfirmed = order.status === "Confirmed";
-  const orderHistory = isConfirmed ? auditEvents.filter((event) => event.details.toLowerCase().includes(order.id.toLowerCase())).slice(0, 20) : [];
+  const showOrderHistory = order.status === "Draft" || isConfirmed;
+  // Product-level JSON audits belong in the SKU history. The order view keeps
+  // the readable order-edit trail, including added/removed products and qty
+  // increases/reductions.
+  const orderHistory = showOrderHistory ? auditEvents.filter((event) => event.details.toLowerCase().includes(order.id.toLowerCase()) && !["Recorded confirmed order product change", "Recorded Product / SKU stock movement"].includes(event.action)).slice(0, 20) : [];
   return <Shell close={close} wide printDocument={isConfirmed}>
     <section className={isConfirmed ? "confirmed-order-print-document" : ""}>
       <div className="order-modal-head"><div className="modal-mark"><ClipboardList size={22}/></div><div>{isConfirmed && <span className="overline">CONFIRMATION NO. {order.confirmationSequence || "—"}</span>}<span className="overline">{order.status.toUpperCase()} ORDER · {order.id}</span><h2 className="dispatch-customer-name">{order.client || "Customer not assigned"}</h2><p>{[order.city, order.transporter].filter(Boolean).join(" · ") || "No city or transporter assigned"}</p></div></div>
       {isConfirmed && <div className="confirmed-order-print-actions"><button className="outline confirmed-order-print-button" type="button" onClick={() => window.print()}>Print packing copy</button></div>}
       <div className="form-row"><div className="profile-empty"><b>Status</b><br/><Pill value={order.status}/></div><div className="profile-empty"><b>Payment</b><br/><Pill value={order.payment}/></div><div className="profile-empty"><b>Expected arrival</b><br/>{order.eta ? new Date(order.eta).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—"}</div></div>
       <div className="modal-section-title">Order products</div><div className="table-wrap"><table className="records"><thead><tr><th>SKU</th><th>PRODUCT</th><th>QTY</th><th className="financial-column">UNIT PRICE</th><th className="financial-column">AMOUNT</th><th>REMARKS</th></tr></thead><tbody>{lines.map((line, index) => <tr key={`${line.sku}-${index}`}><td><b>{line.sku || "—"}</b></td><td>{line.product || "—"}</td><td><b>{line.quantity.toLocaleString("en-IN")}</b></td><td className="financial-column">{money(line.unitPrice)}</td><td className="financial-column"><b>{money(line.quantity * line.unitPrice)}</b></td><td>{line.remarks?.trim() || "—"}</td></tr>)}</tbody></table></div><div className="order-total financial-column"><span>Order total</span><b>{money(orderTotal(order))}</b></div>{packingInstructions(order) && <div className="profile-empty"><b>Packing</b><br/>{packingInstructions(order)}</div>}
-      {isConfirmed && <section className="confirmed-order-history"><div><span className="overline">CONFIRMED ORDER HISTORY</span><h3>Changes to this order</h3><p>Who changed what, with the recorded time.</p></div>{orderHistory.length ? orderHistory.map((event) => <article key={event.id}><div><b>{event.action}</b><span>{event.actor_email}{event.details ? ` · ${event.details}` : ""}</span></div><time>{new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</time></article>) : <p className="profile-empty">No confirmed-order changes recorded yet.</p>}</section>}
+      {showOrderHistory && <section className="confirmed-order-history"><div><span className="overline">{isConfirmed ? "CONFIRMED" : "DRAFT"} ORDER HISTORY</span><h3>Changes to this order</h3><p>Who changed what, with the recorded time.</p></div>{orderHistory.length ? orderHistory.map((event) => <article className={/\b(added|increased)\b/i.test(event.details) ? "history-positive" : /\b(removed|reduced)\b/i.test(event.details) ? "history-negative" : ""} key={event.id}><div><b>{event.action}</b><span>{event.actor_email}{event.details ? ` · ${event.details}` : ""}</span></div><time>{new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</time></article>) : <p className="profile-empty">No order changes recorded yet.</p>}</section>}
     </section>
   </Shell>;
 }

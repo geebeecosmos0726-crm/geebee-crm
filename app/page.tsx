@@ -112,6 +112,7 @@ type Order = {
   // Immutable quantities deducted when the order entered Dispatch Plan. These
   // are the only quantities allowed to be added back on a Dispatch reversal.
   dispatchStockLines?: ProductLine[];
+  dispatchedAt?: string;
   dispatchReversedAt?: string;
   cancelledFromDispatch?: boolean;
   cancelledFromStage?: "Draft" | "Confirmed" | "Dispatch plan" | "Sent to customer" | "Received by customer";
@@ -549,21 +550,6 @@ const catalogueMatchForOrderLine = (line: ProductLine, catalogue: CatalogueItem[
       .some((candidate) => candidate.toLocaleLowerCase() === label);
   });
   return labelMatches.length === 1 ? labelMatches[0] : undefined;
-};
-// Verified opening balances supplied for the AB-204 numbered-candle series.
-// These are used only by the per-product history ledger: they do not modify
-// live Product/SKU availability or write anything to Google Stock Master.
-const productHistoryOpeningBalances: Record<string, number> = {
-  ab2040: 18820,
-  ab2041: 106608,
-  ab2042: 1764,
-  ab2043: 756,
-  ab2044: 13080,
-  ab2045: 4824,
-  ab2046: 3080,
-  ab2047: 3864,
-  ab2048: 3516,
-  ab2049: 18248,
 };
 const productCategories = ["Candles", "Paper Banner", "Ribbon", "Metal & Paper stands", "Cake crown", "Crown & Tiaras", "Led candles", "Balloon pump", "Goggles /LED Goggles", "Caps", "Paper Sets /Props", "Cake topper", "Party popper", "Party items"] as const;
 const categoryImages: Record<(typeof productCategories)[number], string> = {
@@ -1447,7 +1433,7 @@ export default function Home() {
     const primaryOrder = orders.find((item) => item.id === primaryId);
     const advanceOrder = orders.find((item) => item.id === advanceId);
     const confirmedLines = !isAdvance && primaryOrder?.status === "Confirmed" ? (primaryOrder.approvedProducts || linesFor(primaryOrder)) : [];
-    const committedLines = !isAdvance && primaryOrder?.inventoryCommitted ? linesFor(primaryOrder) : [];
+    const committedLines = !isAdvance && primaryOrder?.inventoryCommitted ? (primaryOrder.dispatchStockLines?.length ? primaryOrder.dispatchStockLines : linesFor(primaryOrder)) : [];
     setCatalogue((current) => current.map((product) => {
       const reserved = confirmedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       const restore = committedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
@@ -1498,7 +1484,7 @@ export default function Home() {
     });
     const committedLines = [...primaryIds].flatMap((id) => {
       const order = orders.find((item) => item.id === id);
-      return order?.inventoryCommitted ? linesFor(order) : [];
+      return order?.inventoryCommitted ? (order.dispatchStockLines?.length ? order.dispatchStockLines : linesFor(order)) : [];
     });
     setCatalogue((current) => current.map((product) => {
       const reserved = confirmedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
@@ -1705,7 +1691,7 @@ export default function Home() {
       };
     }));
     const first = dispatchLines[0] || approvedLines[0];
-    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, dispatchStockLines: dispatchLines.map((line) => ({ ...line })), dispatchReversedAt: undefined, status: "Dispatch plan", inventoryCommitted: true } : item));
+    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, dispatchStockLines: dispatchLines.map((line) => ({ ...line })), dispatchedAt: new Date().toISOString(), dispatchReversedAt: undefined, status: "Dispatch plan", inventoryCommitted: true } : item));
     logActivity("Sent confirmed order to Dispatch Plan", "Dispatch Plan", releasedLines.length ? `${order.id} · reduced CRM reservation released` : order.id);
     if (stockMovements.length) pendingStockMovementAudits.current.push({ orderId: order.id, direction: "Dispatch", lines: stockMovements });
     flash(releasedLines.length ? `${order.id} sent to Dispatch Plan; reduced quantities were released from CRM reservation.` : `${order.id} sent to Dispatch Plan for Operations.`);
@@ -2819,7 +2805,7 @@ function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }:
     .filter((order) => order.inventoryCommitted && activeDispatchStatuses.has(order.status))
     .flatMap((order) => (order.dispatchStockLines?.length ? order.dispatchStockLines : linesFor(order)).map((line) => ({ order, line })))
     .filter(({ order, line }) => skuKey(line.sku) === skuKey(sku) && !auditedDispatchKeys.has(`${order.id}::${skuKey(line.sku)}`))
-    .map(({ order, line }) => ({ orderId: order.id, client: order.client, direction: "Dispatch" as const, sku: line.sku, product: line.product, quantity: line.quantity, before: 0, after: 0, actor: "Recovered from saved dispatch order", createdAt: "", derivedFromOrder: true }));
+    .map(({ order, line }) => ({ orderId: order.id, client: order.client, direction: "Dispatch" as const, sku: line.sku, product: line.product, quantity: line.quantity, before: 0, after: 0, actor: "Recovered from saved dispatch order", createdAt: order.dispatchedAt || "", derivedFromOrder: true }));
   const movements = [...auditedMovements, ...snapshotMovements];
   const orderChanges = auditEvents.flatMap((event) => {
     if (event.action !== "Recorded confirmed order product change") return [] as RecordedOrderChange[];
@@ -2845,12 +2831,8 @@ function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }:
     grouped.set(key, current);
   });
   const rows = [...grouped.values()].sort((a, b) => a.first.localeCompare(b.first));
-  const suppliedOpeningBalance = productHistoryOpeningBalances[skuKey(sku)];
   const auditedStartingBalance = rows.find((row) => row.dispatch && !row.dispatch.derivedFromOrder)?.dispatch?.before ?? rows.find((row) => row.returned)?.returned?.before;
-  const startingBalance = suppliedOpeningBalance ?? auditedStartingBalance;
-  // The ledger is calculated from the verified opening balance rather than
-  // trusting a historical before/after value that may have been recorded
-  // before the stock-master write safeguards existed.
+  const startingBalance = auditedStartingBalance;
   let runningBalance = startingBalance;
   const calculatedRows = rows.map((row) => {
     const afterDispatch = row.dispatch && runningBalance !== undefined ? runningBalance - row.dispatch.quantity : undefined;
@@ -2859,7 +2841,7 @@ function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }:
     if (afterReturn !== undefined) runningBalance = afterReturn;
     return { ...row, afterDispatch, afterReturn };
   });
-  return <section className="product-stock-history"><div><span className="overline">THIS SKU · ORDER HISTORY</span><h3>Order and stock history</h3><p>{startingBalance === undefined ? "An active dispatch is recorded below, but no opening balance is available yet for a reliable running total." : <>Tracked balance began at <b>{startingBalance.toLocaleString("en-IN")}</b>; order-history balance is <b>{(runningBalance ?? startingBalance).toLocaleString("en-IN")}</b>{suppliedOpeningBalance !== undefined ? ". Based on the verified opening balance." : `; current CRM available balance is ${currentAvailable.toLocaleString("en-IN")}.`}</>}</p></div>{orderChanges.length > 0 && <><h4>Confirmed-order changes</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>CHANGE</th><th>QTY</th><th>BY</th></tr></thead><tbody>{orderChanges.map((change, index) => <tr key={`${change.orderId}-${change.createdAt}-${index}`}><td><b>{change.orderId}</b><small className="table-subtext">{new Date(change.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></td><td>{change.client}</td><td><span className={changeClass(change.change)}>{change.change}</span></td><td className={changeClass(change.change)}><b>{change.change === "Confirmed" ? change.after.toLocaleString("en-IN") : `${change.before.toLocaleString("en-IN")} → ${change.after.toLocaleString("en-IN")}`}</b></td><td>{change.actor}</td></tr>)}</tbody></table></div></>}{calculatedRows.length > 0 && <><h4>Actual stock movement</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>SUBTRACTED</th><th>REMAINING</th><th>REVERSED</th><th>REMAINING</th></tr></thead><tbody>{calculatedRows.map((row) => <tr key={row.orderId}><td><b>{row.orderId}</b>{row.dispatch?.derivedFromOrder && <small className="table-subtext">Recovered from saved Dispatch Plan</small>}</td><td>{row.client}</td><td>{row.dispatch ? <b>−{row.dispatch.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.dispatch ? <><b>{row.afterDispatch?.toLocaleString("en-IN") ?? "—"}</b>{row.dispatch.createdAt && <small className="table-subtext">{new Date(row.dispatch.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small>}</> : "—"}</td><td>{row.returned ? <b>+{row.returned.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.returned ? <><b>{row.afterReturn?.toLocaleString("en-IN") ?? "—"}</b><small className="table-subtext">{new Date(row.returned.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td></tr>)}</tbody></table></div></>}</section>;
+  return <section className="product-stock-history"><div><span className="overline">THIS SKU · ORDER HISTORY</span><h3>Order and stock history</h3><p>{startingBalance === undefined ? "Actual stock movements are shown below. A reliable opening balance was not recorded for the older history." : <>Tracked balance began at <b>{startingBalance.toLocaleString("en-IN")}</b>; order-history balance is <b>{(runningBalance ?? startingBalance).toLocaleString("en-IN")}</b>; current CRM available balance is <b>{currentAvailable.toLocaleString("en-IN")}</b>.</>}</p></div>{orderChanges.length > 0 && <><h4>Confirmed-order changes</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>CHANGE</th><th>QTY</th><th>BY</th></tr></thead><tbody>{orderChanges.map((change, index) => <tr key={`${change.orderId}-${change.createdAt}-${index}`}><td><b>{change.orderId}</b><small className="table-subtext">{new Date(change.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></td><td>{change.client}</td><td><span className={changeClass(change.change)}>{change.change}</span></td><td className={changeClass(change.change)}><b>{change.change === "Confirmed" ? change.after.toLocaleString("en-IN") : `${change.before.toLocaleString("en-IN")} → ${change.after.toLocaleString("en-IN")}`}</b></td><td>{change.actor}</td></tr>)}</tbody></table></div></>}{calculatedRows.length > 0 && <><h4>Actual stock movement</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>SUBTRACTED</th><th>REMAINING</th><th>REVERSED</th><th>REMAINING</th></tr></thead><tbody>{calculatedRows.map((row) => <tr key={row.orderId}><td><b>{row.orderId}</b>{row.dispatch?.derivedFromOrder && <small className="table-subtext">Recovered from saved Dispatch Plan</small>}</td><td>{row.client}</td><td>{row.dispatch ? <b>−{row.dispatch.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.dispatch ? <><b>{row.afterDispatch?.toLocaleString("en-IN") ?? "—"}</b>{row.dispatch.createdAt && <small className="table-subtext">{new Date(row.dispatch.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small>}</> : "—"}</td><td>{row.returned ? <b>+{row.returned.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.returned ? <><b>{row.afterReturn?.toLocaleString("en-IN") ?? "—"}</b><small className="table-subtext">{new Date(row.returned.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td></tr>)}</tbody></table></div></>}</section>;
 }
 
 function ProductStockInventoryPanel({ session, canApply, auditEvents, orders, releaseAllReservations, onAudit, query, onProductsSynced, onLiveBackup }: { session: Session; canApply: boolean; auditEvents: AuditEvent[]; orders: Order[]; releaseAllReservations: () => void; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>>; onLiveBackup: () => void }) {
@@ -2872,42 +2854,6 @@ function ProductStockInventoryPanel({ session, canApply, auditEvents, orders, re
     setItems(products);
     saveProductStockCache(session.user.id, products);
     onProductsSynced(products);
-  };
-  const reconcileVerified204Balances = () => {
-    const passcode = window.prompt("Recalculate AB-204-0 to AB-204-9 from their verified opening balances?\n\nThis writes the calculated Available Stock to CRM and Google Stock Master.\n\nEnter sync passcode: GeeBee2026");
-    if (passcode === null) return;
-    if (passcode !== "GeeBee2026") { setMessage("Incorrect passcode. No stock was changed."); return; }
-    const activeDispatchStatuses = new Set(["Dispatch plan", "Sent to customer", "Received by customer"]);
-    const deductions = new Map(Object.keys(productHistoryOpeningBalances).map((sku) => [sku, 0]));
-    const addDeduction = (sku: string, quantity: number) => {
-      const key = skuKey(sku);
-      if (deductions.has(key)) deductions.set(key, (deductions.get(key) || 0) + quantity);
-    };
-    orders.filter((order) => order.inventoryCommitted && activeDispatchStatuses.has(order.status)).forEach((order) => {
-      const dispatched = order.dispatchStockLines?.length ? order.dispatchStockLines : linesFor(order);
-      dispatched.forEach((line) => {
-        const mixSeries = numberCandleMixSeries(line);
-        if (mixSeries === "204" && Number.isInteger(line.quantity / numberCandleMixUnits)) {
-          const multiplier = line.quantity / numberCandleMixUnits;
-          numberCandleMixRecipe.forEach((component) => addDeduction(`AB-204-${component.digit}`, component.cartons * multiplier));
-          return;
-        }
-        addDeduction(line.sku, line.quantity);
-      });
-    });
-    const calculated = new Map(Object.entries(productHistoryOpeningBalances).map(([sku, opening]) => [sku, opening - (deductions.get(sku) || 0)]));
-    const matched = items.filter((item) => calculated.has(skuKey(item.sku)));
-    if (matched.length !== calculated.size) {
-      const found = new Set(matched.map((item) => skuKey(item.sku)));
-      const missing = [...calculated.keys()].filter((sku) => !found.has(sku));
-      setMessage(`No stock was changed. These verified AB-204 SKU(s) are missing from Product / SKUs: ${missing.join(", ")}.`);
-      return;
-    }
-    if (!window.confirm(`Apply the calculated balances to ${matched.length} AB-204 numbered SKUs? This updates CRM and Google Stock Master.`)) return;
-    const next = items.map((item) => calculated.has(skuKey(item.sku)) ? { ...item, availableQuantity: calculated.get(skuKey(item.sku))! } : item);
-    replaceItems(next);
-    onAudit("Reconciled verified AB-204 opening balances", "Products", [...calculated.entries()].map(([sku, available]) => `${sku.toUpperCase()}: ${available.toLocaleString("en-IN")}`).join(" · "));
-    setMessage(`AB-204 reconciliation applied to CRM and queued for Stock Master: ${[...calculated.entries()].map(([sku, available]) => `${sku.toUpperCase()} ${available.toLocaleString("en-IN")}`).join(" · ")}.`);
   };
   const load = async () => {
     setLoading(true); setMessage("");
@@ -2956,7 +2902,7 @@ function ProductStockInventoryPanel({ session, canApply, auditEvents, orders, re
     } catch (error) { setMessage(error instanceof Error ? error.message : "Product could not be updated."); }
     finally { setLoading(false); }
   };
-  return <><section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT MASTER</span><h2>Products / SKUs</h2><p>Your Google Sheet inventory is the product master for this section. Sync it only when the sheet has changed.</p></div><div className="catalogue-count"><b>{items.length}</b><span>SKUs</span></div></div><section className="catalogue-actions"><div className="catalogue-tip"><b>Google Sheet product master</b><p>Fields: SKU ID, Product Name, Category, Unit, Inner Qty, Outer Qty, Selling Price, Available Stock, Low Stock Alert, Image URL.</p></div><div className="button-row">{canApply && <button className="outline" type="button" disabled={loading} onClick={() => sync("setup")}>Set up blank sheet + test rows</button>}{canApply && <button className="outline" type="button" disabled={loading} onClick={releaseAllReservations}>Release all reservations</button>}{canApply && <button className="outline" type="button" disabled={loading} onClick={reconcileVerified204Balances}>Recalculate AB-204 series</button>}<span className="sync-stock-action"><button className="primary" type="button" disabled={loading} onClick={() => sync("sync")}>{loading ? "Syncing…" : "Sync Google Sheet"}</button><small>Update CRM from Sheet</small></span></div></section>{message && <p className="inventory-recon-message success">{message}</p>}<section className="catalogue-grid">{visibleItems.map((item) => <article className="catalogue-card" key={item.id} onClick={() => canApply && setEditing(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={item.name} onError={(event) => { event.currentTarget.style.display = "none"; }}/> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><small title={item.sku}>{item.sku}</small><h3 title={item.name}>{item.name}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / ${item.unit || "pc"}` : "Price to be added"}</p><p className={`catalogue-stock ${availableStock(item) < 0 ? "negative-stock" : ""}`}>Available: <b>{availableStock(item).toLocaleString("en-IN")}</b>{availableStock(item) < 0 && " · Stock issue"}</p><ProductReservationSummary product={item} orders={orders}/><p className="catalogue-stock">Low alert: <b>{item.reorderThreshold ?? 0}</b></p>{canApply && <button className="edit-product" type="button" onClick={(event) => { event.stopPropagation(); setEditing(item); }}><Pencil size={13}/> Edit product</button>}</div></article>)}{!loading && !visibleItems.length && <div className="empty">No products match this search. Sync Google Sheet if the product master has changed.</div>}</section></section>{editing && <StockInventoryModal item={editing} auditEvents={auditEvents} orders={orders} close={() => setEditing(null)} save={saveEdit}/>}</>;
+  return <><section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT MASTER</span><h2>Products / SKUs</h2><p>Your Google Sheet inventory is the product master for this section. Sync it only when the sheet has changed.</p></div><div className="catalogue-count"><b>{items.length}</b><span>SKUs</span></div></div><section className="catalogue-actions"><div className="catalogue-tip"><b>Google Sheet product master</b><p>Fields: SKU ID, Product Name, Category, Unit, Inner Qty, Outer Qty, Selling Price, Available Stock, Low Stock Alert, Image URL.</p></div><div className="button-row">{canApply && <button className="outline" type="button" disabled={loading} onClick={() => sync("setup")}>Set up blank sheet + test rows</button>}{canApply && <button className="outline" type="button" disabled={loading} onClick={releaseAllReservations}>Release all reservations</button>}<span className="sync-stock-action"><button className="primary" type="button" disabled={loading} onClick={() => sync("sync")}>{loading ? "Syncing…" : "Sync Google Sheet"}</button><small>Update CRM from Sheet</small></span></div></section>{message && <p className="inventory-recon-message success">{message}</p>}<section className="catalogue-grid">{visibleItems.map((item) => <article className="catalogue-card" key={item.id} onClick={() => canApply && setEditing(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={item.name} onError={(event) => { event.currentTarget.style.display = "none"; }}/> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><small title={item.sku}>{item.sku}</small><h3 title={item.name}>{item.name}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / ${item.unit || "pc"}` : "Price to be added"}</p><p className={`catalogue-stock ${availableStock(item) < 0 ? "negative-stock" : ""}`}>Available: <b>{availableStock(item).toLocaleString("en-IN")}</b>{availableStock(item) < 0 && " · Stock issue"}</p><ProductReservationSummary product={item} orders={orders}/><p className="catalogue-stock">Low alert: <b>{item.reorderThreshold ?? 0}</b></p>{canApply && <button className="edit-product" type="button" onClick={(event) => { event.stopPropagation(); setEditing(item); }}><Pencil size={13}/> Edit product</button>}</div></article>)}{!loading && !visibleItems.length && <div className="empty">No products match your search. Sync Google Sheet if the product master has changed.</div>}</section></section>{editing && <StockInventoryModal item={editing} auditEvents={auditEvents} orders={orders} close={() => setEditing(null)} save={saveEdit}/>}</>;
 }
 
 function ProductStockCategoriesPanel({ session, query, openCategory }: { session: Session; query: string; openCategory: (category: string) => void }) {

@@ -1646,31 +1646,27 @@ export default function Home() {
     // AB-204 MIX / AB-205 MIX can never be sent to Dispatch as one virtual
     // SKU. Dispatch must always deduct AB-204-0…9 or AB-205-0…9 directly.
     const requestedExpansion = expandNumberCandleMixLines(linesFor(order), catalogue);
-    const approvedExpansion = expandNumberCandleMixLines(order.approvedProducts || linesFor(order), catalogue);
-    if (requestedExpansion.error || approvedExpansion.error) {
-      flash(requestedExpansion.error || approvedExpansion.error || "The MIX order could not be expanded into numbered candle SKUs.");
+    if (requestedExpansion.error) {
+      flash(requestedExpansion.error || "The MIX order could not be expanded into numbered candle SKUs.");
       return;
     }
     const requestedLines = requestedExpansion.lines;
-    const approvedLines = approvedExpansion.lines;
-    // A sheet may contain the same SKU on more than one row. Do not use a
-    // one-value-per-SKU map here: it silently replaces earlier quantities
-    // with the final row and can therefore send the wrong quantity to Dispatch.
+    const approvedLines = requestedLines;
+    // The final visible lines in Confirmed Orders are the only dispatch
+    // source of truth. Do not compare them with an older approved snapshot:
+    // that was able to send a prior quantity (E-486: 1,000) after the user
+    // had correctly saved a later quantity (1,500).
+    const dispatchLines = requestedLines.map((line) => ({ ...line }));
+    const releasedLines: ProductLine[] = [];
     const summariseBySku = (lines: ProductLine[]) => {
       const summary = new Map<string, ProductLine>();
-      lines.forEach((line) => { const key = skuKey(line.sku); const existing = summary.get(key); summary.set(key, existing ? { ...existing, quantity: existing.quantity + line.quantity } : { ...line }); });
+      lines.forEach((line) => {
+        const key = skuKey(line.sku);
+        const prior = summary.get(key);
+        summary.set(key, prior ? { ...prior, quantity: prior.quantity + line.quantity } : { ...line });
+      });
       return summary;
     };
-    const requestedBySku = summariseBySku(requestedLines);
-    const approvedBySku = summariseBySku(approvedLines);
-    const dispatchLines: ProductLine[] = []; const releasedLines: ProductLine[] = [];
-    approvedBySku.forEach((approved, key) => {
-      const requested = requestedBySku.get(key);
-      const dispatchQuantity = Math.min(approved.quantity, requested?.quantity || 0);
-      if (dispatchQuantity) dispatchLines.push({ ...(requested || approved), quantity: dispatchQuantity });
-      const releasedQuantity = Math.max(0, approved.quantity - dispatchQuantity);
-      if (releasedQuantity) releasedLines.push({ ...approved, quantity: releasedQuantity });
-    });
     if (!window.confirm(`Send ${order.id} to Dispatch Plan? Any quantity reduced by Operations will be released from CRM reservation.`)) return;
     const dispatchedBySku = summariseBySku(dispatchLines);
     const stockMovements = [...dispatchedBySku.values()].map((line) => {

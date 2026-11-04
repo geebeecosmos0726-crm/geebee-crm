@@ -380,7 +380,10 @@ const describeConfirmedOrderChanges = (before: Order, after: Order) => {
     const next = String(after[field] || "").trim();
     if (previous !== next) changes.push(`${label}: ${previous || "—"} → ${next || "—"}`);
   });
-  const keyFor = (line: ProductLine) => `${skuKey(line.sku)}|${line.product.trim().toLowerCase()}`;
+  // SKU is the identity of an order product. Product labels can change
+  // formatting (for example "AB - 972" versus "AB 972") while referring to
+  // the same SKU, so never use the label as part of this comparison key.
+  const keyFor = (line: ProductLine) => skuKey(line.sku) || skuKey(line.product);
   const previousLines = new Map(linesFor(before).map((line) => [keyFor(line), line]));
   const nextLines = new Map(linesFor(after).map((line) => [keyFor(line), line]));
   new Set([...previousLines.keys(), ...nextLines.keys()]).forEach((key) => {
@@ -395,6 +398,41 @@ const describeConfirmedOrderChanges = (before: Order, after: Order) => {
     if ((previous.remarks || "").trim() !== (next.remarks || "").trim()) changes.push(`${label} remark updated`);
   });
   return changes;
+};
+// Older history entries created before SKU-only comparison may contain a
+// misleading Removed + Added pair for the same SKU. Present those as the
+// single quantity change they actually represent, without changing the audit
+// record itself.
+const readableOrderHistoryDetails = (details: string) => {
+  const separator = " · ";
+  const separatorAt = details.indexOf(separator);
+  const prefix = separatorAt >= 0 ? details.slice(0, separatorAt + separator.length) : "";
+  const segments = (separatorAt >= 0 ? details.slice(separatorAt + separator.length) : details).split(" | ");
+  const parsed = segments.map((segment, index) => {
+    const match = segment.match(/^(Added|Removed)\s+(.+?)\s+×\s+([\d,.]+)$/i);
+    return match ? { index, raw: segment, action: match[1].toLowerCase(), label: match[2].trim(), quantity: match[3] } : null;
+  });
+  const pairs = new Map<string, { added?: NonNullable<(typeof parsed)[number]>; removed?: NonNullable<(typeof parsed)[number]> }>();
+  parsed.forEach((entry) => {
+    if (!entry) return;
+    const key = skuKey(entry.label);
+    const pair = pairs.get(key) || {};
+    if (entry.action === "added") pair.added = entry;
+    if (entry.action === "removed") pair.removed = entry;
+    pairs.set(key, pair);
+  });
+  const consumed = new Set<number>();
+  const readable = segments.flatMap((segment, index) => {
+    if (consumed.has(index)) return [];
+    const entry = parsed[index];
+    if (!entry) return [segment];
+    const pair = pairs.get(skuKey(entry.label));
+    if (!pair?.added || !pair.removed) return [segment];
+    consumed.add(pair.added.index); consumed.add(pair.removed.index);
+    if (pair.added.quantity === pair.removed.quantity) return [];
+    return [`${pair.added.label} qty: ${pair.removed.quantity} → ${pair.added.quantity}`];
+  });
+  return `${prefix}${readable.join(" | ")}`.trim();
 };
 // This is deliberately SKU based (not product-name based): product names can
 // repeat, while a confirmed order must leave an auditable history for the
@@ -2404,13 +2442,14 @@ function OrderDetailsModal({ order, auditEvents, close }: { order: Order; auditE
   // the readable order-edit trail, including added/removed products and qty
   // increases/reductions.
   const orderHistory = showOrderHistory ? auditEvents.filter((event) => event.details.toLowerCase().includes(order.id.toLowerCase()) && !["Recorded confirmed order product change", "Recorded Product / SKU stock movement"].includes(event.action)).slice(0, 20) : [];
+  const readableOrderHistory = orderHistory.map((event) => ({ ...event, readableDetails: readableOrderHistoryDetails(event.details) }));
   return <Shell close={close} wide printDocument={isConfirmed}>
     <section className={isConfirmed ? "confirmed-order-print-document" : ""}>
       <div className="order-modal-head"><div className="modal-mark"><ClipboardList size={22}/></div><div>{isConfirmed && <span className="overline">CONFIRMATION NO. {order.confirmationSequence || "—"}</span>}<span className="overline">{order.status.toUpperCase()} ORDER · {order.id}</span><h2 className="dispatch-customer-name">{order.client || "Customer not assigned"}</h2><p>{[order.city, order.transporter].filter(Boolean).join(" · ") || "No city or transporter assigned"}</p></div></div>
       {isConfirmed && <div className="confirmed-order-print-actions"><button className="outline confirmed-order-print-button" type="button" onClick={() => window.print()}>Print packing copy</button></div>}
       <div className="form-row"><div className="profile-empty"><b>Status</b><br/><Pill value={order.status}/></div><div className="profile-empty"><b>Payment</b><br/><Pill value={order.payment}/></div><div className="profile-empty"><b>Expected arrival</b><br/>{order.eta ? new Date(order.eta).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—"}</div></div>
       <div className="modal-section-title">Order products</div><div className="table-wrap"><table className="records"><thead><tr><th>SKU</th><th>PRODUCT</th><th>QTY</th><th className="financial-column">UNIT PRICE</th><th className="financial-column">AMOUNT</th><th>REMARKS</th></tr></thead><tbody>{lines.map((line, index) => <tr key={`${line.sku}-${index}`}><td><b>{line.sku || "—"}</b></td><td>{line.product || "—"}</td><td><b>{line.quantity.toLocaleString("en-IN")}</b></td><td className="financial-column">{money(line.unitPrice)}</td><td className="financial-column"><b>{money(line.quantity * line.unitPrice)}</b></td><td>{line.remarks?.trim() || "—"}</td></tr>)}</tbody></table></div><div className="order-total financial-column"><span>Order total</span><b>{money(orderTotal(order))}</b></div>{packingInstructions(order) && <div className="profile-empty"><b>Packing</b><br/>{packingInstructions(order)}</div>}
-      {showOrderHistory && <section className="confirmed-order-history"><div><span className="overline">{isConfirmed ? "CONFIRMED" : "DRAFT"} ORDER HISTORY</span><h3>Changes to this order</h3><p>Who changed what, with the recorded time.</p></div>{orderHistory.length ? orderHistory.map((event) => <article className={/\b(added|increased)\b/i.test(event.details) ? "history-positive" : /\b(removed|reduced)\b/i.test(event.details) ? "history-negative" : ""} key={event.id}><div><b>{event.action}</b><span>{event.actor_email}{event.details ? ` · ${event.details}` : ""}</span></div><time>{new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</time></article>) : <p className="profile-empty">No order changes recorded yet.</p>}</section>}
+      {showOrderHistory && <section className="confirmed-order-history"><div><span className="overline">{isConfirmed ? "CONFIRMED" : "DRAFT"} ORDER HISTORY</span><h3>Changes to this order</h3><p>Who changed what, with the recorded time.</p></div>{readableOrderHistory.length ? readableOrderHistory.map((event) => <article className={/\b(added|increased)\b/i.test(event.readableDetails) ? "history-positive" : /\b(removed|reduced)\b/i.test(event.readableDetails) ? "history-negative" : ""} key={event.id}><div><b>{event.action}</b><span>{event.actor_email}{event.readableDetails ? ` · ${event.readableDetails}` : ""}</span></div><time>{new Date(event.created_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</time></article>) : <p className="profile-empty">No order changes recorded yet.</p>}</section>}
     </section>
   </Shell>;
 }

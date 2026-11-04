@@ -365,6 +365,26 @@ const linesFor = (order: Order): ProductLine[] => order.products || [{ product: 
 const confirmedReservationsForSku = (orders: Order[], sku: string) => orders
   .filter((order) => order.status === "Confirmed")
   .flatMap((order) => (order.approvedProducts || linesFor(order)).filter((line) => skuKey(line.sku) === skuKey(sku)).map((line) => ({ orderId: order.id, quantity: line.quantity })));
+// Backorders are calculated from the final confirmed lines. Existing
+// reservations from other confirmed orders reduce what is free; the order
+// being edited is deliberately excluded so its new quantity replaces—not
+// stacks on top of—its prior reservation.
+const backorderLinesFor = (lines: ProductLine[], orderId: string, orders: Order[], catalogue: CatalogueItem[]) => {
+  const remaining = new Map(catalogue.map((product) => {
+    const reservedElsewhere = confirmedReservationsForSku(orders.filter((order) => order.id !== orderId), product.sku)
+      .reduce((sum, entry) => sum + entry.quantity, 0);
+    return [skuKey(product.sku), availableStock(product) - reservedElsewhere];
+  }));
+  const shortages: ProductLine[] = [];
+  lines.forEach((line) => {
+    const key = skuKey(line.sku);
+    const free = remaining.get(key) ?? 0;
+    const shortage = Math.max(0, line.quantity - Math.max(0, free));
+    if (shortage) shortages.push({ ...line, quantity: shortage });
+    remaining.set(key, free - line.quantity);
+  });
+  return shortages;
+};
 function ProductReservationSummary({ product, orders }: { product: CatalogueItem; orders: Order[] }) {
   const reservations = confirmedReservationsForSku(orders, product.sku);
   const reserved = reservations.reduce((total, entry) => total + entry.quantity, 0);
@@ -1109,6 +1129,25 @@ export default function Home() {
     setAuditEvents((current) => [event, ...current].slice(0, 100));
     cloud.from("crm_audit_events").insert({ workspace_owner_id: event.workspace_owner_id, actor_email: event.actor_email, action, module, details }).then(({ error }) => { if (error) console.warn("Could not record activity", error.message); });
   };
+  const deleteOrderHistory = async (orderIds: string[]) => {
+    if (!session?.access_token || !orderIds.length) return;
+    try {
+      const response = await fetch("/api/admin/delete-order-history", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session.access_token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ orderIds }),
+      });
+      const result = await response.json().catch(() => ({})) as { ok?: boolean; deletedAuditIds?: number[]; error?: string };
+      if (!response.ok || !result.ok) {
+        flash(result.error || "The order was deleted, but its history could not be cleared from the activity log.");
+        return;
+      }
+      const deleted = new Set((result.deletedAuditIds || []).map(Number));
+      if (deleted.size) setAuditEvents((current) => current.filter((event) => !deleted.has(Number(event.id))));
+    } catch {
+      flash("The order was deleted, but its history could not be cleared from the activity log.");
+    }
+  };
   useEffect(() => {
     const saved = loadCrmData();
     setOrders(saved.orders); setClients(saved.clients); setInvoices(saved.invoices); setCatalogue([]); setLeads(saved.leads); setQuotes(saved.quotes); setTasks(saved.tasks); setTransporters(saved.transporters); setSuppliers(saved.suppliers); setPurchases(saved.purchases);
@@ -1497,7 +1536,14 @@ export default function Home() {
       .map((item) => activeBackorderParents.has(item.id) ? { ...item, backorders: [] } : item));
     setInvoices((current) => current.filter((invoice) => !removedIds.has(invoice.order)));
     setTasks((current) => current.filter((task) => !task.relatedTo || !removedIds.has(task.relatedTo)));
-    logActivity("Removed order and released stock", "Orders", [...removedIds].join(", "));
+    // A hard delete means the order must disappear from every audit view too:
+    // order timeline, product history, stock movement history and notifications.
+    // Do not create a replacement activity row containing its ID.
+    const historyIds = [...removedIds];
+    void deleteOrderHistory(historyIds);
+    // Include an audit insert that may still be completing from the same UI
+    // action (for example a bulk Sheet hard-delete activity entry).
+    window.setTimeout(() => { void deleteOrderHistory(historyIds); }, 1200);
     queueGoogleSheetLiveBackup();
     flash(`${ids.length} order${ids.length === 1 ? "" : "s"} removed; linked backorders, invoices and stock allocations were removed safely too.`);
   };
@@ -1590,22 +1636,7 @@ export default function Home() {
     const missingSkus = [...new Set(requestedLines.filter((line) => !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku))).map((line) => line.sku || line.product))];
     if (missingSkus.length) { flash(`Cannot confirm ${order.id}: ${missingSkus.join(", ")} is not in Product / SKUs. Add it to the Stock Master first.`); return; }
     if (!window.confirm(`Confirm ${order.id}? CRM will reserve Sheet stock now and shortages will be made into backorders.`)) return;
-    const shortages: ProductLine[] = [];
-    const dispatchLines: ProductLine[] = [];
-    // The current Confirmed Orders are the reservation source of truth. Do
-    // not let a stale stored reservedStock turn available stock into a false
-    // backorder (for example, BA 301 showing 744 free but being treated as 0).
-    const remainingStock = new Map(catalogue.map((product) => {
-      const liveReserved = confirmedReservationsForSku(orders, product.sku).reduce((total, entry) => total + entry.quantity, 0);
-      return [skuKey(product.sku), Math.max(0, availableStock(product) - liveReserved)];
-    }));
-    requestedLines.forEach((line) => {
-      const key = skuKey(line.sku); const available = remainingStock.get(key) || 0;
-      const dispatchNow = Math.max(0, Math.min(line.quantity, available)); const short = Math.max(0, line.quantity - dispatchNow);
-      remainingStock.set(key, Math.max(0, available - dispatchNow));
-      if (dispatchNow) dispatchLines.push({ ...line, quantity: dispatchNow });
-      if (short) shortages.push({ ...line, quantity: short });
-    });
+    const shortages = backorderLinesFor(requestedLines, order.id, orders, catalogue);
     setCatalogue((current) => current.map((product) => {
       const confirmedQuantity = requestedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       // Keep the customer's full confirmed requirement reserved, including a
@@ -1964,7 +1995,25 @@ export default function Home() {
             // decision. Keep those exact lines as the confirmed reservation,
             // even if the resulting free balance is negative; the shortage's
             // linked backorder remains separately visible and actionable.
-            if (editing?.status === "Confirmed" && !editingBackorder) savedOrder = { ...savedOrder, products: orderedLines, approvedProducts: orderedLines };
+            if (editing?.status === "Confirmed" && !editingBackorder) {
+              const recalculatedBackorders = backorderLinesFor(orderedLines, editing.id, orders, catalogue);
+              savedOrder = { ...savedOrder, products: orderedLines, approvedProducts: orderedLines, backorders: recalculatedBackorders, confirmedIncludesBackorderQuantity: true };
+              const existingAdvance = orders.find((item) => item.id === `ADV-${editing.id}`);
+              syncedBackorder = recalculatedBackorders.length
+                ? {
+                    ...(existingAdvance || savedOrder),
+                    id: `ADV-${requestedId}`,
+                    product: recalculatedBackorders[0].product,
+                    sku: recalculatedBackorders[0].sku,
+                    quantity: recalculatedBackorders[0].quantity,
+                    unitPrice: recalculatedBackorders[0].unitPrice,
+                    products: recalculatedBackorders,
+                    status: "Advance order",
+                    payment: "Partial",
+                    inventoryCommitted: false,
+                  }
+                : null;
+            }
             const confirmedChangeSummary = editing?.status === "Confirmed" ? describeConfirmedOrderChanges(editing, savedOrder) : [];
             const draftChangeSummary = editing?.status === "Draft" ? describeConfirmedOrderChanges(editing, savedOrder) : [];
             const confirmedProductChanges = editing?.status === "Confirmed" && !editingBackorder
@@ -1986,18 +2035,31 @@ export default function Home() {
               let next = current.map((item) => item.id === editing.id ? savedOrder : item.id === previousAdvanceId && requestedId !== editing.id ? { ...item, id: nextAdvanceId } : item);
               if (linkedBackorderIsLive && editingBackorder) next = next.map((item) => item.id === primaryId ? { ...item, backorders: orderedLines } : item);
               if (syncedBackorder !== undefined) {
-                next = syncedBackorder ? next.map((item) => item.id === linkedBackorder!.id ? syncedBackorder! : item) : next.filter((item) => item.id !== linkedBackorder!.id);
+                const priorAdvanceId = linkedBackorder?.id || `ADV-${editing.id}`;
+                if (syncedBackorder) {
+                  const hasAdvance = next.some((item) => item.id === priorAdvanceId || item.id === syncedBackorder!.id);
+                  next = hasAdvance
+                    ? next.map((item) => item.id === priorAdvanceId || item.id === syncedBackorder!.id ? syncedBackorder! : item)
+                    : [...next, syncedBackorder];
+                } else next = next.filter((item) => item.id !== priorAdvanceId);
               }
               return next;
             });
             if (editing) setInvoices((current) => {
               let next = current.map((invoice) => requestedId !== editing.id && (invoice.order === editing.id || invoice.order === `ADV-${editing.id}`) ? { ...invoice, order: invoice.order === editing.id ? requestedId : `ADV-${requestedId}` } : invoice);
               if (linkedBackorderIsLive && editingBackorder) next = next.map((invoice) => invoice.order === editing.id ? { ...invoice, amount: money(orderTotal(savedOrder)) } : invoice);
-              if (syncedBackorder === null) next = next.filter((invoice) => invoice.order !== linkedBackorder!.id);
-              if (syncedBackorder) next = next.map((invoice) => invoice.order === linkedBackorder!.id ? { ...invoice, amount: money(orderTotal(syncedBackorder)) } : invoice);
+              if (syncedBackorder !== undefined) {
+                const priorAdvanceId = linkedBackorder?.id || `ADV-${editing.id}`;
+                next = next.filter((invoice) => invoice.order !== priorAdvanceId);
+                if (syncedBackorder) next.push({ id: syncedBackorder.id, client: savedOrder.client, order: syncedBackorder.id, amount: money(orderTotal(syncedBackorder)), due: "Advance payment", status: "Partial" });
+              }
               return next;
             });
-            if (syncedBackorder === null) setTasks((current) => current.filter((task) => task.relatedTo !== linkedBackorder!.id));
+            if (syncedBackorder !== undefined) setTasks((current) => {
+              const priorAdvanceId = linkedBackorder?.id || `ADV-${editing!.id}`;
+              const next = current.filter((task) => task.relatedTo !== priorAdvanceId);
+              return syncedBackorder ? [...next, { id: `TASK-${Date.now()}`, title: `Arrange future dispatch for advance order ${syncedBackorder.id}`, time: "10:00", dueDate: new Date().toISOString().slice(0, 10), assignee: "Rahul", type: "Follow-up", status: "Open", relatedTo: syncedBackorder.id }] : next;
+            });
             setModal(null);
             logActivity(editing ? (editing.status === "Confirmed" ? "Updated confirmed order" : "Updated order") : "Created order", editing?.status === "Confirmed" ? "Confirmed Orders" : "Orders", editing?.status === "Confirmed" ? `${requestedId} · ${confirmedChangeSummary.join(" | ") || "Order details saved"}` : editing?.status === "Draft" ? `${requestedId} · ${draftChangeSummary.join(" | ") || "Order details saved"}` : requestedId);
             if (confirmedProductChanges.length) {

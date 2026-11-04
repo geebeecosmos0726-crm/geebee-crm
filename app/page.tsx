@@ -119,6 +119,9 @@ type Order = {
   products?: ProductLine[];
   approvedProducts?: ProductLine[];
   backorders?: ProductLine[];
+  // New confirmations retain the customer's complete requested quantity even
+  // when a linked backorder also records the shortage.
+  confirmedIncludesBackorderQuantity?: boolean;
 };
 type Client = {
   id: number;
@@ -1478,7 +1481,10 @@ export default function Home() {
     const advanceId = `ADV-${order.id}`;
     const shortageLines = order.backorders?.length ? order.backorders : (orders.find((item) => item.id === advanceId)?.products || []);
     const confirmedLines = linesFor(order);
-    const restoredLines = [...confirmedLines, ...shortageLines];
+    // New confirmations already retain the whole customer requirement in the
+    // main order. Older confirmations kept only available lines, so preserve
+    // their historical behaviour while avoiding duplicate quantities now.
+    const restoredLines = order.confirmedIncludesBackorderQuantity ? confirmedLines : [...confirmedLines, ...shortageLines];
     const advanceInvoiceIds = invoices.filter((invoice) => invoice.order === advanceId).map((invoice) => invoice.id);
     const advanceTaskIds = tasks.filter((task) => task.relatedTo === advanceId).map((task) => task.id);
     // Returning the main order to Draft absorbs its shortage lines back into
@@ -1492,7 +1498,7 @@ export default function Home() {
       return !released ? product : { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - released) };
     }));
     const first = restoredLines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
-    setOrders((current) => current.filter((item) => item.id !== advanceId).map((item) => item.id === order.id ? { ...item, ...first, products: restoredLines, approvedProducts: undefined, backorders: undefined, clientApproval: undefined, status: "Draft", inventoryCommitted: false } : item));
+    setOrders((current) => current.filter((item) => item.id !== advanceId).map((item) => item.id === order.id ? { ...item, ...first, products: restoredLines, approvedProducts: undefined, backorders: undefined, confirmedIncludesBackorderQuantity: undefined, clientApproval: undefined, status: "Draft", inventoryCommitted: false } : item));
     setInvoices((current) => current.filter((invoice) => invoice.order !== advanceId));
     setTasks((current) => current.filter((task) => task.relatedTo !== advanceId));
     const confirmationReference = order.confirmationSequence ? `Confirmation #${order.confirmationSequence}` : "No confirmation number";
@@ -1575,18 +1581,19 @@ export default function Home() {
       if (short) shortages.push({ ...line, quantity: short });
     });
     setCatalogue((current) => current.map((product) => {
-      const dispatched = dispatchLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      // Only quantities that physically exist are reserved. A shortage lives
-      // only in Backorders and must never consume stock from another order.
-      if (!dispatched) return product;
+      const confirmedQuantity = requestedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      // Keep the customer's full confirmed requirement reserved, including a
+      // shortage. This makes the negative balance visible in CRM while the
+      // linked Backorder continues to show what needs replenishment.
+      if (!confirmedQuantity) return product;
       const liveReserved = confirmedReservationsForSku(orders, product.sku).reduce((total, entry) => total + entry.quantity, 0);
-      return { ...product, reservedStock: liveReserved + dispatched };
+      return { ...product, reservedStock: liveReserved + confirmedQuantity };
     }));
-    const firstDispatch = dispatchLines[0] || requestedLines[0];
+    const firstDispatch = requestedLines[0] || { product: order.product, sku: order.sku, quantity: order.quantity, unitPrice: order.unitPrice };
     // Allocate a confirmation number once. If the order was returned to Draft,
     // reuse its earlier number instead of creating a second reference.
     const nextConfirmationSequence = order.confirmationSequence || (Math.max(0, ...orders.map((item) => item.confirmationSequence || 0)) + 1);
-    const confirmedOrder: Order = { ...order, confirmationSequence: nextConfirmationSequence, product: firstDispatch.product, sku: firstDispatch.sku, quantity: firstDispatch.quantity, unitPrice: firstDispatch.unitPrice, products: dispatchLines, approvedProducts: dispatchLines, status: "Confirmed", backorders: shortages };
+    const confirmedOrder: Order = { ...order, confirmationSequence: nextConfirmationSequence, product: firstDispatch.product, sku: firstDispatch.sku, quantity: firstDispatch.quantity, unitPrice: firstDispatch.unitPrice, products: requestedLines, approvedProducts: requestedLines, status: "Confirmed", backorders: shortages, confirmedIncludesBackorderQuantity: true };
     const advanceOrder = shortages.length ? { ...order, id: `ADV-${order.id}`, product: shortages[0].product, sku: shortages[0].sku, quantity: shortages[0].quantity, unitPrice: shortages[0].unitPrice, products: shortages, status: "Advance order", payment: "Partial" } : null;
     setOrders((current) => [...current.filter((item) => item.id !== order.id && item.id !== `ADV-${order.id}`), confirmedOrder, ...(advanceOrder ? [advanceOrder] : [])]);
     if (advanceOrder) {
@@ -1600,7 +1607,7 @@ export default function Home() {
     logActivity("Recorded confirmed order product change", "Products", JSON.stringify({
       orderId: order.id,
       client: order.client,
-      changes: dispatchLines.map((line) => ({ sku: line.sku, product: line.product, change: "Confirmed", before: 0, after: line.quantity })),
+      changes: requestedLines.map((line) => ({ sku: line.sku, product: line.product, change: "Confirmed", before: 0, after: line.quantity })),
     }));
     logActivity("Confirmed order and reserved inventory", "Orders", shortages.length ? `${order.id} · Confirmation #${nextConfirmationSequence} · ${shortages.length} shortage line(s) moved to backorder` : `${order.id} · Confirmation #${nextConfirmationSequence}`);
     const fullyShortLines = shortages.filter((shortage) => shortage.quantity === (requestedLines.find((line) => skuKey(line.sku) === skuKey(shortage.sku))?.quantity || 0));

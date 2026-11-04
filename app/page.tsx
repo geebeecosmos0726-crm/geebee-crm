@@ -1631,7 +1631,18 @@ export default function Home() {
   };
   const pushToDispatchPlan = (order: Order) => {
     if (order.status !== "Confirmed") return;
-    const approvedLines = order.approvedProducts || linesFor(order);
+    // Current confirmations already store MIX orders as their component SKUs.
+    // Re-expand here as well so an older confirmed order that still contains
+    // AB-204 MIX / AB-205 MIX can never be sent to Dispatch as one virtual
+    // SKU. Dispatch must always deduct AB-204-0…9 or AB-205-0…9 directly.
+    const requestedExpansion = expandNumberCandleMixLines(linesFor(order), catalogue);
+    const approvedExpansion = expandNumberCandleMixLines(order.approvedProducts || linesFor(order), catalogue);
+    if (requestedExpansion.error || approvedExpansion.error) {
+      flash(requestedExpansion.error || approvedExpansion.error || "The MIX order could not be expanded into numbered candle SKUs.");
+      return;
+    }
+    const requestedLines = requestedExpansion.lines;
+    const approvedLines = approvedExpansion.lines;
     // A sheet may contain the same SKU on more than one row. Do not use a
     // one-value-per-SKU map here: it silently replaces earlier quantities
     // with the final row and can therefore send the wrong quantity to Dispatch.
@@ -1640,7 +1651,7 @@ export default function Home() {
       lines.forEach((line) => { const key = skuKey(line.sku); const existing = summary.get(key); summary.set(key, existing ? { ...existing, quantity: existing.quantity + line.quantity } : { ...line }); });
       return summary;
     };
-    const requestedBySku = summariseBySku(linesFor(order));
+    const requestedBySku = summariseBySku(requestedLines);
     const approvedBySku = summariseBySku(approvedLines);
     const dispatchLines: ProductLine[] = []; const releasedLines: ProductLine[] = [];
     approvedBySku.forEach((approved, key) => {

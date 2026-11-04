@@ -207,7 +207,10 @@ export async function PATCH(request: Request) {
       const now = new Date().toISOString();
       const records = (existing || []).map((row: any) => {
         const update = updateById.get(String(row.record_id));
-        const data = { ...(row.data as ProductData), availableQuantity: Math.max(0, number(update.availableQuantity)), reservedStock: Math.max(0, number(update.reservedStock)) };
+        // A negative available quantity is intentional when Operations has
+        // dispatched more than the Stock Master contained. Preserve and write
+        // it so the shortfall stays visible instead of being silently hidden.
+        const data = { ...(row.data as ProductData), availableQuantity: number(update.availableQuantity), reservedStock: Math.max(0, number(update.reservedStock)) };
         return { workspace_owner_id: ownerId, record_id: row.record_id, search_key: `${data.sku || ""} ${data.name || ""} ${data.category || ""}`.toLowerCase(), data, updated_at: now };
       });
       // The Google Stock Master is the source of truth. Write the Sheet first;

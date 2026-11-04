@@ -550,6 +550,21 @@ const catalogueMatchForOrderLine = (line: ProductLine, catalogue: CatalogueItem[
   });
   return labelMatches.length === 1 ? labelMatches[0] : undefined;
 };
+// Verified opening balances supplied for the AB-204 numbered-candle series.
+// These are used only by the per-product history ledger: they do not modify
+// live Product/SKU availability or write anything to Google Stock Master.
+const productHistoryOpeningBalances: Record<string, number> = {
+  ab2040: 18820,
+  ab2041: 106608,
+  ab2042: 1764,
+  ab2043: 756,
+  ab2044: 13080,
+  ab2045: 4824,
+  ab2046: 3080,
+  ab2047: 3864,
+  ab2048: 3516,
+  ab2049: 18248,
+};
 const productCategories = ["Candles", "Paper Banner", "Ribbon", "Metal & Paper stands", "Cake crown", "Crown & Tiaras", "Led candles", "Balloon pump", "Goggles /LED Goggles", "Caps", "Paper Sets /Props", "Cake topper", "Party popper", "Party items"] as const;
 const categoryImages: Record<(typeof productCategories)[number], string> = {
   "Party popper": "https://gbcosmos.com/wp-content/uploads/2026/09/Party_Poppers.png",
@@ -2819,8 +2834,20 @@ function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }:
     grouped.set(key, current);
   });
   const rows = [...grouped.values()].sort((a, b) => a.first.localeCompare(b.first));
-  const startingBalance = rows[0]?.dispatch?.before ?? rows[0]?.returned?.before;
-  return <section className="product-stock-history"><div><span className="overline">THIS SKU · ORDER HISTORY</span><h3>Order and stock history</h3><p>{startingBalance === undefined ? "No dispatch or return has been recorded for this SKU yet." : <>Tracked balance began at <b>{startingBalance.toLocaleString("en-IN")}</b>; current available balance is <b>{currentAvailable.toLocaleString("en-IN")}</b>.</>}</p></div>{orderChanges.length > 0 && <><h4>Confirmed-order changes</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>CHANGE</th><th>QTY</th><th>BY</th></tr></thead><tbody>{orderChanges.map((change, index) => <tr key={`${change.orderId}-${change.createdAt}-${index}`}><td><b>{change.orderId}</b><small className="table-subtext">{new Date(change.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></td><td>{change.client}</td><td><span className={changeClass(change.change)}>{change.change}</span></td><td className={changeClass(change.change)}><b>{change.change === "Confirmed" ? change.after.toLocaleString("en-IN") : `${change.before.toLocaleString("en-IN")} → ${change.after.toLocaleString("en-IN")}`}</b></td><td>{change.actor}</td></tr>)}</tbody></table></div></>}{rows.length > 0 && <><h4>Actual stock movement</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>SUBTRACTED</th><th>REMAINING</th><th>REVERSED</th><th>REMAINING</th></tr></thead><tbody>{rows.map((row) => <tr key={row.orderId}><td><b>{row.orderId}</b></td><td>{row.client}</td><td>{row.dispatch ? <b>−{row.dispatch.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.dispatch ? <><b>{row.dispatch.after.toLocaleString("en-IN")}</b><small className="table-subtext">{new Date(row.dispatch.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td><td>{row.returned ? <b>+{row.returned.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.returned ? <><b>{row.returned.after.toLocaleString("en-IN")}</b><small className="table-subtext">{new Date(row.returned.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td></tr>)}</tbody></table></div></>}</section>;
+  const suppliedOpeningBalance = productHistoryOpeningBalances[skuKey(sku)];
+  const startingBalance = suppliedOpeningBalance ?? rows[0]?.dispatch?.before ?? rows[0]?.returned?.before;
+  // The ledger is calculated from the verified opening balance rather than
+  // trusting a historical before/after value that may have been recorded
+  // before the stock-master write safeguards existed.
+  let runningBalance = startingBalance;
+  const calculatedRows = rows.map((row) => {
+    const afterDispatch = row.dispatch ? (runningBalance ?? 0) - row.dispatch.quantity : undefined;
+    if (afterDispatch !== undefined) runningBalance = afterDispatch;
+    const afterReturn = row.returned ? (runningBalance ?? 0) + row.returned.quantity : undefined;
+    if (afterReturn !== undefined) runningBalance = afterReturn;
+    return { ...row, afterDispatch, afterReturn };
+  });
+  return <section className="product-stock-history"><div><span className="overline">THIS SKU · ORDER HISTORY</span><h3>Order and stock history</h3><p>{startingBalance === undefined ? "No dispatch or return has been recorded for this SKU yet." : <>Tracked balance began at <b>{startingBalance.toLocaleString("en-IN")}</b>; order-history balance is <b>{(runningBalance ?? startingBalance).toLocaleString("en-IN")}</b>{suppliedOpeningBalance !== undefined ? ". Based on the verified opening balance." : `; current CRM available balance is ${currentAvailable.toLocaleString("en-IN")}.`}</>}</p></div>{orderChanges.length > 0 && <><h4>Confirmed-order changes</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>CHANGE</th><th>QTY</th><th>BY</th></tr></thead><tbody>{orderChanges.map((change, index) => <tr key={`${change.orderId}-${change.createdAt}-${index}`}><td><b>{change.orderId}</b><small className="table-subtext">{new Date(change.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></td><td>{change.client}</td><td><span className={changeClass(change.change)}>{change.change}</span></td><td className={changeClass(change.change)}><b>{change.change === "Confirmed" ? change.after.toLocaleString("en-IN") : `${change.before.toLocaleString("en-IN")} → ${change.after.toLocaleString("en-IN")}`}</b></td><td>{change.actor}</td></tr>)}</tbody></table></div></>}{calculatedRows.length > 0 && <><h4>Actual stock movement</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>SUBTRACTED</th><th>REMAINING</th><th>REVERSED</th><th>REMAINING</th></tr></thead><tbody>{calculatedRows.map((row) => <tr key={row.orderId}><td><b>{row.orderId}</b></td><td>{row.client}</td><td>{row.dispatch ? <b>−{row.dispatch.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.dispatch ? <><b>{row.afterDispatch?.toLocaleString("en-IN")}</b><small className="table-subtext">{new Date(row.dispatch.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td><td>{row.returned ? <b>+{row.returned.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.returned ? <><b>{row.afterReturn?.toLocaleString("en-IN")}</b><small className="table-subtext">{new Date(row.returned.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td></tr>)}</tbody></table></div></>}</section>;
 }
 
 function ProductStockInventoryPanel({ session, canApply, auditEvents, orders, releaseAllReservations, onAudit, query, onProductsSynced, onLiveBackup }: { session: Session; canApply: boolean; auditEvents: AuditEvent[]; orders: Order[]; releaseAllReservations: () => void; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>>; onLiveBackup: () => void }) {

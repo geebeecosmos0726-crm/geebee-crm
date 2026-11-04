@@ -1134,6 +1134,10 @@ export default function Home() {
     flash(status === "Order Created" ? `${lead.company} added to Customers and a draft order was created.` : status === "Lost" ? `Enquiry moved to Lost Leads: ${lostReason}.` : `Enquiry moved to ${status}; follow-up created where required.`);
   };
   const logActivity = (action: string, module: string, details: string) => {
+    // A hard-deleted order must leave no ID-bearing audit record behind. The
+    // deletion action is deliberately not logged; a newly fetched order with
+    // the same ID therefore begins with a completely fresh history.
+    if (action === "Hard deleted orders from sheet") return;
     const cloud = supabase;
     if (!cloud || !workspaceOwnerId || !session?.user.email) return;
     const event = { id: Date.now(), workspace_owner_id: workspaceOwnerId, actor_email: session.user.email, action, module, details, created_at: new Date().toISOString() };

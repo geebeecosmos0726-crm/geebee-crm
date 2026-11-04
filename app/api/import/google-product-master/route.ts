@@ -28,6 +28,12 @@ const number = (value: unknown) => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 const quoteRange = (title: string) => `'${title.replace(/'/g, "''")}'!A:Z`;
+const columnLetter = (index: number) => { let value = index + 1; let letters = ""; while (value) { const remainder = (value - 1) % 26; letters = String.fromCharCode(65 + remainder) + letters; value = Math.floor((value - 1) / 26); } return letters; };
+const productNameOnly = (value: unknown) => {
+  const text = display(value);
+  const separator = text.indexOf("·");
+  return separator >= 0 ? text.slice(separator + 1).trim() : text;
+};
 
 async function administrator(request: Request, url: string, serviceKey: string, allowMember = false) {
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
@@ -80,8 +86,8 @@ function readProducts(values: unknown[][]) {
     }
     products.push({ sku, name, category: get(row, columns.category), unit: get(row, columns.unit), innerQty: get(row, columns.innerQty), outerQty: get(row, columns.outerQty), sellingPrice: number(get(row, columns.sellingPrice)), availableStock: number(get(row, columns.availableStock)), lowStockAlert: number(get(row, columns.lowStockAlert)), imageUrl: get(row, columns.imageUrl), row: sourceRow });
   }
-  if (!products.length) return { error: "No complete product rows were found. Each imported row needs SKU ID and Product Name.", products: [] as SheetProduct[], skippedRows };
-  return { error: "", products, skippedRows };
+  if (!products.length) return { error: "No complete product rows were found. Each imported row needs SKU ID and Product Name.", products: [] as SheetProduct[], skippedRows, stockColumn: columns.availableStock };
+  return { error: "", products, skippedRows, stockColumn: columns.availableStock };
 }
 
 export async function POST(request: Request) {
@@ -122,6 +128,7 @@ export async function POST(request: Request) {
     const result = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range });
     const parsed = readProducts((result.data.values || []) as unknown[][]);
     if (parsed.error) return Response.json({ error: parsed.error, needsSetup: !(result.data.values || []).length, sheetTitle: title }, { status: 400 });
+    if (typeof parsed.stockColumn !== "number") throw new Error("Google Stock Master needs an Available Stock column before it can be synced safely.");
     // This is deliberately separate from crm_products. It is a safe testing
     // inventory master and never alters the live Product / SKU catalogue.
     const { data: existingRows, error: existingError } = await db.from("crm_stock_inventory").select("record_id, data").eq("workspace_owner_id", ownerId).limit(100000);
@@ -135,6 +142,49 @@ export async function POST(request: Request) {
       if (cleanupError) throw cleanupError;
     }
     const existing = allExisting.filter((record) => !placeholderIds.includes(record.recordId));
+    // When a Sheet is updated while orders are already in Dispatch, the user
+    // explicitly tells us whether the Sheet balance includes those dispatches.
+    // If it does not, subtract each active dispatch exactly once and write the
+    // corrected balance back to the Sheet. Cancelling happens in the UI before
+    // this endpoint is called, so this route never changes data on cancel.
+    const sheetIncludesActiveDispatch = body?.sheetIncludesActiveDispatch !== false;
+    const rawActiveDispatchLines: unknown[] = Array.isArray(body?.activeDispatchLines) ? body.activeDispatchLines : [];
+    const activeDispatchLines = rawActiveDispatchLines.map((line) => ({
+      sku: display((line as Record<string, unknown>)?.sku),
+      product: productNameOnly((line as Record<string, unknown>)?.product),
+      quantity: Math.max(0, number((line as Record<string, unknown>)?.quantity)),
+    })).filter((line) => line.sku && line.quantity > 0);
+    const sourceCountBySku = new Map<string, number>();
+    const sourceCountByIdentity = new Map<string, number>();
+    parsed.products.forEach((source) => {
+      const sku = compact(source.sku); const identity = inventoryKey(source);
+      sourceCountBySku.set(sku, (sourceCountBySku.get(sku) || 0) + 1);
+      sourceCountByIdentity.set(identity, (sourceCountByIdentity.get(identity) || 0) + 1);
+    });
+    const activeBySku = new Map<string, number>();
+    const activeByIdentity = new Map<string, number>();
+    activeDispatchLines.forEach((line) => {
+      const sku = compact(line.sku); const identity = inventoryKey({ sku: line.sku, name: line.product });
+      activeBySku.set(sku, (activeBySku.get(sku) || 0) + line.quantity);
+      activeByIdentity.set(identity, (activeByIdentity.get(identity) || 0) + line.quantity);
+    });
+    const dispatchForSource = (source: SheetProduct) => {
+      if (sheetIncludesActiveDispatch) return 0;
+      const identity = inventoryKey(source);
+      if ((sourceCountByIdentity.get(identity) || 0) === 1 && activeByIdentity.has(identity)) return activeByIdentity.get(identity) || 0;
+      const sku = compact(source.sku);
+      return (sourceCountBySku.get(sku) || 0) === 1 ? activeBySku.get(sku) || 0 : 0;
+    };
+    if (!sheetIncludesActiveDispatch) {
+      const unresolvedDispatchLines = activeDispatchLines.filter((line) => {
+        const identity = inventoryKey({ sku: line.sku, name: line.product });
+        if ((sourceCountByIdentity.get(identity) || 0) === 1) return false;
+        return (sourceCountBySku.get(compact(line.sku)) || 0) !== 1;
+      });
+      if (unresolvedDispatchLines.length) {
+        throw new Error(`Sync stopped safely: ${unresolvedDispatchLines.map((line) => line.sku).filter((sku, index, list) => list.indexOf(sku) === index).join(", ")} cannot be matched uniquely in Stock Master. Choose YES if the Sheet already includes Dispatch, or make those SKU rows unique before choosing NO.`);
+      }
+    }
     const existingByRow = new Map<string, { recordId: string; product: ProductData }>();
     existing.forEach((record) => { const key = rowKey(record.product); if (key) existingByRow.set(key, record); });
     const existingByIdentity = new Map<string, Array<{ recordId: string; product: ProductData }>>();
@@ -151,9 +201,10 @@ export async function POST(request: Request) {
       const current = currentRecord?.product || {};
       if (currentRecord) updated += 1; else added += 1;
       const id = typeof current.id === "number" ? current.id : Date.now() + index;
+      const activeDispatchQuantity = dispatchForSource(source);
       const data: ProductData = {
         ...current, id, sourceRow: source.row, sku: source.sku.trim().toUpperCase(), name: source.name.trim(), category: source.category || String(current.category || "Uncategorised"), unit: source.unit || String(current.unit || "Piece"),
-        innerQty: source.innerQty, outerQty: source.outerQty, cartonQty: source.outerQty, unitPrice: source.sellingPrice, availableQuantity: source.availableStock,
+        innerQty: source.innerQty, outerQty: source.outerQty, cartonQty: source.outerQty, unitPrice: source.sellingPrice, availableQuantity: source.availableStock - activeDispatchQuantity,
         // An empty Image URL in the Sheet is intentional: it clears any
         // previously saved image instead of silently retaining it.
         reorderThreshold: source.lowStockAlert, image: source.imageUrl,
@@ -164,9 +215,19 @@ export async function POST(request: Request) {
       const { error: upsertError } = await db.from("crm_stock_inventory").upsert(records, { onConflict: "workspace_owner_id,record_id" });
       if (upsertError) throw upsertError;
     }
+    const correctedSheetRows = !sheetIncludesActiveDispatch ? parsed.products.map((source) => ({ source, quantity: dispatchForSource(source) })).filter((entry) => entry.quantity > 0) : [];
+    if (correctedSheetRows.length) {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+          valueInputOption: "USER_ENTERED",
+          data: correctedSheetRows.map(({ source, quantity }) => ({ range: `'${title.replace(/'/g, "''")}'!${columnLetter(parsed.stockColumn)}${source.row}`, values: [[source.availableStock - quantity]] })),
+        },
+      });
+    }
     const crmOnly = existing.map((record) => record.product).filter((product) => product.sku && (!rowKey(product) || !sheetKeys.has(rowKey(product)))).map((product) => ({ sku: product.sku || "", name: product.name || "" }));
-    await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Synced Product Stock Inventory", module: "Products", details: `${updated} updated · ${added} added · ${placeholderIds.length} incomplete placeholder(s) removed · ${crmOnly.length} CRM-only SKU(s)` });
-    return Response.json({ sheetTitle: title, products: records.map((record) => record.data), updated, added, cleanedPlaceholders: placeholderIds.length, crmOnly, skippedRows: parsed.skippedRows || [], scanned: parsed.products.length });
+    await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Synced Product Stock Inventory", module: "Products", details: `${updated} updated · ${added} added · ${placeholderIds.length} incomplete placeholder(s) removed · ${crmOnly.length} CRM-only SKU(s)${correctedSheetRows.length ? ` · ${correctedSheetRows.length} active Dispatch balance(s) applied` : ""}` });
+    return Response.json({ sheetTitle: title, products: records.map((record) => record.data), updated, added, cleanedPlaceholders: placeholderIds.length, crmOnly, skippedRows: parsed.skippedRows || [], scanned: parsed.products.length, activeDispatchBalancesApplied: correctedSheetRows.length });
   } catch (error) {
     console.error("Google product master sync failed:", error instanceof Error ? error.message : error);
     return Response.json({ error: error instanceof Error ? error.message : "Could not sync the Product Stock Inventory sheet." }, { status: 400 });

@@ -2946,7 +2946,25 @@ function ProductStockInventoryPanel({ session, canApply, auditEvents, orders, re
     try {
       const passcode = mode === "sync" && !background ? window.prompt("Stock Master sync passcode: GeeBee2026\n\nEnter it to update CRM data from the Google Sheet.") : "";
       if (mode === "sync" && !background && passcode === null) { setLoading(false); return; }
-      const response = await fetch("/api/import/google-product-master", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ mode, passcode }) });
+      const activeDispatchOrders = orders.filter((order) => order.inventoryCommitted && ["Dispatch plan", "Sent to customer", "Received by customer"].includes(order.status));
+      const activeDispatchLines = activeDispatchOrders.flatMap((order) => (order.dispatchStockLines?.length ? order.dispatchStockLines : linesFor(order)).map((line) => ({ sku: line.sku, product: line.product, quantity: line.quantity })));
+      let sheetIncludesActiveDispatch = true;
+      if (mode === "sync" && !background) {
+        if (activeDispatchLines.length) {
+          const answer = window.prompt(
+            `There ${activeDispatchOrders.length === 1 ? "is" : "are"} ${activeDispatchOrders.length} active Dispatch order${activeDispatchOrders.length === 1 ? "" : "s"}.\n\nDoes the Sheet Available Stock already include the dispatched quantities?\n\nType YES = Sheet already includes Dispatch (normal).\nType NO = Sheet does NOT include Dispatch; CRM will subtract those quantities once and correct the Sheet.\nPress Cancel = do not sync anything.`,
+            "YES",
+          );
+          if (answer === null) { setMessage("Sync cancelled. CRM and Google Sheet were not changed."); return; }
+          const choice = answer.trim().toUpperCase();
+          if (choice !== "YES" && choice !== "NO") { setMessage("Sync cancelled. Type YES or NO when you are ready; no data was changed."); return; }
+          sheetIncludesActiveDispatch = choice === "YES";
+        } else if (!window.confirm("Sync Product / SKUs from the Google Sheet now? This updates CRM inventory from the current Sheet values. Click Cancel to make no changes.")) {
+          setMessage("Sync cancelled. CRM and Google Sheet were not changed.");
+          return;
+        }
+      }
+      const response = await fetch("/api/import/google-product-master", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ mode, passcode, sheetIncludesActiveDispatch, activeDispatchLines }) });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Product Stock Inventory could not be updated.");
       if (mode === "setup") { setMessage(result.message || "Blank Sheet headers and test rows are ready."); await load(); return; }
@@ -2954,7 +2972,7 @@ function ProductStockInventoryPanel({ session, canApply, auditEvents, orders, re
       onLiveBackup();
       const skipped = Array.isArray(result.skippedRows) ? result.skippedRows.length : 0;
       if (!background) {
-        setMessage(`${result.scanned || 0} Sheet SKU(s) processed: ${result.updated || 0} updated, ${result.added || 0} added to the separate test inventory.${result.cleanedPlaceholders ? ` ${result.cleanedPlaceholders} old incomplete product card${result.cleanedPlaceholders === 1 ? " was" : "s were"} removed.` : ""}${skipped ? ` ${skipped} incomplete Sheet row${skipped === 1 ? " needs" : "s need"} a Product Name or SKU ID.` : ""}`);
+        setMessage(`${result.scanned || 0} Sheet SKU(s) processed: ${result.updated || 0} updated, ${result.added || 0} added to the separate test inventory.${result.activeDispatchBalancesApplied ? ` ${result.activeDispatchBalancesApplied} active Dispatch balance${result.activeDispatchBalancesApplied === 1 ? " was" : "s were"} subtracted and written safely to the Sheet.` : ""}${result.cleanedPlaceholders ? ` ${result.cleanedPlaceholders} old incomplete product card${result.cleanedPlaceholders === 1 ? " was" : "s were"} removed.` : ""}${skipped ? ` ${skipped} incomplete Sheet row${skipped === 1 ? " needs" : "s need"} a Product Name or SKU ID.` : ""}`);
         onAudit("Synced test Product Stock Inventory", "Products", `${result.updated || 0} updated · ${result.added || 0} added`);
       }
     } catch (error) { setMessage(error instanceof Error ? error.message : "Product Stock Inventory could not be updated."); }

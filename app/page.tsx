@@ -1032,6 +1032,17 @@ export default function Home() {
   const sheetBackupPending = useRef(false);
   const workspaceDataSnapshot = useRef<string | null>(null);
   const pendingStockMovementAudits = useRef<Array<{ orderId: string; direction: ProductStockMovement["direction"]; lines: ProductStockMovement[] }>>([]);
+  // Browser state updates are asynchronous. Keep a short-lived lock for a
+  // stage action so a second click cannot apply the same reservation or stock
+  // deduction while the first click is still being rendered and persisted.
+  const orderTransitionLocks = useRef<Set<string>>(new Set());
+  const beginOrderTransition = (stage: "confirm" | "dispatch", orderId: string) => {
+    const key = `${stage}:${orderId}`;
+    if (orderTransitionLocks.current.has(key)) return false;
+    orderTransitionLocks.current.add(key);
+    window.setTimeout(() => orderTransitionLocks.current.delete(key), 2200);
+    return true;
+  };
   const flash = (m: string) => {
       setToast(m);
       setTimeout(() => setToast(""), 2600);
@@ -1636,6 +1647,7 @@ export default function Home() {
     const missingSkus = [...new Set(requestedLines.filter((line) => !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku))).map((line) => line.sku || line.product))];
     if (missingSkus.length) { flash(`Cannot confirm ${order.id}: ${missingSkus.join(", ")} is not in Product / SKUs. Add it to the Stock Master first.`); return; }
     if (!window.confirm(`Confirm ${order.id}? CRM will reserve Sheet stock now and shortages will be made into backorders.`)) return;
+    if (!beginOrderTransition("confirm", order.id)) { flash(`${order.id} is already being confirmed. Please wait.`); return; }
     const shortages = backorderLinesFor(requestedLines, order.id, orders, catalogue);
     setCatalogue((current) => current.map((product) => {
       const confirmedQuantity = requestedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
@@ -1699,6 +1711,7 @@ export default function Home() {
       return summary;
     };
     if (!window.confirm(`Send ${order.id} to Dispatch Plan? Any quantity reduced by Operations will be released from CRM reservation.`)) return;
+    if (!beginOrderTransition("dispatch", order.id)) { flash(`${order.id} is already being sent to Dispatch Plan. Please wait.`); return; }
     const dispatchedBySku = summariseBySku(dispatchLines);
     const stockMovements = [...dispatchedBySku.values()].map((line) => {
       const product = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));

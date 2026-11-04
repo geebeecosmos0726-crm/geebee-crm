@@ -1225,7 +1225,16 @@ export default function Home() {
     if (!changed.length) return;
     const timer = window.setTimeout(async () => {
       const movementsForThisSave = [...pendingStockMovementAudits.current];
-      const response = await fetch("/api/import/google-product-master", { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ stockUpdates: changed.map((product) => ({ id: product.id, availableQuantity: availableStock(product), reservedStock: product.reservedStock || 0 })) }) });
+      // A Confirmed order changes only the CRM reservation. It must never
+      // write a cached available balance back to Stock Master, because someone
+      // may have updated that Sheet since the last CRM sync. Only a real stock
+      // movement (Dispatch, reversal, PO receipt/deletion) writes the Sheet.
+      const response = await fetch("/api/import/google-product-master", { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ stockUpdates: changed.map((product) => {
+        const previous = inventorySnapshots.current.get(String(product.id));
+        let previousAvailable: number | undefined;
+        try { previousAvailable = previous ? JSON.parse(previous).availableQuantity : undefined; } catch { previousAvailable = undefined; }
+        return { id: product.id, availableQuantity: availableStock(product), reservedStock: product.reservedStock || 0, writeToSheet: previousAvailable === undefined || previousAvailable !== availableStock(product) };
+      }) }) });
       if (!response.ok) { const result = await response.json().catch(() => ({})); setCloudError(result.error || "Dispatch stock movement could not be saved to Product / SKU inventory."); return; }
       inventorySnapshots.current = next;
       // Only commit the audit after both the Stock Master write and CRM stock

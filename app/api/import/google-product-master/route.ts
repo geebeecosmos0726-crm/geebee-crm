@@ -213,38 +213,41 @@ export async function PATCH(request: Request) {
         const data = { ...(row.data as ProductData), availableQuantity: number(update.availableQuantity), reservedStock: Math.max(0, number(update.reservedStock)) };
         return { workspace_owner_id: ownerId, record_id: row.record_id, search_key: `${data.sku || ""} ${data.name || ""} ${data.category || ""}`.toLowerCase(), data, updated_at: now };
       });
-      // The Google Stock Master is the source of truth. Write the Sheet first;
-      // if this fails, do not let the CRM pretend that stock was moved.
-      const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-      const sheetId = process.env.GOOGLE_PRODUCT_MASTER_SHEET_ID || DEFAULT_PRODUCT_MASTER_SHEET_ID;
-      if (!keyJson) throw new Error("Google Stock Master is not configured, so dispatch stock cannot be moved safely.");
-      const credentials = JSON.parse(keyJson);
-      if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
-      const auth = new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
-      const sheets = google.sheets({ version: "v4", auth });
-      const metadata = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties" });
-      const selected = (metadata.data.sheets || []).find((sheet) => /^(product stock inventory|product master)$/i.test(sheet.properties?.title || "")) || metadata.data.sheets?.[0];
-      const title = selected?.properties?.title;
-      if (!title) throw new Error("The Google Stock Master has no worksheet.");
-      const values = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
-      const sheetRows = (values.data.values || []).map((row) => Array.isArray(row) ? row.map(display) : []);
-      const headerRowIndex = sheetRows.findIndex((row) => headerIndex(row, ["skuid", "sku"]) >= 0 && headerIndex(row, ["availablestock", "availablequantity", "stock"]) >= 0);
-      const headerRow = headerRowIndex >= 0 ? sheetRows[headerRowIndex] : undefined;
-      const skuColumn = headerRow ? headerIndex(headerRow, ["skuid", "sku"]) : -1;
-      const nameColumn = headerRow ? headerIndex(headerRow, ["productname", "product"]) : -1;
-      const stockColumn = headerRow ? headerIndex(headerRow, ["availablestock", "availablequantity", "stock"]) : -1;
-      if (skuColumn < 0 || stockColumn < 0) throw new Error("Google Stock Master needs SKU ID and Available Stock columns before dispatch can update it.");
-      const column = (index: number) => { let value = index + 1; let letters = ""; while (value) { const remainder = (value - 1) % 26; letters = String.fromCharCode(65 + remainder) + letters; value = Math.floor((value - 1) / 26); } return letters; };
+      const recordsForSheet = records.filter((record) => updateById.get(String(record.record_id))?.writeToSheet !== false);
+      // The Google Stock Master is written only for an actual available-stock
+      // movement. Confirming an order updates reserved stock in CRM, but must
+      // not overwrite a newer manual Sheet balance from a stale browser copy.
+      if (recordsForSheet.length) {
+        const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+        const sheetId = process.env.GOOGLE_PRODUCT_MASTER_SHEET_ID || DEFAULT_PRODUCT_MASTER_SHEET_ID;
+        if (!keyJson) throw new Error("Google Stock Master is not configured, so dispatch stock cannot be moved safely.");
+        const credentials = JSON.parse(keyJson);
+        if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
+        const auth = new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
+        const sheets = google.sheets({ version: "v4", auth });
+        const metadata = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties" });
+        const selected = (metadata.data.sheets || []).find((sheet) => /^(product stock inventory|product master)$/i.test(sheet.properties?.title || "")) || metadata.data.sheets?.[0];
+        const title = selected?.properties?.title;
+        if (!title) throw new Error("The Google Stock Master has no worksheet.");
+        const values = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
+        const sheetRows = (values.data.values || []).map((row) => Array.isArray(row) ? row.map(display) : []);
+        const headerRowIndex = sheetRows.findIndex((row) => headerIndex(row, ["skuid", "sku"]) >= 0 && headerIndex(row, ["availablestock", "availablequantity", "stock"]) >= 0);
+        const headerRow = headerRowIndex >= 0 ? sheetRows[headerRowIndex] : undefined;
+        const skuColumn = headerRow ? headerIndex(headerRow, ["skuid", "sku"]) : -1;
+        const nameColumn = headerRow ? headerIndex(headerRow, ["productname", "product"]) : -1;
+        const stockColumn = headerRow ? headerIndex(headerRow, ["availablestock", "availablequantity", "stock"]) : -1;
+        if (skuColumn < 0 || stockColumn < 0) throw new Error("Google Stock Master needs SKU ID and Available Stock columns before dispatch can update it.");
+        const column = (index: number) => { let value = index + 1; let letters = ""; while (value) { const remainder = (value - 1) % 26; letters = String.fromCharCode(65 + remainder) + letters; value = Math.floor((value - 1) / 26); } return letters; };
       // Never use a remembered Sheet row here. Users regularly insert rows in
       // Stock Master, which makes an old sourceRow unsafe. Resolve each stock
       // write against the Sheet's current SKU ID instead. compact() makes
       // AB-204-1, AB 204 1 and ab2041 the same SKU for this lookup.
-      const liveSheetRows = sheetRows.slice(headerRowIndex + 1).map((row, index) => ({
+        const liveSheetRows = sheetRows.slice(headerRowIndex + 1).map((row, index) => ({
         row: headerRowIndex + index + 2,
         sku: display(row[skuColumn]),
         name: nameColumn >= 0 ? display(row[nameColumn]) : "",
       })).filter((row) => row.sku);
-      const sheetUpdates = records.map((record) => {
+        const sheetUpdates = recordsForSheet.map((record) => {
         const product = record.data as ProductData;
         const sku = compact(product.sku);
         const skuMatches = liveSheetRows.filter((row) => compact(row.sku) === sku);
@@ -257,13 +260,14 @@ export async function PATCH(request: Request) {
         if (!skuMatches.length) throw new Error(`${productLabel} was not found in the current Google Stock Master. Sync the Sheet before dispatching this order.`);
         const candidates = skuMatches.map((row) => `row ${row.row}${row.name ? ` (${row.name})` : ""}`).join(", ");
         throw new Error(`${productLabel} cannot be matched safely because this SKU appears on ${candidates}. Give those rows unique SKU IDs or ensure one Product Name matches exactly, then retry.`);
-      });
-      await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: sheetId, requestBody: { valueInputOption: "USER_ENTERED", data: sheetUpdates.map((item) => ({ range: `'${title.replace(/'/g, "''")}'!${column(stockColumn)}${item.row}`, values: [[item.value]] })) } });
+        });
+        await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: sheetId, requestBody: { valueInputOption: "USER_ENTERED", data: sheetUpdates.map((item) => ({ range: `'${title.replace(/'/g, "''")}'!${column(stockColumn)}${item.row}`, values: [[item.value]] })) } });
+      }
       if (records.length) {
         const { error: updateError } = await db.from("crm_stock_inventory").upsert(records, { onConflict: "workspace_owner_id,record_id" });
         if (updateError) throw updateError;
       }
-      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Updated dispatch inventory", module: "Products", details: `${records.length} Product / SKU stock line(s)` });
+      await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Updated dispatch inventory", module: "Products", details: `${records.length} CRM product record(s) updated · ${recordsForSheet.length} Available Stock line(s) written to Stock Master` });
       return Response.json({ ok: true, updated: records.length });
     }
     const { db, ownerId, email } = await administrator(request, url, serviceKey);

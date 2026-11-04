@@ -534,6 +534,22 @@ const orderWithLines = (order: Order, products: ProductLine[]): Order => {
 };
 const catalogueSku = (item: CatalogueItem) => item.sku?.trim() || "SKU pending";
 const catalogueName = (item: CatalogueItem) => item.name?.trim() || item.description?.trim() || (item.sku?.trim() ? `Product ${item.sku.trim()}` : "Product name pending");
+// A product input can retain its human-readable label even when an older
+// import supplied a malformed or blank SKU. Resolve that label only when it
+// identifies exactly one current master product. This repairs harmless UI
+// mismatches without ever guessing between duplicate product names.
+const catalogueMatchForOrderLine = (line: ProductLine, catalogue: CatalogueItem[]) => {
+  const skuMatches = catalogue.filter((item) => skuKey(item.sku) === skuKey(line.sku));
+  if (skuMatches.length === 1) return skuMatches[0];
+  const label = line.product.trim().toLocaleLowerCase();
+  if (!label) return undefined;
+  const labelMatches = catalogue.filter((item) => {
+    const name = catalogueName(item);
+    return [name, `${item.sku} · ${name}`, `${name} · ${item.sku}`]
+      .some((candidate) => candidate.toLocaleLowerCase() === label);
+  });
+  return labelMatches.length === 1 ? labelMatches[0] : undefined;
+};
 const productCategories = ["Candles", "Paper Banner", "Ribbon", "Metal & Paper stands", "Cake crown", "Crown & Tiaras", "Led candles", "Balloon pump", "Goggles /LED Goggles", "Caps", "Paper Sets /Props", "Cake topper", "Party popper", "Party items"] as const;
 const categoryImages: Record<(typeof productCategories)[number], string> = {
   "Party popper": "https://gbcosmos.com/wp-content/uploads/2026/09/Party_Poppers.png",
@@ -1894,13 +1910,23 @@ export default function Home() {
             // Creating an order only records the customer's request. Inventory
             // is intentionally untouched until the user moves it to Dispatch Plan.
             let savedOrder: Order = editing ? { ...o, id: requestedId, status: editing.status } : { ...o, id: requestedId, status: "Draft", backorders: [] };
-            const orderedLines = o.products?.length ? o.products : [{ product: o.product, sku: o.sku, quantity: o.quantity, unitPrice: o.unitPrice }];
-            if (orderedLines.some((line) => !line.product.trim())) { flash("Choose every product from Product / SKU. If it is missing, add it in Stock Master first."); return; }
+            const enteredLines = o.products?.length ? o.products : [{ product: o.product, sku: o.sku, quantity: o.quantity, unitPrice: o.unitPrice }];
+            if (enteredLines.some((line) => !line.product.trim())) { flash("Choose every product from Product / SKU. If it is missing, add it in Stock Master first."); return; }
+            // Keep an imported/manual rate and quantity exactly as entered,
+            // but repair a line's SKU from its unambiguous catalogue label.
+            // This prevents a green selected product from failing Save merely
+            // because an older import kept a stale SKU value behind the label.
+            const orderedLines = enteredLines.map((line) => {
+              if (numberCandleMixSeries(line)) return line;
+              const matched = catalogueMatchForOrderLine(line, catalogue);
+              return matched ? { ...line, sku: matched.sku, product: `${matched.sku} · ${catalogueName(matched)}`, review: { ...line.review, product: false } } : line;
+            });
             // AB-204 MIX and AB-205 MIX are recipe lines: on confirmation they
             // are safely expanded into their numbered components. A separate
             // MIX stock card is therefore not required.
             const missingLines = orderedLines.filter((line) => !numberCandleMixSeries(line) && !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku)));
-            if (missingLines.length) { flash(`${missingLines.length} product line${missingLines.length === 1 ? " is" : "s are"} not in Product / SKU. Add it in Stock Master, sync, then save this order.`); return; }
+            if (missingLines.length) { flash(`${missingLines.length} product line${missingLines.length === 1 ? " is" : "s are"} not in Product / SKU (${missingLines.map((line) => line.sku || line.product).join(", ")}). Add it in Stock Master, sync, then save this order.`); return; }
+            savedOrder = orderWithLines(savedOrder, orderedLines);
             const editingBackorder = Boolean(editing && isBackorderRecord(editing));
             const primaryId = editingBackorder ? editing!.id.replace(/^ADV-/, "") : editing?.id || "";
             const primaryOrder = editingBackorder ? orders.find((item) => item.id === primaryId) : editing;

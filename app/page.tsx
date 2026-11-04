@@ -2861,6 +2861,42 @@ function ProductStockInventoryPanel({ session, canApply, auditEvents, orders, re
     saveProductStockCache(session.user.id, products);
     onProductsSynced(products);
   };
+  const reconcileVerified204Balances = () => {
+    const passcode = window.prompt("Recalculate AB-204-0 to AB-204-9 from their verified opening balances?\n\nThis writes the calculated Available Stock to CRM and Google Stock Master.\n\nEnter sync passcode: GeeBee2026");
+    if (passcode === null) return;
+    if (passcode !== "GeeBee2026") { setMessage("Incorrect passcode. No stock was changed."); return; }
+    const activeDispatchStatuses = new Set(["Dispatch plan", "Sent to customer", "Received by customer"]);
+    const deductions = new Map(Object.keys(productHistoryOpeningBalances).map((sku) => [sku, 0]));
+    const addDeduction = (sku: string, quantity: number) => {
+      const key = skuKey(sku);
+      if (deductions.has(key)) deductions.set(key, (deductions.get(key) || 0) + quantity);
+    };
+    orders.filter((order) => order.inventoryCommitted && activeDispatchStatuses.has(order.status)).forEach((order) => {
+      const dispatched = order.dispatchStockLines?.length ? order.dispatchStockLines : linesFor(order);
+      dispatched.forEach((line) => {
+        const mixSeries = numberCandleMixSeries(line);
+        if (mixSeries === "204" && Number.isInteger(line.quantity / numberCandleMixUnits)) {
+          const multiplier = line.quantity / numberCandleMixUnits;
+          numberCandleMixRecipe.forEach((component) => addDeduction(`AB-204-${component.digit}`, component.cartons * multiplier));
+          return;
+        }
+        addDeduction(line.sku, line.quantity);
+      });
+    });
+    const calculated = new Map(Object.entries(productHistoryOpeningBalances).map(([sku, opening]) => [sku, opening - (deductions.get(sku) || 0)]));
+    const matched = items.filter((item) => calculated.has(skuKey(item.sku)));
+    if (matched.length !== calculated.size) {
+      const found = new Set(matched.map((item) => skuKey(item.sku)));
+      const missing = [...calculated.keys()].filter((sku) => !found.has(sku));
+      setMessage(`No stock was changed. These verified AB-204 SKU(s) are missing from Product / SKUs: ${missing.join(", ")}.`);
+      return;
+    }
+    if (!window.confirm(`Apply the calculated balances to ${matched.length} AB-204 numbered SKUs? This updates CRM and Google Stock Master.`)) return;
+    const next = items.map((item) => calculated.has(skuKey(item.sku)) ? { ...item, availableQuantity: calculated.get(skuKey(item.sku))! } : item);
+    replaceItems(next);
+    onAudit("Reconciled verified AB-204 opening balances", "Products", [...calculated.entries()].map(([sku, available]) => `${sku.toUpperCase()}: ${available.toLocaleString("en-IN")}`).join(" · "));
+    setMessage(`AB-204 reconciliation applied to CRM and queued for Stock Master: ${[...calculated.entries()].map(([sku, available]) => `${sku.toUpperCase()} ${available.toLocaleString("en-IN")}`).join(" · ")}.`);
+  };
   const load = async () => {
     setLoading(true); setMessage("");
     try {
@@ -2908,7 +2944,7 @@ function ProductStockInventoryPanel({ session, canApply, auditEvents, orders, re
     } catch (error) { setMessage(error instanceof Error ? error.message : "Product could not be updated."); }
     finally { setLoading(false); }
   };
-  return <><section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT MASTER</span><h2>Products / SKUs</h2><p>Your Google Sheet inventory is the product master for this section. Sync it only when the sheet has changed.</p></div><div className="catalogue-count"><b>{items.length}</b><span>SKUs</span></div></div><section className="catalogue-actions"><div className="catalogue-tip"><b>Google Sheet product master</b><p>Fields: SKU ID, Product Name, Category, Unit, Inner Qty, Outer Qty, Selling Price, Available Stock, Low Stock Alert, Image URL.</p></div><div className="button-row">{canApply && <button className="outline" type="button" disabled={loading} onClick={() => sync("setup")}>Set up blank sheet + test rows</button>}{canApply && <button className="outline" type="button" disabled={loading} onClick={releaseAllReservations}>Release all reservations</button>}<span className="sync-stock-action"><button className="primary" type="button" disabled={loading} onClick={() => sync("sync")}>{loading ? "Syncing…" : "Sync Google Sheet"}</button><small>Update CRM from Sheet</small></span></div></section>{message && <p className="inventory-recon-message success">{message}</p>}<section className="catalogue-grid">{visibleItems.map((item) => <article className="catalogue-card" key={item.id} onClick={() => canApply && setEditing(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={item.name} onError={(event) => { event.currentTarget.style.display = "none"; }}/> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><small title={item.sku}>{item.sku}</small><h3 title={item.name}>{item.name}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / ${item.unit || "pc"}` : "Price to be added"}</p><p className={`catalogue-stock ${availableStock(item) < 0 ? "negative-stock" : ""}`}>Available: <b>{availableStock(item).toLocaleString("en-IN")}</b>{availableStock(item) < 0 && " · Stock issue"}</p><ProductReservationSummary product={item} orders={orders}/><p className="catalogue-stock">Low alert: <b>{item.reorderThreshold ?? 0}</b></p>{canApply && <button className="edit-product" type="button" onClick={(event) => { event.stopPropagation(); setEditing(item); }}><Pencil size={13}/> Edit product</button>}</div></article>)}{!loading && !visibleItems.length && <div className="empty">No products match this search. Sync Google Sheet if the product master has changed.</div>}</section></section>{editing && <StockInventoryModal item={editing} auditEvents={auditEvents} orders={orders} close={() => setEditing(null)} save={saveEdit}/>}</>;
+  return <><section className="catalogue-page"><div className="catalogue-top"><div><span className="overline">PRODUCT MASTER</span><h2>Products / SKUs</h2><p>Your Google Sheet inventory is the product master for this section. Sync it only when the sheet has changed.</p></div><div className="catalogue-count"><b>{items.length}</b><span>SKUs</span></div></div><section className="catalogue-actions"><div className="catalogue-tip"><b>Google Sheet product master</b><p>Fields: SKU ID, Product Name, Category, Unit, Inner Qty, Outer Qty, Selling Price, Available Stock, Low Stock Alert, Image URL.</p></div><div className="button-row">{canApply && <button className="outline" type="button" disabled={loading} onClick={() => sync("setup")}>Set up blank sheet + test rows</button>}{canApply && <button className="outline" type="button" disabled={loading} onClick={releaseAllReservations}>Release all reservations</button>}{canApply && <button className="outline" type="button" disabled={loading} onClick={reconcileVerified204Balances}>Recalculate AB-204 series</button>}<span className="sync-stock-action"><button className="primary" type="button" disabled={loading} onClick={() => sync("sync")}>{loading ? "Syncing…" : "Sync Google Sheet"}</button><small>Update CRM from Sheet</small></span></div></section>{message && <p className="inventory-recon-message success">{message}</p>}<section className="catalogue-grid">{visibleItems.map((item) => <article className="catalogue-card" key={item.id} onClick={() => canApply && setEditing(item)}><div className="catalogue-image">{item.image ? <img src={item.image} alt={item.name} onError={(event) => { event.currentTarget.style.display = "none"; }}/> : <PackageCheck size={27}/>}<span>{item.category || "Uncategorised"}</span></div><div className="catalogue-info"><small title={item.sku}>{item.sku}</small><h3 title={item.name}>{item.name}</h3><p>{item.unitPrice ? `${money(item.unitPrice)} / ${item.unit || "pc"}` : "Price to be added"}</p><p className={`catalogue-stock ${availableStock(item) < 0 ? "negative-stock" : ""}`}>Available: <b>{availableStock(item).toLocaleString("en-IN")}</b>{availableStock(item) < 0 && " · Stock issue"}</p><ProductReservationSummary product={item} orders={orders}/><p className="catalogue-stock">Low alert: <b>{item.reorderThreshold ?? 0}</b></p>{canApply && <button className="edit-product" type="button" onClick={(event) => { event.stopPropagation(); setEditing(item); }}><Pencil size={13}/> Edit product</button>}</div></article>)}{!loading && !visibleItems.length && <div className="empty">No products match this search. Sync Google Sheet if the product master has changed.</div>}</section></section>{editing && <StockInventoryModal item={editing} auditEvents={auditEvents} orders={orders} close={() => setEditing(null)} save={saveEdit}/>}</>;
 }
 
 function ProductStockCategoriesPanel({ session, query, openCategory }: { session: Session; query: string; openCategory: (category: string) => void }) {

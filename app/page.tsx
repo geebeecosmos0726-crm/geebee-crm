@@ -106,13 +106,6 @@ type Order = {
   // the first time a Draft becomes Confirmed and survives a return to Draft.
   confirmationSequence?: number;
   sourceSheetOrderId?: string;
-  // A fetched Sheet order starts as an untouched request. It becomes true only
-  // when a user changes its product lines or quantities in Draft, allowing an
-  // intentional over-allocation to move into Confirmed Orders.
-  draftStockEdited?: boolean;
-  // Only these specific product lines were quantity-edited by a user while
-  // still Draft. An import, a price edit or merely saving does not add a key.
-  draftEditedQuantityKeys?: string[];
   // True only after this order's quantities have actually been deducted from
   // Product / SKU available stock on entry to Dispatch Plan.
   inventoryCommitted?: boolean;
@@ -559,17 +552,6 @@ const isFulfilmentOrder = (order?: Order) => Boolean(order && ["Sent to customer
 const orderWithLines = (order: Order, products: ProductLine[]): Order => {
   const first = products[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
   return { ...order, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products };
-};
-// SKU is the stable identity of an order line. Product labels may be
-// reformatted during Save (for example, "Banner" becomes "AB-331 · Banner"),
-// so including the label here caused a real Qty edit to be missed.
-const draftQuantityLineKey = (line: ProductLine) => skuKey(line.sku) || line.product.trim().toLowerCase();
-const editedDraftQuantityKeys = (before: ProductLine[], after: ProductLine[]) => {
-  const oldQuantities = new Map(before.map((line) => [draftQuantityLineKey(line), line.quantity]));
-  const newQuantities = new Map(after.map((line) => [draftQuantityLineKey(line), line.quantity]));
-  // Product additions/removals are deliberately not treated as a quantity
-  // override. Only an existing product's Qty field gives this permission.
-  return [...oldQuantities].flatMap(([key, quantity]) => newQuantities.has(key) && newQuantities.get(key) !== quantity ? [key] : []);
 };
 const catalogueSku = (item: CatalogueItem) => item.sku?.trim() || "SKU pending";
 const catalogueName = (item: CatalogueItem) => item.name?.trim() || item.description?.trim() || (item.sku?.trim() ? `Product ${item.sku.trim()}` : "Product name pending");
@@ -1671,26 +1653,8 @@ export default function Home() {
     if (!window.confirm(`Confirm ${order.id}? CRM will reserve Sheet stock now and shortages will be made into backorders.`)) return;
     if (!beginOrderTransition("confirm", order.id)) { flash(`${order.id} is already being confirmed. Please wait.`); return; }
     const shortages = backorderLinesFor(requestedLines, order.id, orders, catalogue);
-    const editedQuantityKeys = new Set(order.draftEditedQuantityKeys || []);
-    // For imported orders, only a product whose Qty was manually changed may
-    // be over-allocated. A shortage on any untouched product keeps the whole
-    // request in Draft and creates its Backorder instead.
-    const untouchedShortages = shortages.filter((line) => !editedQuantityKeys.has(draftQuantityLineKey(line)));
-    const unchangedImportedShortage = Boolean(order.sourceSheetOrderId && untouchedShortages.length);
     const firstDispatch = requestedLines[0] || { product: order.product, sku: order.sku, quantity: order.quantity, unitPrice: order.unitPrice };
     const advanceOrder = shortages.length ? { ...order, id: `ADV-${order.id}`, product: shortages[0].product, sku: shortages[0].sku, quantity: shortages[0].quantity, unitPrice: shortages[0].unitPrice, products: shortages, status: "Advance order", payment: "Partial" } : null;
-    // An untouched Sheet order with any shortage is kept in Draft. It is a
-    // request awaiting stock, not an intentional over-allocation. Its ADV
-    // record remains visible in Backorders without reserving physical stock.
-    if (unchangedImportedShortage && advanceOrder) {
-      setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...firstDispatch, products: requestedLines, backorders: shortages } : item).filter((item) => item.id !== advanceOrder.id).concat(advanceOrder));
-      const advanceAmount = shortages.reduce((total, line) => total + line.quantity * line.unitPrice, 0);
-      setInvoices((current) => [...current.filter((invoice) => invoice.order !== advanceOrder.id), { id: advanceOrder.id, client: order.client, order: advanceOrder.id, amount: money(advanceAmount), due: "Advance payment", status: "Partial" }]);
-      setTasks((current) => [...current.filter((task) => task.relatedTo !== advanceOrder.id), { id: `TASK-${Date.now()}`, title: `Arrange future dispatch for advance order ${advanceOrder.id}`, time: "10:00", dueDate: new Date().toISOString().slice(0, 10), assignee: "Rahul", type: "Follow-up", status: "Open", relatedTo: advanceOrder.id }]);
-      logActivity("Created backorder from unchanged Draft", "Backorders", `${order.id} · ${shortages.length} shortage line(s); Draft was not confirmed`);
-      flash(`${order.id} stays in Draft because stock is short. Backorder ${advanceOrder.id} was created; no stock was reserved.`);
-      return;
-    }
     setCatalogue((current) => current.map((product) => {
       const confirmedQuantity = requestedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
       // Keep the customer's full confirmed requirement reserved, including a
@@ -2028,11 +1992,6 @@ export default function Home() {
             const missingLines = orderedLines.filter((line) => !numberCandleMixSeries(line) && !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku)));
             if (missingLines.length) { flash(`${missingLines.length} product line${missingLines.length === 1 ? " is" : "s are"} not in Product / SKU (${missingLines.map((line) => line.sku || line.product).join(", ")}). Add it in Stock Master, sync, then save this order.`); return; }
             savedOrder = orderWithLines(savedOrder, orderedLines);
-            if (!editing) savedOrder = { ...savedOrder, draftStockEdited: !savedOrder.sourceSheetOrderId, draftEditedQuantityKeys: savedOrder.sourceSheetOrderId ? [] : orderedLines.map(draftQuantityLineKey) };
-            if (editing?.status === "Draft") {
-              const changedKeys = editedDraftQuantityKeys(linesFor(editing), orderedLines);
-              if (changedKeys.length) savedOrder = { ...savedOrder, draftStockEdited: true, draftEditedQuantityKeys: [...new Set([...(editing.draftEditedQuantityKeys || []), ...changedKeys])] };
-            }
             const editingBackorder = Boolean(editing && isBackorderRecord(editing));
             const primaryId = editingBackorder ? editing!.id.replace(/^ADV-/, "") : editing?.id || "";
             const primaryOrder = editingBackorder ? orders.find((item) => item.id === primaryId) : editing;

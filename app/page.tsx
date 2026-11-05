@@ -106,6 +106,13 @@ type Order = {
   // the first time a Draft becomes Confirmed and survives a return to Draft.
   confirmationSequence?: number;
   sourceSheetOrderId?: string;
+  // Product lines originally requested by the customer. Confirmed `products`
+  // can hold only the stock allocated for dispatch while this preserves the
+  // complete request for a later return to Draft.
+  requestedProducts?: ProductLine[];
+  // Only Qty changes on these exact SKU lines are allowed to reserve beyond
+  // free stock. Saving, changing price, or editing another SKU does not count.
+  draftEditedQuantityKeys?: string[];
   // True only after this order's quantities have actually been deducted from
   // Product / SKU available stock on entry to Dispatch Plan.
   inventoryCommitted?: boolean;
@@ -384,6 +391,31 @@ const backorderLinesFor = (lines: ProductLine[], orderId: string, orders: Order[
     remaining.set(key, free - line.quantity);
   });
   return shortages;
+};
+const draftQuantityLineKey = (line: ProductLine) => skuKey(line.sku) || line.product.trim().toLowerCase();
+const editedDraftQuantityKeys = (before: ProductLine[], after: ProductLine[]) => {
+  const oldQuantities = new Map(before.map((line) => [draftQuantityLineKey(line), line.quantity]));
+  const newQuantities = new Map(after.map((line) => [draftQuantityLineKey(line), line.quantity]));
+  return [...oldQuantities].flatMap(([key, quantity]) => newQuantities.has(key) && newQuantities.get(key) !== quantity ? [key] : []);
+};
+const confirmationAllocationFor = (lines: ProductLine[], orderId: string, orders: Order[], catalogue: CatalogueItem[], editedQuantityKeys: Set<string>) => {
+  const remaining = new Map(catalogue.map((product) => {
+    const reservedElsewhere = confirmedReservationsForSku(orders.filter((order) => order.id !== orderId), product.sku).reduce((sum, entry) => sum + entry.quantity, 0);
+    return [skuKey(product.sku), availableStock(product) - reservedElsewhere];
+  }));
+  const confirmed: ProductLine[] = [];
+  const shortages: ProductLine[] = [];
+  lines.forEach((line) => {
+    const key = skuKey(line.sku);
+    const free = remaining.get(key) ?? 0;
+    const shortage = Math.max(0, line.quantity - Math.max(0, free));
+    if (shortage) shortages.push({ ...line, quantity: shortage });
+    const allowOverAllocation = editedQuantityKeys.has(draftQuantityLineKey(line));
+    const confirmedQuantity = allowOverAllocation ? line.quantity : Math.max(0, Math.min(line.quantity, Math.max(0, free)));
+    if (confirmedQuantity) confirmed.push({ ...line, quantity: confirmedQuantity });
+    remaining.set(key, free - (allowOverAllocation ? line.quantity : confirmedQuantity));
+  });
+  return { confirmed, shortages };
 };
 function ProductReservationSummary({ product, orders }: { product: CatalogueItem; orders: Order[] }) {
   const reservations = confirmedReservationsForSku(orders, product.sku);
@@ -1568,10 +1600,11 @@ export default function Home() {
     const advanceId = `ADV-${order.id}`;
     const shortageLines = order.backorders?.length ? order.backorders : (orders.find((item) => item.id === advanceId)?.products || []);
     const confirmedLines = linesFor(order);
-    // New confirmations already retain the whole customer requirement in the
-    // main order. Older confirmations kept only available lines, so preserve
-    // their historical behaviour while avoiding duplicate quantities now.
-    const restoredLines = order.confirmedIncludesBackorderQuantity ? confirmedLines : [...confirmedLines, ...shortageLines];
+    // Current confirmations retain the original customer requirement
+    // separately, so returning to Draft restores it without duplicating any
+    // line that was manually over-allocated. Keep the fallback for older
+    // records created before requestedProducts existed.
+    const restoredLines = order.requestedProducts?.length ? order.requestedProducts : (order.confirmedIncludesBackorderQuantity ? confirmedLines : [...confirmedLines, ...shortageLines]);
     const advanceInvoiceIds = invoices.filter((invoice) => invoice.order === advanceId).map((invoice) => invoice.id);
     const advanceTaskIds = tasks.filter((task) => task.relatedTo === advanceId).map((task) => task.id);
     // Returning the main order to Draft absorbs its shortage lines back into
@@ -1585,7 +1618,7 @@ export default function Home() {
       return !released ? product : { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - released) };
     }));
     const first = restoredLines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
-    setOrders((current) => current.filter((item) => item.id !== advanceId).map((item) => item.id === order.id ? { ...item, ...first, products: restoredLines, approvedProducts: undefined, backorders: undefined, confirmedIncludesBackorderQuantity: undefined, clientApproval: undefined, status: "Draft", inventoryCommitted: false } : item));
+    setOrders((current) => current.filter((item) => item.id !== advanceId).map((item) => item.id === order.id ? { ...item, ...first, products: restoredLines, requestedProducts: restoredLines, approvedProducts: undefined, backorders: undefined, confirmedIncludesBackorderQuantity: undefined, clientApproval: undefined, status: "Draft", inventoryCommitted: false } : item));
     setInvoices((current) => current.filter((invoice) => invoice.order !== advanceId));
     setTasks((current) => current.filter((task) => task.relatedTo !== advanceId));
     const confirmationReference = order.confirmationSequence ? `Confirmation #${order.confirmationSequence}` : "No confirmation number";
@@ -1652,14 +1685,15 @@ export default function Home() {
     if (missingSkus.length) { flash(`Cannot confirm ${order.id}: ${missingSkus.join(", ")} is not in Product / SKUs. Add it to the Stock Master first.`); return; }
     if (!window.confirm(`Confirm ${order.id}? CRM will reserve Sheet stock now and shortages will be made into backorders.`)) return;
     if (!beginOrderTransition("confirm", order.id)) { flash(`${order.id} is already being confirmed. Please wait.`); return; }
-    const shortages = backorderLinesFor(requestedLines, order.id, orders, catalogue);
-    const firstDispatch = requestedLines[0] || { product: order.product, sku: order.sku, quantity: order.quantity, unitPrice: order.unitPrice };
+    const editedQuantityKeys = new Set(order.draftEditedQuantityKeys || (order.sourceSheetOrderId ? [] : requestedLines.map(draftQuantityLineKey)));
+    const { confirmed: confirmedLines, shortages } = confirmationAllocationFor(requestedLines, order.id, orders, catalogue, editedQuantityKeys);
+    const firstDispatch = confirmedLines[0] || requestedLines[0] || { product: order.product, sku: order.sku, quantity: 0, unitPrice: order.unitPrice };
     const advanceOrder = shortages.length ? { ...order, id: `ADV-${order.id}`, product: shortages[0].product, sku: shortages[0].sku, quantity: shortages[0].quantity, unitPrice: shortages[0].unitPrice, products: shortages, status: "Advance order", payment: "Partial" } : null;
     setCatalogue((current) => current.map((product) => {
-      const confirmedQuantity = requestedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      // Keep the customer's full confirmed requirement reserved, including a
-      // shortage. This makes the negative balance visible in CRM while the
-      // linked Backorder continues to show what needs replenishment.
+      const confirmedQuantity = confirmedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
+      // An unchanged sheet line reserves only actual free stock. A manually
+      // edited Qty may reserve its whole new figure, intentionally showing a
+      // negative Free balance for the matching backorder.
       if (!confirmedQuantity) return product;
       const liveReserved = confirmedReservationsForSku(orders, product.sku).reduce((total, entry) => total + entry.quantity, 0);
       return { ...product, reservedStock: liveReserved + confirmedQuantity };
@@ -1667,7 +1701,7 @@ export default function Home() {
     // Allocate a confirmation number once. If the order was returned to Draft,
     // reuse its earlier number instead of creating a second reference.
     const nextConfirmationSequence = order.confirmationSequence || (Math.max(0, ...orders.map((item) => item.confirmationSequence || 0)) + 1);
-    const confirmedOrder: Order = { ...order, confirmationSequence: nextConfirmationSequence, product: firstDispatch.product, sku: firstDispatch.sku, quantity: firstDispatch.quantity, unitPrice: firstDispatch.unitPrice, products: requestedLines, approvedProducts: requestedLines, status: "Confirmed", backorders: shortages, confirmedIncludesBackorderQuantity: true };
+    const confirmedOrder: Order = { ...order, confirmationSequence: nextConfirmationSequence, product: firstDispatch.product, sku: firstDispatch.sku, quantity: firstDispatch.quantity, unitPrice: firstDispatch.unitPrice, products: confirmedLines, approvedProducts: confirmedLines, requestedProducts: requestedLines, status: "Confirmed", backorders: shortages, confirmedIncludesBackorderQuantity: confirmedLines.some((line) => editedQuantityKeys.has(draftQuantityLineKey(line))) };
     setOrders((current) => [...current.filter((item) => item.id !== order.id && item.id !== `ADV-${order.id}`), confirmedOrder, ...(advanceOrder ? [advanceOrder] : [])]);
     if (advanceOrder) {
       const advanceAmount = shortages.reduce((total, line) => total + line.quantity * line.unitPrice, 0);
@@ -1680,7 +1714,7 @@ export default function Home() {
     logActivity("Recorded confirmed order product change", "Products", JSON.stringify({
       orderId: order.id,
       client: order.client,
-      changes: requestedLines.map((line) => ({ sku: line.sku, product: line.product, change: "Confirmed", before: 0, after: line.quantity })),
+      changes: confirmedLines.map((line) => ({ sku: line.sku, product: line.product, change: "Confirmed", before: 0, after: line.quantity })),
     }));
     logActivity("Confirmed order and reserved inventory", "Orders", shortages.length ? `${order.id} · Confirmation #${nextConfirmationSequence} · ${shortages.length} shortage line(s) moved to backorder` : `${order.id} · Confirmation #${nextConfirmationSequence}`);
     const fullyShortLines = shortages.filter((shortage) => shortage.quantity === (requestedLines.find((line) => skuKey(line.sku) === skuKey(shortage.sku))?.quantity || 0));
@@ -1698,6 +1732,7 @@ export default function Home() {
       return;
     }
     const requestedLines = requestedExpansion.lines;
+    if (!requestedLines.length) { flash(`${order.id} has no stock allocated for dispatch. Its full quantity is currently in Backorders.`); return; }
     const approvedLines = requestedLines;
     // The final visible lines in Confirmed Orders are the only dispatch
     // source of truth. Do not compare them with an older approved snapshot:
@@ -1992,6 +2027,11 @@ export default function Home() {
             const missingLines = orderedLines.filter((line) => !numberCandleMixSeries(line) && !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku)));
             if (missingLines.length) { flash(`${missingLines.length} product line${missingLines.length === 1 ? " is" : "s are"} not in Product / SKU (${missingLines.map((line) => line.sku || line.product).join(", ")}). Add it in Stock Master, sync, then save this order.`); return; }
             savedOrder = orderWithLines(savedOrder, orderedLines);
+            if (!editing) savedOrder = { ...savedOrder, requestedProducts: orderedLines, draftEditedQuantityKeys: savedOrder.sourceSheetOrderId ? [] : orderedLines.map(draftQuantityLineKey) };
+            if (editing?.status === "Draft") {
+              const changedKeys = editedDraftQuantityKeys(linesFor(editing), orderedLines);
+              savedOrder = { ...savedOrder, requestedProducts: orderedLines, draftEditedQuantityKeys: changedKeys.length ? [...new Set([...(editing.draftEditedQuantityKeys || []), ...changedKeys])] : editing.draftEditedQuantityKeys || [] };
+            }
             const editingBackorder = Boolean(editing && isBackorderRecord(editing));
             const primaryId = editingBackorder ? editing!.id.replace(/^ADV-/, "") : editing?.id || "";
             const primaryOrder = editingBackorder ? orders.find((item) => item.id === primaryId) : editing;
@@ -2014,7 +2054,7 @@ export default function Home() {
             // linked backorder remains separately visible and actionable.
             if (editing?.status === "Confirmed" && !editingBackorder) {
               const recalculatedBackorders = backorderLinesFor(orderedLines, editing.id, orders, catalogue);
-              savedOrder = { ...savedOrder, products: orderedLines, approvedProducts: orderedLines, backorders: recalculatedBackorders, confirmedIncludesBackorderQuantity: true };
+              savedOrder = { ...savedOrder, products: orderedLines, requestedProducts: orderedLines, approvedProducts: orderedLines, backorders: recalculatedBackorders, confirmedIncludesBackorderQuantity: true };
               const existingAdvance = orders.find((item) => item.id === `ADV-${editing.id}`);
               syncedBackorder = recalculatedBackorders.length
                 ? {

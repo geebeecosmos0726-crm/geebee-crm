@@ -4,7 +4,7 @@ import { google } from "googleapis";
 export const runtime = "nodejs";
 
 type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; remarks?: string };
-type ImportedOrder = { id: string; sourceSheetOrderId: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string; transporter?: string };
+type ImportedOrder = { id: string; sourceSheetOrderId: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string; transporter?: string; requestedProducts?: ProductLine[]; draftEditedQuantityKeys?: string[] };
 type CustomerIdentity = { name: string; city: string };
 
 const sheetId = process.env.GOOGLE_ORDER_IMPORT_SHEET_ID;
@@ -236,6 +236,7 @@ export async function POST(request: Request) {
           quantity: first.quantity,
           unitPrice: first.unitPrice,
           products: lines,
+          requestedProducts: Array.isArray(current.draftEditedQuantityKeys) && current.draftEditedQuantityKeys.length ? current.requestedProducts || current.products || lines : lines,
           eta: String(current.eta || ""),
           status: "Draft",
           payment: (current.payment as "Partial") || "Partial",
@@ -248,7 +249,7 @@ export async function POST(request: Request) {
         continue;
       }
       const id = details.id;
-      imported.push({ id, sourceSheetOrderId: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "", transporter });
+      imported.push({ id, sourceSheetOrderId: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, requestedProducts: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "", transporter, draftEditedQuantityKeys: [] });
       if (matchedCustomer) {
         reusedCustomers.push(`${details.id}: ${details.client} → ${matchedCustomer.name}`);
       } else {

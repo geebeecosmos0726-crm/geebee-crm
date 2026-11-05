@@ -560,7 +560,10 @@ const orderWithLines = (order: Order, products: ProductLine[]): Order => {
   const first = products[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
   return { ...order, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products };
 };
-const draftQuantityLineKey = (line: ProductLine) => `${skuKey(line.sku)}::${line.product.trim().toLowerCase()}`;
+// SKU is the stable identity of an order line. Product labels may be
+// reformatted during Save (for example, "Banner" becomes "AB-331 · Banner"),
+// so including the label here caused a real Qty edit to be missed.
+const draftQuantityLineKey = (line: ProductLine) => skuKey(line.sku) || line.product.trim().toLowerCase();
 const editedDraftQuantityKeys = (before: ProductLine[], after: ProductLine[]) => {
   const oldQuantities = new Map(before.map((line) => [draftQuantityLineKey(line), line.quantity]));
   const newQuantities = new Map(after.map((line) => [draftQuantityLineKey(line), line.quantity]));

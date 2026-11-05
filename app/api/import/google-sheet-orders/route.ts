@@ -4,7 +4,7 @@ import { google } from "googleapis";
 export const runtime = "nodejs";
 
 type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; remarks?: string };
-type ImportedOrder = { id: string; sourceSheetOrderId: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string; transporter?: string };
+type ImportedOrder = { id: string; sourceSheetOrderId: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string; transporter?: string; draftStockEdited?: boolean };
 type CustomerIdentity = { name: string; city: string };
 
 const sheetId = process.env.GOOGLE_ORDER_IMPORT_SHEET_ID;
@@ -193,7 +193,10 @@ export async function POST(request: Request) {
       const lines = readLines(values, productMap);
       if (!lines.length) { skipped.push(`${details.id}: no ITEM and QUANTITY rows found`); continue; }
       const matchingHistory = (existingOrders || []).filter((row: any) => key(row.record_id) === key(details.id) || key(row.data?.sourceSheetOrderId) === key(details.id));
-      const progressedOrder = matchingHistory.find((row: any) => String(row.data?.status || "Draft") !== "Draft");
+      // The linked ADV record is a backorder for a still-Draft sheet order,
+      // not proof that the main order has progressed. It must not prevent the
+      // main Draft from being fetched or manually corrected later.
+      const progressedOrder = matchingHistory.find((row: any) => String(row.data?.status || "Draft") !== "Draft" && !/^ADV-/i.test(String(row.record_id || row.data?.id || "")));
       // An order Sheet is only an intake source. Once that original order ID
       // has progressed beyond Draft, never bring it back into Orders. Earlier
       // versions generated E-001/26 drafts here; clean only those generated
@@ -245,7 +248,7 @@ export async function POST(request: Request) {
         continue;
       }
       const id = details.id;
-      imported.push({ id, sourceSheetOrderId: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "", transporter });
+      imported.push({ id, sourceSheetOrderId: details.id, client, city, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: lines, eta: "", status: "Draft", payment: "Partial", avatar: initials(client), remarks: "", transporter, draftStockEdited: false });
       if (matchedCustomer) {
         reusedCustomers.push(`${details.id}: ${details.client} → ${matchedCustomer.name}`);
       } else {

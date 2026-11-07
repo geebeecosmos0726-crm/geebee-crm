@@ -1099,17 +1099,17 @@ export default function Home() {
   const sheetBackupPending = useRef(false);
   const workspaceDataSnapshot = useRef<string | null>(null);
   const pendingStockMovementAudits = useRef<Array<{ orderId: string; direction: ProductStockMovement["direction"]; lines: ProductStockMovement[] }>>([]);
-  // Browser state updates are asynchronous. Keep a short-lived lock for a
-  // stage action so a second click cannot apply the same reservation or stock
-  // deduction while the first click is still being rendered and persisted.
+  // Dispatch and reversal wait for both the inventory ledger and Stock Master.
+  // Keep the lock until the complete action finishes, not merely until render.
   const orderTransitionLocks = useRef<Set<string>>(new Set());
-  const beginOrderTransition = (stage: "confirm" | "dispatch", orderId: string) => {
+  const beginOrderTransition = (stage: "confirm" | "dispatch" | "reverse", orderId: string) => {
     const key = `${stage}:${orderId}`;
     if (orderTransitionLocks.current.has(key)) return false;
     orderTransitionLocks.current.add(key);
-    window.setTimeout(() => orderTransitionLocks.current.delete(key), 2200);
+    window.setTimeout(() => orderTransitionLocks.current.delete(key), 60_000);
     return true;
   };
+  const endOrderTransition = (stage: "confirm" | "dispatch" | "reverse", orderId: string) => orderTransitionLocks.current.delete(`${stage}:${orderId}`);
   const flash = (m: string) => {
       setToast(m);
       setTimeout(() => setToast(""), 2600);
@@ -1759,6 +1759,8 @@ export default function Home() {
       flash(`${order.id} was dispatched before the new SKU ledger started. Its current balance is the opening balance, so it cannot be automatically reversed. Review it once and create a new confirmed order if stock must be moved.`);
       return;
     }
+    if (!beginOrderTransition("reverse", order.id)) { flash(`${order.id} is already returning to Confirmed Orders. Please wait.`); return; }
+    flash(`${order.id}: reversing inventory and updating Stock Master…`);
     const reversalTransactionId = order.inventoryReversalTransactionId || `reversal:${dispatchTransactionId}`;
     try {
       if (order.inventoryCommitted) await applyInventoryLedgerTransaction({
@@ -1769,12 +1771,14 @@ export default function Home() {
         lines: [...restoredBySku.values()],
       });
     } catch (error) {
+      endOrderTransition("reverse", order.id);
       flash(error instanceof Error ? error.message : "Dispatch reversal could not be saved.");
       return;
     }
     const restoredQuantity = dispatchedSnapshot.reduce((sum, line) => sum + line.quantity, 0);
     setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...first, products: lines, approvedProducts: lines, status: "Confirmed", inventoryCommitted: false, inventoryReversalTransactionId: reversalTransactionId, dispatchReversedAt: new Date().toISOString() } : item));
     logActivity("Returned dispatch order to Confirmed Orders", "Dispatch Plan", `${order.id} · restored ${restoredQuantity.toLocaleString("en-IN")} unit(s) from saved dispatch quantity`);
+    endOrderTransition("reverse", order.id);
     flash(`${order.id} returned to Confirmed Orders. Exactly ${restoredQuantity.toLocaleString("en-IN")} dispatched unit(s) were added back through the SKU ledger.`);
   };
   const markOrderSentToCustomer = (order: Order) => {
@@ -1844,6 +1848,7 @@ export default function Home() {
     }));
     logActivity("Confirmed order and reserved inventory", "Orders", shortages.length ? `${order.id} · Confirmation #${nextConfirmationSequence} · ${shortages.length} shortage line(s) moved to backorder` : `${order.id} · Confirmation #${nextConfirmationSequence}`);
     const fullyShortLines = shortages.filter((shortage) => shortage.quantity === (requestedLines.find((line) => skuKey(line.sku) === skuKey(shortage.sku))?.quantity || 0));
+    endOrderTransition("confirm", order.id);
     flash(shortages.length ? `${order.id} confirmed; CRM reserved Sheet stock and created a backorder.${fullyShortLines.length ? ` No free stock was available for: ${fullyShortLines.map((line) => line.sku).join(", ")}.` : ""}` : `${order.id} confirmed and CRM stock reserved.`);
   };
   const pushToDispatchPlan = async (order: Order) => {
@@ -1877,6 +1882,7 @@ export default function Home() {
     };
     if (!window.confirm(`Send ${order.id} to Dispatch Plan? Any quantity reduced by Operations will be released from CRM reservation.`)) return;
     if (!beginOrderTransition("dispatch", order.id)) { flash(`${order.id} is already being sent to Dispatch Plan. Please wait.`); return; }
+    flash(`${order.id}: recording inventory and updating Stock Master…`);
     const dispatchedBySku = summariseBySku(dispatchLines);
     const nextDispatchCycle = (order.inventoryDispatchCycle || 0) + 1;
     const dispatchTransactionId = order.inventoryDispatchTransactionId && !order.dispatchReversedAt
@@ -1893,6 +1899,7 @@ export default function Home() {
         allowNegativeSkus,
       });
     } catch (error) {
+      endOrderTransition("dispatch", order.id);
       flash(error instanceof Error ? error.message : "Dispatch stock movement could not be saved.");
       return;
     }
@@ -1905,6 +1912,7 @@ export default function Home() {
     const first = dispatchLines[0] || approvedLines[0];
     setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, dispatchStockLines: dispatchLines.map((line) => ({ ...line })), inventoryDispatchTransactionId: dispatchTransactionId, inventoryDispatchCycle: nextDispatchCycle, inventoryReversalTransactionId: undefined, dispatchedAt: new Date().toISOString(), dispatchReversedAt: undefined, status: "Dispatch plan", inventoryCommitted: true } : item));
     logActivity("Sent confirmed order to Dispatch Plan", "Dispatch Plan", releasedLines.length ? `${order.id} · reduced CRM reservation released` : order.id);
+    endOrderTransition("dispatch", order.id);
     flash(releasedLines.length ? `${order.id} sent to Dispatch Plan; reduced quantities were released from CRM reservation.` : `${order.id} sent to Dispatch Plan for Operations.`);
   };
   const navigationGroups = [

@@ -5,6 +5,11 @@ export const runtime = "nodejs";
 type InventoryLine = { sku: string; quantity: number };
 
 const exactSku = (value: unknown) => String(value ?? "").trim().toUpperCase();
+const errorMessage = (error: unknown, fallback: string) => {
+  if (error instanceof Error && error.message) return error.message;
+  if (error && typeof error === "object" && "message" in error && typeof (error as { message?: unknown }).message === "string") return (error as { message: string }).message;
+  return fallback;
+};
 
 async function administrator(request: Request) {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -38,7 +43,8 @@ export async function GET(request: Request) {
     if (error) throw error;
     return Response.json({ ledger: data || [] });
   } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : "Could not load the inventory ledger. Run the inventory-ledger SQL setup first." }, { status: 400 });
+    console.error("Inventory ledger load failed", error);
+    return Response.json({ error: errorMessage(error, "Could not load the inventory ledger. Run the inventory-ledger SQL setup first.") }, { status: 400 });
   }
 }
 
@@ -74,6 +80,7 @@ export async function POST(request: Request) {
     if (inventoryError) throw inventoryError;
     return Response.json({ movements: movements || [], products: (inventory || []).map((row: any) => ({ id: row.record_id, ...row.data })), skuIds });
   } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : "Inventory movement could not be saved. Run the inventory-ledger SQL setup first." }, { status: 400 });
+    console.error("Inventory ledger transaction failed", error);
+    return Response.json({ error: errorMessage(error, "Inventory movement could not be saved. Run the inventory-ledger SQL setup first.") }, { status: 400 });
   }
 }

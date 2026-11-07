@@ -58,8 +58,10 @@ const likelyMasterTabTitle = (spreadsheetId: string) => {
 
 async function administrator(request: Request, url: string, serviceKey: string, allowMember = false) {
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-  if (!token) throw new Error("Sign in again before syncing product stock.");
   const db = createClient(url, serviceKey, { auth: { persistSession: false } });
+  const internalOwnerId = request.headers.get("x-geebee-workspace-owner")?.trim();
+  if (request.headers.get("x-geebee-internal-stock-sync") === serviceKey && internalOwnerId) return { db, ownerId: internalOwnerId, email: "system@geebee.local" };
+  if (!token) throw new Error("Sign in again before syncing product stock.");
   const { data: userData, error } = await db.auth.getUser(token);
   const email = userData.user?.email;
   if (error || !userData.user || !email) throw new Error("Sign in again before syncing product stock.");
@@ -295,14 +297,25 @@ export async function PATCH(request: Request) {
       const { data: existing, error: readError } = await db.from("crm_stock_inventory").select("record_id, data").eq("workspace_owner_id", ownerId).in("record_id", ids);
       if (readError) throw readError;
       const updateById = new Map<string, any>(updates.map((item: any): [string, any] => [String(item.id), item]));
+      const internalSync = request.headers.get("x-geebee-internal-stock-sync") === serviceKey;
       const now = new Date().toISOString();
-      const records = (existing || []).map((row: any) => {
+      const records = (existing || []).flatMap((row: any) => {
         const update = updateById.get(String(row.record_id));
+        const current = row.data as ProductData & { sheetSyncToken?: string };
+        // A newer movement may already be waiting for Sheet sync. An older
+        // background worker must never overwrite that newer balance.
+        if (internalSync && current.sheetSyncToken !== update.sheetSyncToken) return [];
         // A negative available quantity is intentional when Operations has
         // dispatched more than the Stock Master contained. Preserve and write
         // it so the shortfall stays visible instead of being silently hidden.
-        const data = { ...(row.data as ProductData), availableQuantity: number(update.availableQuantity), reservedStock: Math.max(0, number(update.reservedStock)) };
-        return { workspace_owner_id: ownerId, record_id: row.record_id, search_key: `${data.sku || ""} ${data.name || ""} ${data.category || ""}`.toLowerCase(), data, updated_at: now };
+        const data: ProductData & Record<string, unknown> = { ...current, availableQuantity: number(update.availableQuantity), reservedStock: Math.max(0, number(update.reservedStock)) };
+        if (internalSync) {
+          delete data.sheetSyncPending;
+          delete data.sheetSyncError;
+          delete data.sheetSyncToken;
+          delete data.sheetSyncUpdatedAt;
+        }
+        return [{ workspace_owner_id: ownerId, record_id: row.record_id, search_key: `${data.sku || ""} ${data.name || ""} ${data.category || ""}`.toLowerCase(), data, updated_at: now }];
       });
       const recordsForSheet = records.filter((record) => updateById.get(String(record.record_id))?.writeToSheet !== false);
       // The Google Stock Master is written only for an actual available-stock

@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import { after } from "next/server";
 
 export const runtime = "nodejs";
 
@@ -10,12 +11,54 @@ const errorMessage = (error: unknown, fallback: string) => {
   if (error && typeof error === "object" && "message" in error && typeof (error as { message?: unknown }).message === "string") return (error as { message: string }).message;
   return fallback;
 };
+const inventorySearchKey = (data: Record<string, unknown>) => `${String(data.sku || "")} ${String(data.name || "")} ${String(data.category || "")}`.toLowerCase();
+
+async function markSheetSyncFailure(db: any, ownerId: string, records: any[], transactionId: string, message: string) {
+  const { data: liveRows } = await db.from("crm_stock_inventory").select("record_id, data").eq("workspace_owner_id", ownerId).in("record_id", records.map((record) => String(record.record_id)));
+  const updates = (liveRows || []).flatMap((row: any) => {
+    const data = row.data || {};
+    if (data.sheetSyncToken !== transactionId) return [];
+    const next = { ...data, sheetSyncPending: true, sheetSyncError: message, sheetSyncUpdatedAt: new Date().toISOString() };
+    return [{ workspace_owner_id: ownerId, record_id: row.record_id, search_key: inventorySearchKey(next), data: next, updated_at: new Date().toISOString() }];
+  });
+  if (updates.length) await db.from("crm_stock_inventory").upsert(updates, { onConflict: "workspace_owner_id,record_id" });
+}
+
+function scheduleStockMasterSync(request: Request, serviceKey: string, ownerId: string, records: any[], transactionId: string, db: any) {
+  if (!records.length) return;
+  const origin = new URL(request.url).origin;
+  after(async () => {
+    try {
+      const response = await fetch(`${origin}/api/import/google-product-master`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "x-geebee-internal-stock-sync": serviceKey,
+          "x-geebee-workspace-owner": ownerId,
+        },
+        body: JSON.stringify({ stockUpdates: records.map((record) => ({ id: record.record_id, availableQuantity: Number(record.data?.availableQuantity || 0), reservedStock: Number(record.data?.reservedStock || 0), sheetSyncToken: transactionId, writeToSheet: true })) }),
+      });
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(String(result.error || "Google Stock Master did not accept the update."));
+      }
+    } catch (error) {
+      await markSheetSyncFailure(db, ownerId, records, transactionId, errorMessage(error, "Google Stock Master sync failed."));
+    }
+  });
+}
 
 async function administrator(request: Request) {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-  if (!url || !serviceKey || !token) throw new Error("Sign in again before moving inventory.");
+  const internalOwnerId = request.headers.get("x-geebee-workspace-owner")?.trim();
+  if (!url || !serviceKey) throw new Error("Sign in again before moving inventory.");
+  if (request.headers.get("x-geebee-internal-stock-sync") === serviceKey && internalOwnerId) {
+    const db = createClient(url, serviceKey, { auth: { persistSession: false } });
+    return { db, ownerId: internalOwnerId, email: "system@geebee.local" };
+  }
+  if (!token) throw new Error("Sign in again before moving inventory.");
   const db = createClient(url, serviceKey, { auth: { persistSession: false } });
   const { data: userData, error } = await db.auth.getUser(token);
   const email = userData.user?.email;
@@ -41,6 +84,19 @@ export async function GET(request: Request) {
     if (sku) query = query.eq("sku_id", sku);
     const { data, error } = await query;
     if (error) throw error;
+    // Any failed/unfinished background Sheet mirror gets another attempt the
+    // next time an approved user opens CRM. Ledger balances remain source of
+    // truth throughout; this only catches Stock Master up.
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (serviceKey) {
+      const { data: stockRows } = await db.from("crm_stock_inventory").select("record_id, data").eq("workspace_owner_id", ownerId).limit(50000);
+      const pendingGroups = new Map<string, any[]>();
+      (stockRows || []).forEach((row: any) => {
+        const token = String(row.data?.sheetSyncToken || "");
+        if (row.data?.sheetSyncPending && token) pendingGroups.set(token, [...(pendingGroups.get(token) || []), row]);
+      });
+      pendingGroups.forEach((records, transactionId) => scheduleStockMasterSync(request, serviceKey, ownerId, records, transactionId, db));
+    }
     return Response.json({ ledger: data || [] });
   } catch (error) {
     console.error("Inventory ledger load failed", error);
@@ -51,6 +107,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     const { db, ownerId, email } = await administrator(request);
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
     const body = await request.json();
     const transactionId = String(body?.transactionId || "").trim();
     const orderId = String(body?.orderId || "").trim();
@@ -78,7 +135,17 @@ export async function POST(request: Request) {
     const skuIds = safeLines.map((line) => line.sku);
     const { data: inventory, error: inventoryError } = await db.from("crm_stock_inventory").select("record_id, data").eq("workspace_owner_id", ownerId).in("record_id", (movements || []).map((movement: any) => String(movement.product_record_id)));
     if (inventoryError) throw inventoryError;
-    return Response.json({ movements: movements || [], products: (inventory || []).map((row: any) => ({ id: row.record_id, ...row.data })), skuIds });
+    const syncRequestedAt = new Date().toISOString();
+    const pendingRecords = (inventory || []).map((row: any) => {
+      const data = { ...(row.data || {}), sheetSyncPending: true, sheetSyncError: "", sheetSyncToken: transactionId, sheetSyncUpdatedAt: syncRequestedAt };
+      return { workspace_owner_id: ownerId, record_id: row.record_id, search_key: inventorySearchKey(data), data, updated_at: syncRequestedAt };
+    });
+    if (pendingRecords.length) {
+      const { error: pendingError } = await db.from("crm_stock_inventory").upsert(pendingRecords, { onConflict: "workspace_owner_id,record_id" });
+      if (pendingError) throw pendingError;
+    }
+    if (serviceKey) scheduleStockMasterSync(request, serviceKey, ownerId, pendingRecords, transactionId, db);
+    return Response.json({ movements: movements || [], products: pendingRecords.map((row: any) => ({ id: row.record_id, ...row.data })), skuIds, sheetSyncPending: pendingRecords.length > 0 });
   } catch (error) {
     console.error("Inventory ledger transaction failed", error);
     return Response.json({ error: errorMessage(error, "Inventory movement could not be saved. Run the inventory-ledger SQL setup first.") }, { status: 400 });

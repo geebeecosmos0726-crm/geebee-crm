@@ -42,22 +42,19 @@ const productNameOnly = (value: unknown) => {
 // renamed, resolve it once and continue safely rather than guessing.
 const masterTabCache = new Map<string, { title: string; expiresAt: number }>();
 async function getMasterTabTitle(sheets: ReturnType<typeof google.sheets>, spreadsheetId: string) {
-  const cached = masterTabCache.get(spreadsheetId);
-  if (cached && cached.expiresAt > Date.now()) return cached.title;
-  const preferred = process.env.GOOGLE_PRODUCT_MASTER_SHEET_NAME || DEFAULT_PRODUCT_MASTER_TAB;
-  try {
-    await sheets.spreadsheets.values.get({ spreadsheetId, range: quoteRange(preferred), fields: "range" });
-    masterTabCache.set(spreadsheetId, { title: preferred, expiresAt: Date.now() + 10 * 60_000 });
-    return preferred;
-  } catch {
-    const metadata = await sheets.spreadsheets.get({ spreadsheetId, fields: "sheets.properties" });
-    const selected = (metadata.data.sheets || []).find((sheet) => /^(product stock inventory|product master)$/i.test(sheet.properties?.title || "")) || metadata.data.sheets?.[0];
-    const title = selected?.properties?.title;
-    if (!title) throw new Error("The Google Stock Master has no worksheet.");
-    masterTabCache.set(spreadsheetId, { title, expiresAt: Date.now() + 10 * 60_000 });
-    return title;
-  }
+  const metadata = await sheets.spreadsheets.get({ spreadsheetId, fields: "sheets.properties" });
+  const selected = (metadata.data.sheets || []).find((sheet) => /^(product stock inventory|product master)$/i.test(sheet.properties?.title || "")) || metadata.data.sheets?.[0];
+  const title = selected?.properties?.title;
+  if (!title) throw new Error("The Google Stock Master has no worksheet.");
+  masterTabCache.set(spreadsheetId, { title, expiresAt: Date.now() + 10 * 60_000 });
+  return title;
 }
+const likelyMasterTabTitle = (spreadsheetId: string) => {
+  const cached = masterTabCache.get(spreadsheetId);
+  return cached && cached.expiresAt > Date.now()
+    ? cached.title
+    : process.env.GOOGLE_PRODUCT_MASTER_SHEET_NAME || DEFAULT_PRODUCT_MASTER_TAB;
+};
 
 async function administrator(request: Request, url: string, serviceKey: string, allowMember = false) {
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
@@ -319,8 +316,19 @@ export async function PATCH(request: Request) {
         if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
         const auth = new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
         const sheets = google.sheets({ version: "v4", auth });
-        const title = await getMasterTabTitle(sheets, sheetId);
-        const values = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
+        let title = likelyMasterTabTitle(sheetId);
+        let values;
+        try {
+          // Normal path: one Sheet read. We do not spend a separate request
+          // merely to prove the well-known tab name exists.
+          values = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
+          masterTabCache.set(sheetId, { title, expiresAt: Date.now() + 10 * 60_000 });
+        } catch {
+          // A renamed tab is rare. Resolve it only after the direct read has
+          // failed, then retry using the verified title.
+          title = await getMasterTabTitle(sheets, sheetId);
+          values = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
+        }
         const sheetRows = (values.data.values || []).map((row) => Array.isArray(row) ? row.map(display) : []);
         const headerRowIndex = sheetRows.findIndex((row) => headerIndex(row, ["skuid", "sku"]) >= 0 && headerIndex(row, ["availablestock", "availablequantity", "stock"]) >= 0);
         const headerRow = headerRowIndex >= 0 ? sheetRows[headerRowIndex] : undefined;

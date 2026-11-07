@@ -88,6 +88,21 @@ const memberModuleAccess = (tokens: string[] | undefined, module: CrmModule): Mo
 type AccessRequest = { user_id: string; full_name: string; phone: string; email: string; created_at: string };
 type AuditEvent = { id: number; actor_email: string; action: string; module: string; details: string; created_at: string };
 type ProductStockMovement = { orderId: string; client?: string; direction: "Dispatch" | "Return"; sku: string; product: string; quantity: number; before: number; after: number };
+type InventoryLedgerEntry = {
+  id: number;
+  transaction_id: string;
+  reference_transaction_id?: string | null;
+  order_id: string;
+  sku_id: string;
+  product_record_id: string;
+  transaction_type: "Dispatch" | "Reversal";
+  occurred_at: string;
+  quantity: number;
+  signed_quantity: number;
+  previous_available: number;
+  new_available: number;
+  actor_email: string;
+};
 type ConfirmedOrderProductChange = { sku: string; product: string; change: "Confirmed" | "Added" | "Removed" | "Quantity increased" | "Quantity reduced"; before: number; after: number };
 type Order = {
   id: string;
@@ -120,6 +135,11 @@ type Order = {
   // Immutable quantities deducted when the order entered Dispatch Plan. These
   // are the only quantities allowed to be added back on a Dispatch reversal.
   dispatchStockLines?: ProductLine[];
+  // Ledger identifiers are immutable. They make retrying a network request
+  // harmless and tie a reversal to exactly one original dispatch.
+  inventoryDispatchTransactionId?: string;
+  inventoryDispatchCycle?: number;
+  inventoryReversalTransactionId?: string;
   dispatchedAt?: string;
   dispatchReversedAt?: string;
   cancelledFromDispatch?: boolean;
@@ -1023,6 +1043,7 @@ export default function Home() {
     [members, setMembers] = useState<WorkspaceMember[]>([]),
     [accessRequests, setAccessRequests] = useState<AccessRequest[]>([]),
     [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]),
+    [inventoryLedger, setInventoryLedger] = useState<InventoryLedgerEntry[]>([]),
     [clientProfile, setClientProfile] = useState<Client | null>(null),
     [catalogueAttentionOnly, setCatalogueAttentionOnly] = useState(false),
     [notificationsOpen, setNotificationsOpen] = useState(false),
@@ -1303,6 +1324,21 @@ export default function Home() {
     }, 300);
     return () => { cancelled = true; window.clearTimeout(timer); };
   }, [cloudReady, session?.access_token, catalogueHydrated]);
+  useEffect(() => {
+    if (!cloudReady || !session?.access_token) return;
+    let cancelled = false;
+    fetch("/api/inventory/ledger", { headers: { Authorization: `Bearer ${session.access_token}` } })
+      .then(async (response) => ({ response, result: await response.json().catch(() => ({})) }))
+      .then(({ response, result }) => {
+        // A workspace that has not run the one-time ledger SQL setup keeps
+        // operating normally; dispatch is deliberately blocked until setup
+        // exists rather than falling back to the older unsafe calculation.
+        if (!response.ok || cancelled) return;
+        setInventoryLedger(Array.isArray(result.ledger) ? result.ledger : []);
+      })
+      .catch(() => { /* The movement action gives the clear setup error. */ });
+    return () => { cancelled = true; };
+  }, [cloudReady, session?.access_token]);
   useEffect(() => {
     // Dispatch changes product stock in the dedicated Product / SKU table.
     // Persist only the quantities that actually changed, after the initial
@@ -1626,7 +1662,75 @@ export default function Home() {
     logActivity("Confirmed order returned to Draft", "Orders", `${order.id} · ${confirmationReference} sent back to Orders`);
     flash(`${order.id} (${confirmationReference}) returned to Orders. Its linked backorder and related records were removed, and all stock reservation was released.`);
   };
-  const returnDispatchToConfirmed = (order: Order) => {
+  const applyInventoryLedgerTransaction = async ({
+    transactionId,
+    referenceTransactionId,
+    order,
+    transactionType,
+    lines,
+    allowNegativeSkus = [],
+  }: {
+    transactionId: string;
+    referenceTransactionId?: string;
+    order: Order;
+    transactionType: "Dispatch" | "Reversal";
+    lines: ProductLine[];
+    allowNegativeSkus?: string[];
+  }) => {
+    if (!session?.access_token) throw new Error("Sign in again before moving inventory.");
+    const grouped = new Map<string, ProductLine>();
+    lines.forEach((line) => {
+      // Ledger identity is intentionally exact apart from case/outer spaces:
+      // AB 204, AB 204 1 and AB-204-1 can never share a balance.
+      const sku = line.sku.trim().toUpperCase();
+      const prior = grouped.get(sku);
+      grouped.set(sku, prior ? { ...prior, quantity: prior.quantity + line.quantity } : { ...line, sku });
+    });
+    const response = await fetch("/api/inventory/ledger", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+      body: JSON.stringify({
+        transactionId,
+        referenceTransactionId,
+        orderId: order.id,
+        transactionType,
+        lines: [...grouped.values()].map((line) => ({ sku: line.sku, quantity: line.quantity })),
+        allowNegativeSkus: allowNegativeSkus.map((sku) => sku.trim().toUpperCase()),
+      }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || "Inventory movement could not be recorded.");
+    const products = (result.products || []) as CatalogueItem[];
+    // The ledger is committed first. Mirror the exact resulting balances to
+    // Stock Master next; retrying the same transaction ID is safe if Sheets
+    // is temporarily unavailable because the ledger call is idempotent.
+    if (products.length) {
+      const mirror = await fetch("/api/import/google-product-master", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ stockUpdates: products.map((product) => ({ id: product.id, availableQuantity: availableStock(product), reservedStock: product.reservedStock || 0, writeToSheet: true })) }),
+      });
+      if (!mirror.ok) {
+        const mirrorResult = await mirror.json().catch(() => ({}));
+        throw new Error(mirrorResult.error || "Inventory was recorded, but Stock Master could not be updated. Retry the same stage action to finish the Sheet update safely.");
+      }
+    }
+    if (products.length) {
+      const byId = new Map(products.map((product) => [String(product.id), product]));
+      products.forEach((product) => inventorySnapshots.current.set(String(product.id), JSON.stringify({ availableQuantity: availableStock(product), reservedStock: product.reservedStock || 0 })));
+      setCatalogue((current) => current.map((product) => byId.has(String(product.id)) ? { ...product, ...byId.get(String(product.id)) } : product));
+    }
+    const movements = (result.movements || []) as InventoryLedgerEntry[];
+    if (movements.length) {
+      setInventoryLedger((current) => {
+        const next = new Map(current.map((entry) => [String(entry.id), entry]));
+        movements.forEach((entry) => next.set(String(entry.id), entry));
+        return [...next.values()].sort((a, b) => a.occurred_at.localeCompare(b.occurred_at) || a.id - b.id);
+      });
+    }
+    return movements;
+  };
+  const returnDispatchToConfirmed = async (order: Order) => {
     if (order.status !== "Dispatch plan") return;
     if (order.dispatchReversedAt) { flash(`${order.id} has already had its dispatch stock returned once. No stock was changed.`); return; }
     if (!window.confirm(`Return ${order.id} to Confirmed Orders? Its dispatched quantity will be restored to available stock and reserved again.`)) return;
@@ -1637,20 +1741,28 @@ export default function Home() {
     const first = lines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
     const restoredBySku = new Map<string, ProductLine>();
     dispatchedSnapshot.forEach((line) => { const key = skuKey(line.sku); const prior = restoredBySku.get(key); restoredBySku.set(key, prior ? { ...prior, quantity: prior.quantity + line.quantity } : { ...line }); });
-    const stockMovements = [...restoredBySku.values()].map((line) => {
-      const product = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));
-      const before = product ? availableStock(product) : 0;
-      return { orderId: order.id, client: order.client, direction: "Return" as const, sku: line.sku, product: line.product || product?.name || "", quantity: line.quantity, before, after: before + line.quantity };
-    });
-    if (order.inventoryCommitted) setCatalogue((current) => current.map((product) => {
-      const quantity = dispatchedSnapshot.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      return quantity ? { ...product, availableQuantity: availableStock(product) + quantity, reservedStock: (product.reservedStock || 0) + quantity } : product;
-    }));
+    const dispatchTransactionId = order.inventoryDispatchTransactionId;
+    if (order.inventoryCommitted && !dispatchTransactionId) {
+      flash(`${order.id} was dispatched before the new SKU ledger started. Its current balance is the opening balance, so it cannot be automatically reversed. Review it once and create a new confirmed order if stock must be moved.`);
+      return;
+    }
+    const reversalTransactionId = order.inventoryReversalTransactionId || `reversal:${dispatchTransactionId}`;
+    try {
+      if (order.inventoryCommitted) await applyInventoryLedgerTransaction({
+        transactionId: reversalTransactionId,
+        referenceTransactionId: dispatchTransactionId,
+        order,
+        transactionType: "Reversal",
+        lines: [...restoredBySku.values()],
+      });
+    } catch (error) {
+      flash(error instanceof Error ? error.message : "Dispatch reversal could not be saved.");
+      return;
+    }
     const restoredQuantity = dispatchedSnapshot.reduce((sum, line) => sum + line.quantity, 0);
-    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...first, products: lines, approvedProducts: lines, status: "Confirmed", inventoryCommitted: false, dispatchReversedAt: new Date().toISOString() } : item));
+    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...first, products: lines, approvedProducts: lines, status: "Confirmed", inventoryCommitted: false, inventoryReversalTransactionId: reversalTransactionId, dispatchReversedAt: new Date().toISOString() } : item));
     logActivity("Returned dispatch order to Confirmed Orders", "Dispatch Plan", `${order.id} · restored ${restoredQuantity.toLocaleString("en-IN")} unit(s) from saved dispatch quantity`);
-    if (order.inventoryCommitted && stockMovements.length) pendingStockMovementAudits.current.push({ orderId: order.id, direction: "Return", lines: stockMovements });
-    flash(`${order.id} returned to Confirmed Orders. Exactly ${restoredQuantity.toLocaleString("en-IN")} dispatched unit(s) were added back to Product / SKUs and the Stock Master sheet.`);
+    flash(`${order.id} returned to Confirmed Orders. Exactly ${restoredQuantity.toLocaleString("en-IN")} dispatched unit(s) were added back through the SKU ledger.`);
   };
   const markOrderSentToCustomer = (order: Order) => {
     if (order.status !== "Dispatch plan") return;
@@ -1721,7 +1833,7 @@ export default function Home() {
     const fullyShortLines = shortages.filter((shortage) => shortage.quantity === (requestedLines.find((line) => skuKey(line.sku) === skuKey(shortage.sku))?.quantity || 0));
     flash(shortages.length ? `${order.id} confirmed; CRM reserved Sheet stock and created a backorder.${fullyShortLines.length ? ` No free stock was available for: ${fullyShortLines.map((line) => line.sku).join(", ")}.` : ""}` : `${order.id} confirmed and CRM stock reserved.`);
   };
-  const pushToDispatchPlan = (order: Order) => {
+  const pushToDispatchPlan = async (order: Order) => {
     if (order.status !== "Confirmed") return;
     // Current confirmations already store MIX orders as their component SKUs.
     // Re-expand here as well so an older confirmed order that still contains
@@ -1753,27 +1865,33 @@ export default function Home() {
     if (!window.confirm(`Send ${order.id} to Dispatch Plan? Any quantity reduced by Operations will be released from CRM reservation.`)) return;
     if (!beginOrderTransition("dispatch", order.id)) { flash(`${order.id} is already being sent to Dispatch Plan. Please wait.`); return; }
     const dispatchedBySku = summariseBySku(dispatchLines);
-    const stockMovements = [...dispatchedBySku.values()].map((line) => {
-      const product = catalogue.find((item) => skuKey(item.sku) === skuKey(line.sku));
-      const before = product ? availableStock(product) : 0;
-      return { orderId: order.id, client: order.client, direction: "Dispatch" as const, sku: line.sku, product: line.product || product?.name || "", quantity: line.quantity, before, after: before - line.quantity };
-    });
+    const nextDispatchCycle = (order.inventoryDispatchCycle || 0) + 1;
+    const dispatchTransactionId = order.inventoryDispatchTransactionId && !order.dispatchReversedAt
+      ? order.inventoryDispatchTransactionId
+      : `dispatch:${order.id}:${nextDispatchCycle}`;
+    const editedKeys = new Set(order.draftEditedQuantityKeys || []);
+    const allowNegativeSkus = dispatchLines.filter((line) => editedKeys.has(draftQuantityLineKey(line))).map((line) => line.sku);
+    try {
+      await applyInventoryLedgerTransaction({
+        transactionId: dispatchTransactionId,
+        order,
+        transactionType: "Dispatch",
+        lines: [...dispatchedBySku.values()],
+        allowNegativeSkus,
+      });
+    } catch (error) {
+      flash(error instanceof Error ? error.message : "Dispatch stock movement could not be saved.");
+      return;
+    }
+    // The ledger updates physical Available stock. Confirmed reservation is
+    // released only after that atomic movement succeeds.
     setCatalogue((current) => current.map((product) => {
       const dispatched = dispatchLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      const released = releasedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      if (!dispatched && !released) return product;
-      return {
-        ...product,
-        // Available Quantity changes only when Operations takes the order into
-        // Dispatch Plan. Confirmed Orders remain a reservation only.
-        availableQuantity: availableStock(product) - dispatched,
-        reservedStock: Math.max(0, (product.reservedStock || 0) - dispatched - released),
-      };
+      return dispatched ? { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - dispatched) } : product;
     }));
     const first = dispatchLines[0] || approvedLines[0];
-    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, dispatchStockLines: dispatchLines.map((line) => ({ ...line })), dispatchedAt: new Date().toISOString(), dispatchReversedAt: undefined, status: "Dispatch plan", inventoryCommitted: true } : item));
+    setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, dispatchStockLines: dispatchLines.map((line) => ({ ...line })), inventoryDispatchTransactionId: dispatchTransactionId, inventoryDispatchCycle: nextDispatchCycle, inventoryReversalTransactionId: undefined, dispatchedAt: new Date().toISOString(), dispatchReversedAt: undefined, status: "Dispatch plan", inventoryCommitted: true } : item));
     logActivity("Sent confirmed order to Dispatch Plan", "Dispatch Plan", releasedLines.length ? `${order.id} · reduced CRM reservation released` : order.id);
-    if (stockMovements.length) pendingStockMovementAudits.current.push({ orderId: order.id, direction: "Dispatch", lines: stockMovements });
     flash(releasedLines.length ? `${order.id} sent to Dispatch Plan; reduced quantities were released from CRM reservation.` : `${order.id} sent to Dispatch Plan for Operations.`);
   };
   const navigationGroups = [
@@ -1965,7 +2083,7 @@ export default function Home() {
             remove={(ids) => { setCatalogue((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed catalogue product", "Catalogue", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} product${ids.length === 1 ? "" : "s"} removed from catalogue`); }}
           />
         )}{" "}
-        {section === "Product Stock Inventory" && <ProductStockInventoryPanel session={session} canApply={isAdmin} auditEvents={auditEvents} orders={orders} releaseAllReservations={releaseAllReservations} onAudit={logActivity} query={search} onProductsSynced={setCatalogue} onLiveBackup={queueGoogleSheetLiveBackup} />}{" "}
+        {section === "Product Stock Inventory" && <ProductStockInventoryPanel session={session} canApply={isAdmin} auditEvents={auditEvents} inventoryLedger={inventoryLedger} orders={orders} releaseAllReservations={releaseAllReservations} onAudit={logActivity} query={search} onProductsSynced={setCatalogue} onLiveBackup={queueGoogleSheetLiveBackup} />}{" "}
         {section === "Categories" && <ProductStockCategoriesPanel session={session} query={search} openCategory={(category) => { setSection("Product Stock Inventory"); setSectionSearches((current) => ({ ...current, "Product Stock Inventory": category })); }} />}{" "}
         {section === "Fetch Orders" && <GoogleSheetOrderFetch existingOrders={orders} addOrders={setOrders} onAudit={logActivity} showDraftOrders={() => { setSectionSearches((current) => ({ ...current, Orders: "" })); setSection("Orders"); }} />}{" "}
         {section === "Transporters" && <TransportersPanel transporters={transporters.filter((item) => `${item.name} ${item.contact} ${item.phone} ${item.city || ""} ${item.area || ""}`.toLowerCase().includes(search.toLowerCase()))} edit={(item) => show("transporter", item)} add={() => show("transporter")} remove={(ids) => { markForCloudDeletion("crm_transporters", ids); setTransporters((current) => current.filter((item) => !ids.includes(item.id))); logActivity("Removed transporter", "Transporters", ids.join(", ")); syncGoogleSheetAfterDelete(); flash(`${ids.length} transporter${ids.length === 1 ? "" : "s"} removed`); }} />}{" "}
@@ -2900,9 +3018,18 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit, showDraftOr
   return <section className="panel transfer-panel"><div className="panel-head"><div><span className="overline">CONNECTED ORDER SHEET</span><h2>Fetch new orders from Google Sheets</h2><p>Reads your existing order tabs, such as <b>E-404 SHYAM BALLOON PATNA</b> or <b>E-269 (OR) SHYAM BALLOON STORE, PATNA</b>. Only order IDs not already in the CRM are imported, always as Draft orders. Unmatched customer names stay on the draft only until it is saved.</p></div><button className="primary" type="button" onClick={fetchOrders} disabled={loading}>{loading ? "Fetching orders…" : "Fetch new orders"}</button></div>{message && <p className="transfer-message">{message}</p>}{details.length > 0 && <div className="transfer-fields"><b>Skipped tabs</b><br/>{details.join(" · ")}</div>}</section>;
 }
 
-function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }: { sku: string; auditEvents: AuditEvent[]; orders: Order[]; currentAvailable: number }) {
+function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable, ledger = [] }: { sku: string; auditEvents: AuditEvent[]; orders: Order[]; currentAvailable: number; ledger?: InventoryLedgerEntry[] }) {
   type RecordedMovement = ProductStockMovement & { actor: string; createdAt: string; auditId?: number; derivedFromOrder?: boolean };
   type RecordedOrderChange = ConfirmedOrderProductChange & { orderId: string; client: string; actor: string; createdAt: string };
+  // The ledger is the sole source of truth after the SKU ledger cutover. It
+  // never mixes legacy audit estimates with current movements.
+  const exactSku = sku.trim().toUpperCase();
+  const ledgerRows = ledger.filter((entry) => entry.sku_id.trim().toUpperCase() === exactSku)
+    .sort((a, b) => a.occurred_at.localeCompare(b.occurred_at) || a.id - b.id);
+  if (ledgerRows.length) {
+    const opening = ledgerRows[0].previous_available;
+    return <section className="product-stock-history"><div><span className="overline">THIS SKU · TRANSACTION LEDGER</span><h3>Inventory transaction history</h3><p>Opening balance: <b>{Number(opening).toLocaleString("en-IN")}</b> · Current available: <b>{currentAvailable.toLocaleString("en-IN")}</b>. Every row is processed in this exact order.</p></div><div className="table-wrap"><table className="records"><thead><tr><th>TIME / SEQ.</th><th>ORDER</th><th>TYPE</th><th>CHANGE</th><th>PREVIOUS</th><th>AVAILABLE</th><th>REFERENCE</th></tr></thead><tbody>{ledgerRows.map((entry) => <tr key={entry.id}><td><b>#{entry.id}</b><small className="table-subtext">{new Date(entry.occurred_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></td><td><b>{entry.order_id}</b></td><td>{entry.transaction_type}</td><td className={entry.signed_quantity < 0 ? "product-history-change negative" : "product-history-change positive"}><b>{entry.signed_quantity < 0 ? "−" : "+"}{Math.abs(Number(entry.quantity)).toLocaleString("en-IN")}</b></td><td>{Number(entry.previous_available).toLocaleString("en-IN")}</td><td><b>{Number(entry.new_available).toLocaleString("en-IN")}</b></td><td>{entry.reference_transaction_id || "—"}</td></tr>)}</tbody></table></div></section>;
+  }
   const clientByOrder = new Map(orders.map((order) => [order.id, order.client]));
   const auditedMovements = auditEvents.flatMap((event) => {
     if (event.action !== "Recorded Product / SKU stock movement") return [] as RecordedMovement[];
@@ -2955,7 +3082,7 @@ function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }:
   return <section className="product-stock-history"><div><span className="overline">THIS SKU · ORDER HISTORY</span><h3>Order and stock history</h3><p>{startingBalance === undefined ? "Actual stock movements are shown below. A reliable opening balance was not recorded for the older history." : <>Tracked balance began at <b>{startingBalance.toLocaleString("en-IN")}</b>; order-history balance is <b>{(runningBalance ?? startingBalance).toLocaleString("en-IN")}</b>; current CRM available balance is <b>{currentAvailable.toLocaleString("en-IN")}</b>.</>}</p></div>{orderChanges.length > 0 && <><h4>Confirmed-order changes</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>CHANGE</th><th>QTY</th><th>BY</th></tr></thead><tbody>{orderChanges.map((change, index) => <tr key={`${change.orderId}-${change.createdAt}-${index}`}><td><b>{change.orderId}</b><small className="table-subtext">{new Date(change.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></td><td>{change.client}</td><td><span className={changeClass(change.change)}>{change.change}</span></td><td className={changeClass(change.change)}><b>{change.change === "Confirmed" ? change.after.toLocaleString("en-IN") : `${change.before.toLocaleString("en-IN")} → ${change.after.toLocaleString("en-IN")}`}</b></td><td>{change.actor}</td></tr>)}</tbody></table></div></>}{calculatedRows.length > 0 && <><h4>Actual stock movement</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>SUBTRACTED</th><th>REMAINING</th><th>REVERSED</th><th>REMAINING</th></tr></thead><tbody>{calculatedRows.map((row) => <tr key={row.orderId}><td><b>{row.orderId}</b>{row.dispatch?.derivedFromOrder && <small className="table-subtext">Recovered from saved Dispatch Plan</small>}</td><td>{row.client}</td><td>{row.dispatch ? <b>−{row.dispatch.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.dispatch ? <><b>{row.afterDispatch?.toLocaleString("en-IN") ?? "—"}</b>{row.dispatch.createdAt && <small className="table-subtext">{new Date(row.dispatch.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small>}</> : "—"}</td><td>{row.returned ? <b>+{row.returned.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.returned ? <><b>{row.afterReturn?.toLocaleString("en-IN") ?? "—"}</b><small className="table-subtext">{new Date(row.returned.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td></tr>)}</tbody></table></div></>}</section>;
 }
 
-function ProductStockInventoryPanel({ session, canApply, auditEvents, orders, releaseAllReservations, onAudit, query, onProductsSynced, onLiveBackup }: { session: Session; canApply: boolean; auditEvents: AuditEvent[]; orders: Order[]; releaseAllReservations: () => void; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>>; onLiveBackup: () => void }) {
+function ProductStockInventoryPanel({ session, canApply, auditEvents, inventoryLedger, orders, releaseAllReservations, onAudit, query, onProductsSynced, onLiveBackup }: { session: Session; canApply: boolean; auditEvents: AuditEvent[]; inventoryLedger: InventoryLedgerEntry[]; orders: Order[]; releaseAllReservations: () => void; onAudit: (action: string, module: string, details: string) => void; query: string; onProductsSynced: React.Dispatch<React.SetStateAction<CatalogueItem[]>>; onLiveBackup: () => void }) {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [items, setItems] = useState<CatalogueItem[]>(() => readProductStockCache(session.user.id));
@@ -2982,7 +3109,9 @@ function ProductStockInventoryPanel({ session, canApply, auditEvents, orders, re
     try {
       const passcode = mode === "sync" && !background ? window.prompt("Stock Master sync passcode: GeeBee2026\n\nEnter it to update CRM data from the Google Sheet.") : "";
       if (mode === "sync" && !background && passcode === null) { setLoading(false); return; }
-      const activeDispatchOrders = orders.filter((order) => order.inventoryCommitted && ["Dispatch plan", "Sent to customer", "Received by customer"].includes(order.status));
+      // Ledger-managed stock already carries every dispatch exactly once, so
+      // it never needs the older YES/NO active-dispatch adjustment prompt.
+      const activeDispatchOrders = inventoryLedger.length ? [] : orders.filter((order) => order.inventoryCommitted && ["Dispatch plan", "Sent to customer", "Received by customer"].includes(order.status));
       const activeDispatchLines = activeDispatchOrders.flatMap((order) => (order.dispatchStockLines?.length ? order.dispatchStockLines : linesFor(order)).map((line) => ({ sku: line.sku, product: line.product, quantity: line.quantity })));
       let sheetIncludesActiveDispatch = true;
       if (mode === "sync" && !background) {
@@ -3058,8 +3187,21 @@ function ProductStockCategoriesPanel({ session, query, openCategory }: { session
 
 function StockInventoryModal({ item, auditEvents, orders, close, save }: { item: CatalogueItem; auditEvents: AuditEvent[]; orders: Order[]; close: () => void; save: (item: CatalogueItem) => void }) {
   const [form, setForm] = useState(item);
+  const [inventoryLedger, setInventoryLedger] = useState<InventoryLedgerEntry[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const { data } = await supabase?.auth.getSession() || { data: { session: null } };
+      const token = data.session?.access_token;
+      if (!token) return;
+      const response = await fetch(`/api/inventory/ledger?sku=${encodeURIComponent(item.sku)}`, { headers: { Authorization: `Bearer ${token}` } });
+      const result = await response.json().catch(() => ({}));
+      if (!cancelled && response.ok) setInventoryLedger(Array.isArray(result.ledger) ? result.ledger : []);
+    })();
+    return () => { cancelled = true; };
+  }, [item.sku]);
   const update = <K extends keyof CatalogueItem>(key: K, value: CatalogueItem[K]) => setForm((current) => ({ ...current, [key]: value }));
-  return <Shell close={close}><div className="order-modal-head"><div className="modal-mark"><PackageCheck size={22}/></div><div><span className="overline">TEST STOCK INVENTORY</span><h2>Edit product details</h2><p>Available Stock is locked here because it is updated only from the Google Sheet.</p></div></div><div className="modal-section-title">Product details</div><div className="form-row"><label>Product name<input value={form.name} onChange={(event) => update("name", event.target.value)} required/></label><label>SKU ID<input value={form.sku} onChange={(event) => update("sku", event.target.value.toUpperCase())} required/></label></div><div className="form-row"><label>Category<input value={form.category} onChange={(event) => update("category", event.target.value)}/></label><label>Unit<input value={form.unit || ""} onChange={(event) => update("unit", event.target.value)} placeholder="Piece"/></label></div><div className="form-row"><label>Inner qty<input value={form.innerQty || ""} onChange={(event) => update("innerQty", event.target.value)}/></label><label>Outer qty<input value={form.outerQty || ""} onChange={(event) => update("outerQty", event.target.value)}/></label></div><div className="form-row"><label>Selling price (₹)<input type="number" min="0" value={form.unitPrice || ""} onChange={(event) => update("unitPrice", Number(event.target.value))}/></label><label>Low-stock alert<input type="number" min="0" value={form.reorderThreshold ?? ""} onChange={(event) => update("reorderThreshold", Number(event.target.value))}/></label></div><label>Image URL<input value={form.image || ""} onChange={(event) => update("image", event.target.value)} placeholder="https://…"/></label><div className="stock-calculation"><span>Available stock <b>{availableStock(item).toLocaleString("en-IN")}</b></span><span>Controlled by Google Sheet</span></div><ProductStockItemHistory sku={item.sku} auditEvents={auditEvents} orders={orders} currentAvailable={availableStock(item)}/><button className="primary modal-submit" type="button" onClick={() => save(form)}>Save product details</button></Shell>;
+  return <Shell close={close}><div className="order-modal-head"><div className="modal-mark"><PackageCheck size={22}/></div><div><span className="overline">SKU INVENTORY</span><h2>Edit product details</h2><p>Available Stock changes only through the SKU transaction ledger after its opening balance is set.</p></div></div><div className="modal-section-title">Product details</div><div className="form-row"><label>Product name<input value={form.name} onChange={(event) => update("name", event.target.value)} required/></label><label>SKU ID<input value={form.sku} onChange={(event) => update("sku", event.target.value.toUpperCase())} required/></label></div><div className="form-row"><label>Category<input value={form.category} onChange={(event) => update("category", event.target.value)}/></label><label>Unit<input value={form.unit || ""} onChange={(event) => update("unit", event.target.value)} placeholder="Piece"/></label></div><div className="form-row"><label>Inner qty<input value={form.innerQty || ""} onChange={(event) => update("innerQty", event.target.value)} /></label><label>Outer qty<input value={form.outerQty || ""} onChange={(event) => update("outerQty", event.target.value)} /></label></div><div className="form-row"><label>Selling price (₹)<input type="number" min="0" value={form.unitPrice || ""} onChange={(event) => update("unitPrice", Number(event.target.value))}/></label><label>Low-stock alert<input type="number" min="0" value={form.reorderThreshold ?? ""} onChange={(event) => update("reorderThreshold", Number(event.target.value))}/></label></div><label>Image URL<input value={form.image || ""} onChange={(event) => update("image", event.target.value)} placeholder="https://…"/></label><div className="stock-calculation"><span>Available stock <b>{availableStock(item).toLocaleString("en-IN")}</b></span><span>Ledger controlled</span></div><ProductStockItemHistory sku={item.sku} auditEvents={auditEvents} orders={orders} currentAvailable={availableStock(item)} ledger={inventoryLedger}/><button className="primary modal-submit" type="button" onClick={() => save(form)}>Save product details</button></Shell>;
 }
 
 function InventoryReconciliationPanel({ catalogue, session, canApply, apply, syncMaster, onAudit }: { catalogue: CatalogueItem[]; session: Session; canApply: boolean; apply: (matches: InventoryReconciliation[]) => void; syncMaster: (products: CatalogueItem[]) => void; onAudit: (action: string, module: string, details: string) => void }) {

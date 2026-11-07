@@ -142,6 +142,14 @@ export async function POST(request: Request) {
       if (cleanupError) throw cleanupError;
     }
     const existing = allExisting.filter((record) => !placeholderIds.includes(record.recordId));
+    // Once a SKU has entered the transaction ledger, its saved Available
+    // Quantity is the opening balance plus ledger movements. A later Sheet
+    // metadata sync must not overwrite that balance and replay old stock.
+    const { data: openingRows, error: openingError } = await db.from("crm_inventory_opening_balances")
+      .select("product_record_id").eq("workspace_owner_id", ownerId).limit(100000);
+    // The ledger migration may not yet be installed in an older workspace.
+    // In that case retain the pre-ledger sync behaviour until it is set up.
+    const ledgerManagedRecordIds = openingError ? new Set<string>() : new Set((openingRows || []).map((row: any) => String(row.product_record_id)));
     // When a Sheet is updated while orders are already in Dispatch, the user
     // explicitly tells us whether the Sheet balance includes those dispatches.
     // If it does not, subtract each active dispatch exactly once and write the
@@ -202,9 +210,10 @@ export async function POST(request: Request) {
       if (currentRecord) updated += 1; else added += 1;
       const id = typeof current.id === "number" ? current.id : Date.now() + index;
       const activeDispatchQuantity = dispatchForSource(source);
+      const keepLedgerBalance = Boolean(currentRecord && ledgerManagedRecordIds.has(String(currentRecord.recordId)));
       const data: ProductData = {
         ...current, id, sourceRow: source.row, sku: source.sku.trim().toUpperCase(), name: source.name.trim(), category: source.category || String(current.category || "Uncategorised"), unit: source.unit || String(current.unit || "Piece"),
-        innerQty: source.innerQty, outerQty: source.outerQty, cartonQty: source.outerQty, unitPrice: source.sellingPrice, availableQuantity: source.availableStock - activeDispatchQuantity,
+        innerQty: source.innerQty, outerQty: source.outerQty, cartonQty: source.outerQty, unitPrice: source.sellingPrice, availableQuantity: keepLedgerBalance ? number(current.availableQuantity) : source.availableStock - activeDispatchQuantity,
         // An empty Image URL in the Sheet is intentional: it clears any
         // previously saved image instead of silently retaining it.
         reorderThreshold: source.lowStockAlert, image: source.imageUrl,

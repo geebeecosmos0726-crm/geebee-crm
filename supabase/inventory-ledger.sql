@@ -121,8 +121,9 @@ begin
   perform pg_advisory_xact_lock(hashtext(p_workspace_owner_id::text));
 
   select count(*) into existing_count
-  from crm_inventory_ledger
-  where workspace_owner_id = p_workspace_owner_id and transaction_id = p_transaction_id;
+  from crm_inventory_ledger as ledger_row
+  where ledger_row.workspace_owner_id = p_workspace_owner_id
+    and ledger_row.transaction_id = p_transaction_id;
   if existing_count > 0 then
     return query
     select l.transaction_id, l.order_id, l.sku_id, l.product_record_id,
@@ -141,9 +142,9 @@ begin
     if requested_sku = '' or requested_quantity <= 0 then
       raise exception 'Every inventory line needs an exact SKU ID and positive quantity.';
     end if;
-    select count(*) into sku_count from crm_stock_inventory
-      where workspace_owner_id = p_workspace_owner_id
-        and upper(btrim(coalesce(data ->> 'sku', ''))) = requested_sku;
+    select count(*) into sku_count from crm_stock_inventory as stock_row
+      where stock_row.workspace_owner_id = p_workspace_owner_id
+        and upper(btrim(coalesce(stock_row.data ->> 'sku', ''))) = requested_sku;
     if sku_count <> 1 then
       raise exception 'SKU % must match exactly one Product / SKU record; found % matches.', requested_sku, sku_count;
     end if;
@@ -153,9 +154,9 @@ begin
   for line in select value from jsonb_array_elements(p_lines) loop
     requested_sku := upper(btrim(line ->> 'sku'));
     requested_quantity := (line ->> 'quantity')::numeric;
-    select record_id, data into inventory_row from crm_stock_inventory
-      where workspace_owner_id = p_workspace_owner_id
-        and upper(btrim(coalesce(data ->> 'sku', ''))) = requested_sku
+    select stock_row.record_id, stock_row.data into inventory_row from crm_stock_inventory as stock_row
+      where stock_row.workspace_owner_id = p_workspace_owner_id
+        and upper(btrim(coalesce(stock_row.data ->> 'sku', ''))) = requested_sku
       for update;
     current_available := coalesce(nullif(inventory_row.data ->> 'availableQuantity', '')::numeric, 0);
     insert into crm_inventory_opening_balances (workspace_owner_id, sku_id, product_record_id, opening_quantity)
@@ -163,19 +164,19 @@ begin
       on conflict (workspace_owner_id, sku_id) do nothing;
 
     if p_transaction_type = 'Reversal' then
-      select quantity into original_quantity from crm_inventory_ledger
-      where workspace_owner_id = p_workspace_owner_id
-        and transaction_id = p_reference_transaction_id
-        and sku_id = requested_sku
-        and transaction_type = 'Dispatch';
+      select ledger_row.quantity into original_quantity from crm_inventory_ledger as ledger_row
+      where ledger_row.workspace_owner_id = p_workspace_owner_id
+        and ledger_row.transaction_id = p_reference_transaction_id
+        and ledger_row.sku_id = requested_sku
+        and ledger_row.transaction_type = 'Dispatch';
       if original_quantity is null then
         raise exception 'No original dispatch exists for % under reference %.', requested_sku, p_reference_transaction_id;
       end if;
-      select coalesce(sum(quantity), 0) into already_reversed from crm_inventory_ledger
-      where workspace_owner_id = p_workspace_owner_id
-        and reference_transaction_id = p_reference_transaction_id
-        and sku_id = requested_sku
-        and transaction_type = 'Reversal';
+      select coalesce(sum(ledger_row.quantity), 0) into already_reversed from crm_inventory_ledger as ledger_row
+      where ledger_row.workspace_owner_id = p_workspace_owner_id
+        and ledger_row.reference_transaction_id = p_reference_transaction_id
+        and ledger_row.sku_id = requested_sku
+        and ledger_row.transaction_type = 'Reversal';
       if requested_quantity > original_quantity - already_reversed then
         raise exception 'Only % units of % remain eligible for reversal from dispatch %.', original_quantity - already_reversed, requested_sku, p_reference_transaction_id;
       end if;
@@ -208,22 +209,24 @@ begin
   for requested_sku in
     select distinct upper(btrim(value ->> 'sku')) from jsonb_array_elements(p_lines)
   loop
-    select opening_quantity into opening from crm_inventory_opening_balances
-      where workspace_owner_id = p_workspace_owner_id and sku_id = requested_sku;
+    select opening_row.opening_quantity into opening from crm_inventory_opening_balances as opening_row
+      where opening_row.workspace_owner_id = p_workspace_owner_id
+        and opening_row.sku_id = requested_sku;
     running := opening;
-    for entry in select * from crm_inventory_ledger
-      where workspace_owner_id = p_workspace_owner_id and sku_id = requested_sku
-      order by occurred_at, id
+    for entry in select ledger_row.* from crm_inventory_ledger as ledger_row
+      where ledger_row.workspace_owner_id = p_workspace_owner_id
+        and ledger_row.sku_id = requested_sku
+      order by ledger_row.occurred_at, ledger_row.id
     loop
-      update crm_inventory_ledger
+      update crm_inventory_ledger as ledger_row
         set previous_available = running, new_available = running + entry.signed_quantity
-        where id = entry.id;
+        where ledger_row.id = entry.id;
       running := running + entry.signed_quantity;
     end loop;
-    update crm_stock_inventory
-      set data = jsonb_set(data, '{availableQuantity}', to_jsonb(running)), updated_at = now()
-      where workspace_owner_id = p_workspace_owner_id
-        and upper(btrim(coalesce(data ->> 'sku', ''))) = requested_sku;
+    update crm_stock_inventory as stock_row
+      set data = jsonb_set(stock_row.data, '{availableQuantity}', to_jsonb(running)), updated_at = now()
+      where stock_row.workspace_owner_id = p_workspace_owner_id
+        and upper(btrim(coalesce(stock_row.data ->> 'sku', ''))) = requested_sku;
   end loop;
 
   return query

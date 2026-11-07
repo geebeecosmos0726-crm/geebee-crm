@@ -615,15 +615,28 @@ const catalogueName = (item: CatalogueItem) => item.name?.trim() || item.descrip
 const catalogueMatchForOrderLine = (line: ProductLine, catalogue: CatalogueItem[]) => {
   const skuMatches = catalogue.filter((item) => skuKey(item.sku) === skuKey(line.sku));
   if (skuMatches.length === 1) return skuMatches[0];
-  const label = line.product.trim().toLocaleLowerCase();
-  if (!label) return undefined;
+  // Some older Sheet imports saved the whole display label in the SKU field
+  // (for example, "AB - 30 GOLDEN"). It is not an SKU, but it can be repaired
+  // safely only when it equals one complete, unique catalogue display label.
+  // This never treats SKU prefixes as matches: AB 204 and AB 204-1 stay distinct.
+  const labels = [line.product, line.sku]
+    .map((value) => skuKey(value))
+    .filter(Boolean);
+  if (!labels.length) return undefined;
   const labelMatches = catalogue.filter((item) => {
     const name = catalogueName(item);
-    return [name, `${item.sku} · ${name}`, `${name} · ${item.sku}`]
-      .some((candidate) => candidate.toLocaleLowerCase() === label);
+    const candidates = [name, `${item.sku} · ${name}`, `${name} · ${item.sku}`, `${item.sku} ${name}`, `${name} ${item.sku}`]
+      .map((candidate) => skuKey(candidate));
+    return labels.some((label) => candidates.includes(label));
   });
   return labelMatches.length === 1 ? labelMatches[0] : undefined;
 };
+const canonicaliseCatalogueOrderLines = (lines: ProductLine[], catalogue: CatalogueItem[]) => lines.map((line) => {
+  const matched = catalogueMatchForOrderLine(line, catalogue);
+  return matched
+    ? { ...line, sku: matched.sku, product: `${matched.sku} · ${catalogueName(matched)}` }
+    : line;
+});
 const productCategories = ["Candles", "Paper Banner", "Ribbon", "Metal & Paper stands", "Cake crown", "Crown & Tiaras", "Led candles", "Balloon pump", "Goggles /LED Goggles", "Caps", "Paper Sets /Props", "Cake topper", "Party popper", "Party items"] as const;
 const categoryImages: Record<(typeof productCategories)[number], string> = {
   "Party popper": "https://gbcosmos.com/wp-content/uploads/2026/09/Party_Poppers.png",
@@ -1679,7 +1692,7 @@ export default function Home() {
   }) => {
     if (!session?.access_token) throw new Error("Sign in again before moving inventory.");
     const grouped = new Map<string, ProductLine>();
-    lines.forEach((line) => {
+    canonicaliseCatalogueOrderLines(lines, catalogue).forEach((line) => {
       // Ledger identity is intentionally exact apart from case/outer spaces:
       // AB 204, AB 204 1 and AB-204-1 can never share a balance.
       const sku = line.sku.trim().toUpperCase();
@@ -1792,7 +1805,7 @@ export default function Home() {
     if (!catalogueHydrated) { flash("Product / SKU inventory is still loading. Please wait a moment, then confirm the order again."); return; }
     const mixExpansion = expandNumberCandleMixLines(linesFor(order), catalogue);
     if (mixExpansion.error) { flash(mixExpansion.error); return; }
-    const requestedLines = mixExpansion.lines;
+    const requestedLines = canonicaliseCatalogueOrderLines(mixExpansion.lines, catalogue);
     if (!requestedLines.length) { flash("Add at least one product line before confirming this order."); return; }
     const missingSkus = [...new Set(requestedLines.filter((line) => !catalogue.some((product) => skuKey(product.sku) === skuKey(line.sku))).map((line) => line.sku || line.product))];
     if (missingSkus.length) { flash(`Cannot confirm ${order.id}: ${missingSkus.join(", ")} is not in Product / SKUs. Add it to the Stock Master first.`); return; }
@@ -1844,7 +1857,7 @@ export default function Home() {
       flash(requestedExpansion.error || "The MIX order could not be expanded into numbered candle SKUs.");
       return;
     }
-    const requestedLines = requestedExpansion.lines;
+    const requestedLines = canonicaliseCatalogueOrderLines(requestedExpansion.lines, catalogue);
     if (!requestedLines.length) { flash(`${order.id} has no stock allocated for dispatch. Its full quantity is currently in Backorders.`); return; }
     const approvedLines = requestedLines;
     // The final visible lines in Confirmed Orders are the only dispatch

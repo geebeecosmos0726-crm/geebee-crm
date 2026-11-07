@@ -4,6 +4,7 @@ import { google } from "googleapis";
 export const runtime = "nodejs";
 
 const DEFAULT_PRODUCT_MASTER_SHEET_ID = "19aIVexyhcLZ1b_QYv7dIZuvwqLzbJkAeFonEKV7ZpmA";
+const DEFAULT_PRODUCT_MASTER_TAB = "Product Stock Inventory";
 const HEADERS = ["SKU ID", "Product Name", "Category", "Unit", "Inner Qty", "Outer Qty", "Selling Price", "Available Stock", "Low Stock Alert", "Image URL"];
 const TEST_ROWS = [
   ["TEST-CRM-001", "Test Party Balloon Set", "Party items", "Piece", "12", "144", "25", "1000", "100", ""],
@@ -34,6 +35,29 @@ const productNameOnly = (value: unknown) => {
   const separator = text.indexOf("·");
   return separator >= 0 ? text.slice(separator + 1).trim() : text;
 };
+
+// A dispatch used to make an additional Google metadata request before every
+// stock movement. The CRM's Stock Master tab has a stable name, so use it
+// directly and cache a renamed tab for warm server instances. If the tab was
+// renamed, resolve it once and continue safely rather than guessing.
+const masterTabCache = new Map<string, { title: string; expiresAt: number }>();
+async function getMasterTabTitle(sheets: ReturnType<typeof google.sheets>, spreadsheetId: string) {
+  const cached = masterTabCache.get(spreadsheetId);
+  if (cached && cached.expiresAt > Date.now()) return cached.title;
+  const preferred = process.env.GOOGLE_PRODUCT_MASTER_SHEET_NAME || DEFAULT_PRODUCT_MASTER_TAB;
+  try {
+    await sheets.spreadsheets.values.get({ spreadsheetId, range: quoteRange(preferred), fields: "range" });
+    masterTabCache.set(spreadsheetId, { title: preferred, expiresAt: Date.now() + 10 * 60_000 });
+    return preferred;
+  } catch {
+    const metadata = await sheets.spreadsheets.get({ spreadsheetId, fields: "sheets.properties" });
+    const selected = (metadata.data.sheets || []).find((sheet) => /^(product stock inventory|product master)$/i.test(sheet.properties?.title || "")) || metadata.data.sheets?.[0];
+    const title = selected?.properties?.title;
+    if (!title) throw new Error("The Google Stock Master has no worksheet.");
+    masterTabCache.set(spreadsheetId, { title, expiresAt: Date.now() + 10 * 60_000 });
+    return title;
+  }
+}
 
 async function administrator(request: Request, url: string, serviceKey: string, allowMember = false) {
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
@@ -295,10 +319,7 @@ export async function PATCH(request: Request) {
         if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
         const auth = new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
         const sheets = google.sheets({ version: "v4", auth });
-        const metadata = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties" });
-        const selected = (metadata.data.sheets || []).find((sheet) => /^(product stock inventory|product master)$/i.test(sheet.properties?.title || "")) || metadata.data.sheets?.[0];
-        const title = selected?.properties?.title;
-        if (!title) throw new Error("The Google Stock Master has no worksheet.");
+        const title = await getMasterTabTitle(sheets, sheetId);
         const values = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
         const sheetRows = (values.data.values || []).map((row) => Array.isArray(row) ? row.map(display) : []);
         const headerRowIndex = sheetRows.findIndex((row) => headerIndex(row, ["skuid", "sku"]) >= 0 && headerIndex(row, ["availablestock", "availablequantity", "stock"]) >= 0);

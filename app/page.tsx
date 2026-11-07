@@ -28,6 +28,7 @@ import "./crm-polish.css";
 import "./auth-reference.css";
 import "./inventory-reconciliation.css";
 import { supabase } from "./lib/supabase";
+import { stockMovementBalances } from "./lib/stockMovementBalances";
 import type { Session } from "@supabase/supabase-js";
 import {
   Bell,
@@ -2900,7 +2901,7 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit, showDraftOr
 }
 
 function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }: { sku: string; auditEvents: AuditEvent[]; orders: Order[]; currentAvailable: number }) {
-  type RecordedMovement = ProductStockMovement & { actor: string; createdAt: string; derivedFromOrder?: boolean };
+  type RecordedMovement = ProductStockMovement & { actor: string; createdAt: string; auditId?: number; derivedFromOrder?: boolean };
   type RecordedOrderChange = ConfirmedOrderProductChange & { orderId: string; client: string; actor: string; createdAt: string };
   const clientByOrder = new Map(orders.map((order) => [order.id, order.client]));
   const auditedMovements = auditEvents.flatMap((event) => {
@@ -2908,7 +2909,7 @@ function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }:
     try {
       const parsed = JSON.parse(event.details) as { orderId?: string; direction?: ProductStockMovement["direction"]; lines?: ProductStockMovement[] };
       if (!Array.isArray(parsed.lines) || !parsed.orderId || (parsed.direction !== "Dispatch" && parsed.direction !== "Return")) return [];
-      return parsed.lines.filter((line) => line && line.sku).map((line) => ({ ...line, orderId: parsed.orderId || line.orderId, client: line.client || clientByOrder.get(parsed.orderId || line.orderId) || "Previous / unknown client", direction: parsed.direction || line.direction, actor: event.actor_email, createdAt: event.created_at }));
+      return parsed.lines.filter((line) => line && line.sku).map((line) => ({ ...line, orderId: parsed.orderId || line.orderId, client: line.client || clientByOrder.get(parsed.orderId || line.orderId) || "Previous / unknown client", direction: parsed.direction || line.direction, actor: event.actor_email, createdAt: event.created_at, auditId: event.id }));
     } catch { return []; }
   });
   // Audit logging is useful, but a dispatch snapshot on the order is the
@@ -2921,7 +2922,7 @@ function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }:
     .flatMap((order) => (order.dispatchStockLines?.length ? order.dispatchStockLines : linesFor(order)).map((line) => ({ order, line })))
     .filter(({ order, line }) => skuKey(line.sku) === skuKey(sku) && !auditedDispatchKeys.has(`${order.id}::${skuKey(line.sku)}`))
     .map(({ order, line }) => ({ orderId: order.id, client: order.client, direction: "Dispatch" as const, sku: line.sku, product: line.product, quantity: line.quantity, before: 0, after: 0, actor: "Recovered from saved dispatch order", createdAt: order.dispatchedAt || "", derivedFromOrder: true }));
-  const movements = [...auditedMovements, ...snapshotMovements];
+  const movements = [...auditedMovements, ...snapshotMovements].filter((movement) => skuKey(movement.sku) === skuKey(sku));
   const orderChanges = auditEvents.flatMap((event) => {
     if (event.action !== "Recorded confirmed order product change") return [] as RecordedOrderChange[];
     try {
@@ -2946,16 +2947,11 @@ function ProductStockItemHistory({ sku, auditEvents, orders, currentAvailable }:
     grouped.set(key, current);
   });
   const rows = [...grouped.values()].sort((a, b) => a.first.localeCompare(b.first));
-  const auditedStartingBalance = rows.find((row) => row.dispatch && !row.dispatch.derivedFromOrder)?.dispatch?.before ?? rows.find((row) => row.returned)?.returned?.before;
-  const startingBalance = auditedStartingBalance;
-  let runningBalance = startingBalance;
-  const calculatedRows = rows.map((row) => {
-    const afterDispatch = row.dispatch && runningBalance !== undefined ? runningBalance - row.dispatch.quantity : undefined;
-    if (afterDispatch !== undefined) runningBalance = afterDispatch;
-    const afterReturn = row.returned && runningBalance !== undefined ? runningBalance + row.returned.quantity : undefined;
-    if (afterReturn !== undefined) runningBalance = afterReturn;
-    return { ...row, afterDispatch, afterReturn };
-  });
+  const { startingBalance, runningBalance, balances } = stockMovementBalances(movements);
+  const calculatedRows = rows.map((row) => ({ ...row,
+    afterDispatch: row.dispatch ? balances.get(row.dispatch) : undefined,
+    afterReturn: row.returned ? balances.get(row.returned) : undefined,
+  }));
   return <section className="product-stock-history"><div><span className="overline">THIS SKU · ORDER HISTORY</span><h3>Order and stock history</h3><p>{startingBalance === undefined ? "Actual stock movements are shown below. A reliable opening balance was not recorded for the older history." : <>Tracked balance began at <b>{startingBalance.toLocaleString("en-IN")}</b>; order-history balance is <b>{(runningBalance ?? startingBalance).toLocaleString("en-IN")}</b>; current CRM available balance is <b>{currentAvailable.toLocaleString("en-IN")}</b>.</>}</p></div>{orderChanges.length > 0 && <><h4>Confirmed-order changes</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>CHANGE</th><th>QTY</th><th>BY</th></tr></thead><tbody>{orderChanges.map((change, index) => <tr key={`${change.orderId}-${change.createdAt}-${index}`}><td><b>{change.orderId}</b><small className="table-subtext">{new Date(change.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></td><td>{change.client}</td><td><span className={changeClass(change.change)}>{change.change}</span></td><td className={changeClass(change.change)}><b>{change.change === "Confirmed" ? change.after.toLocaleString("en-IN") : `${change.before.toLocaleString("en-IN")} → ${change.after.toLocaleString("en-IN")}`}</b></td><td>{change.actor}</td></tr>)}</tbody></table></div></>}{calculatedRows.length > 0 && <><h4>Actual stock movement</h4><div className="table-wrap"><table className="records"><thead><tr><th>ORDER</th><th>CLIENT</th><th>SUBTRACTED</th><th>REMAINING</th><th>REVERSED</th><th>REMAINING</th></tr></thead><tbody>{calculatedRows.map((row) => <tr key={row.orderId}><td><b>{row.orderId}</b>{row.dispatch?.derivedFromOrder && <small className="table-subtext">Recovered from saved Dispatch Plan</small>}</td><td>{row.client}</td><td>{row.dispatch ? <b>−{row.dispatch.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.dispatch ? <><b>{row.afterDispatch?.toLocaleString("en-IN") ?? "—"}</b>{row.dispatch.createdAt && <small className="table-subtext">{new Date(row.dispatch.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small>}</> : "—"}</td><td>{row.returned ? <b>+{row.returned.quantity.toLocaleString("en-IN")}</b> : "—"}</td><td>{row.returned ? <><b>{row.afterReturn?.toLocaleString("en-IN") ?? "—"}</b><small className="table-subtext">{new Date(row.returned.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small></> : "—"}</td></tr>)}</tbody></table></div></>}</section>;
 }
 

@@ -93,6 +93,7 @@ language plpgsql
 security definer
 set search_path = public
 as $$
+#variable_conflict use_column
 declare
   line jsonb;
   requested_sku text;
@@ -161,7 +162,7 @@ begin
     current_available := coalesce(nullif(inventory_row.data ->> 'availableQuantity', '')::numeric, 0);
     insert into crm_inventory_opening_balances (workspace_owner_id, sku_id, product_record_id, opening_quantity)
       values (p_workspace_owner_id, requested_sku, inventory_row.record_id, current_available)
-      on conflict (workspace_owner_id, sku_id) do nothing;
+      on conflict on constraint crm_inventory_opening_balances_pkey do nothing;
 
     if p_transaction_type = 'Reversal' then
       select ledger_row.quantity into original_quantity from crm_inventory_ledger as ledger_row

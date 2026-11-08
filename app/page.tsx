@@ -1572,7 +1572,7 @@ export default function Home() {
       setProductPoLoading(false);
     }
   };
-  const cancelOrder = (order: Order) => {
+  const cancelOrder = async (order: Order) => {
     if (!window.confirm(`Cancel ${order.id}? Its allocated stock will be released back to available inventory.`)) return;
     const isAdvance = order.status === "Advance order";
     const primaryId = isAdvance ? order.id.replace(/^ADV-/, "") : order.id;
@@ -1581,11 +1581,26 @@ export default function Home() {
     const advanceOrder = orders.find((item) => item.id === advanceId);
     const confirmedLines = !isAdvance && primaryOrder?.status === "Confirmed" ? (primaryOrder.approvedProducts || linesFor(primaryOrder)) : [];
     const committedLines = !isAdvance && primaryOrder?.inventoryCommitted ? (primaryOrder.dispatchStockLines?.length ? primaryOrder.dispatchStockLines : linesFor(primaryOrder)) : [];
+    if (!isAdvance && primaryOrder?.inventoryCommitted) {
+      const dispatchTransactionId = primaryOrder.inventoryDispatchTransactionId;
+      if (!dispatchTransactionId) { flash(`${primaryOrder.id} was dispatched before the inventory ledger was installed, so it cannot be safely cancelled automatically.`); return; }
+      try {
+        await applyInventoryLedgerTransaction({
+          transactionId: `cancel-reversal:${dispatchTransactionId}`,
+          referenceTransactionId: dispatchTransactionId,
+          order: primaryOrder,
+          transactionType: "Reversal",
+          lines: committedLines,
+        });
+      } catch (error) {
+        flash(error instanceof Error ? error.message : "Stock could not be returned. The order was not cancelled.");
+        return;
+      }
+    }
     setCatalogue((current) => current.map((product) => {
       const reserved = confirmedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      const restore = committedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      if (!reserved && !restore) return product;
-      return { ...product, availableQuantity: availableStock(product) + restore, reservedStock: Math.max(0, (product.reservedStock || 0) - reserved) };
+      if (!reserved) return product;
+      return { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - reserved) };
     }));
     const cancelledIds = isAdvance ? [order.id] : [primaryId, advanceId];
     setOrders((current) => current.map((item) => {
@@ -1596,13 +1611,13 @@ export default function Home() {
       }
       if (!cancelledIds.includes(item.id)) return item;
       const cancelledFromStage = ["Draft", "Confirmed", "Dispatch plan", "Sent to customer", "Received by customer"].includes(item.status) ? item.status as NonNullable<Order["cancelledFromStage"]> : item.cancelledFromStage;
-      return { ...item, status: "Cancelled", cancelledFromDispatch: ["Dispatch plan", "Sent to customer", "Received by customer"].includes(item.status), cancelledFromStage };
+      return { ...item, status: "Cancelled", cancelledFromDispatch: ["Dispatch plan", "Sent to customer", "Received by customer"].includes(item.status), cancelledFromStage, inventoryCommitted: item.id === primaryId && item.inventoryCommitted ? false : item.inventoryCommitted, inventoryReversalTransactionId: item.id === primaryId && item.inventoryDispatchTransactionId ? `cancel-reversal:${item.inventoryDispatchTransactionId}` : item.inventoryReversalTransactionId, dispatchReversedAt: item.id === primaryId && item.inventoryCommitted ? new Date().toISOString() : item.dispatchReversedAt };
     }));
     setInvoices((current) => current.map((invoice) => cancelledIds.includes(invoice.order) ? { ...invoice, status: "Cancelled" } : invoice));
     logActivity("Cancelled order and released stock", "Orders", cancelledIds.join(", "));
     flash(`Cancelled ${order.id}; stock allocation released.`);
   };
-  const removeOrders = (ids: string[]) => {
+  const removeOrders = async (ids: string[]) => {
     const selectedIds = new Set(ids);
     const primaryIds = new Set<string>();
     const advanceIds = new Set<string>();
@@ -1619,6 +1634,30 @@ export default function Home() {
       if (orders.some((item) => item.id === advanceId)) advanceIds.add(advanceId);
     });
     const removedIds = new Set([...primaryIds, ...advanceIds]);
+    // A dispatched order has already changed physical stock.  Reverse that
+    // exact saved dispatch snapshot through the ledger before removing the
+    // record, so Dispatch Plan and Fulfilment deletes can never strand stock.
+    const dispatchedOrders = [...primaryIds]
+      .map((id) => orders.find((item) => item.id === id))
+      .filter((order): order is Order => Boolean(order?.inventoryCommitted));
+    try {
+      for (const order of dispatchedOrders) {
+        const dispatchTransactionId = order.inventoryDispatchTransactionId;
+        if (!dispatchTransactionId) throw new Error(`${order.id} was dispatched before the inventory ledger was installed, so it cannot be safely deleted automatically.`);
+        const dispatchedLines = order.dispatchStockLines?.length ? order.dispatchStockLines : linesFor(order);
+        if (!dispatchedLines.length) throw new Error(`${order.id} has no saved dispatch quantities to restore.`);
+        await applyInventoryLedgerTransaction({
+          transactionId: `delete-reversal:${dispatchTransactionId}`,
+          referenceTransactionId: dispatchTransactionId,
+          order,
+          transactionType: "Reversal",
+          lines: dispatchedLines,
+        });
+      }
+    } catch (error) {
+      flash(error instanceof Error ? error.message : "Stock could not be returned. The order was not deleted.");
+      return;
+    }
     markForCloudDeletion("crm_orders", [...removedIds]);
     markForCloudDeletion("crm_invoices", invoices.filter((invoice) => removedIds.has(invoice.order)).map((invoice) => invoice.id));
     markForCloudDeletion("crm_tasks", tasks.filter((task) => task.relatedTo && removedIds.has(task.relatedTo)).map((task) => task.id));
@@ -1635,9 +1674,10 @@ export default function Home() {
     });
     setCatalogue((current) => current.map((product) => {
       const reserved = confirmedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      const restore = committedLines.filter((line) => skuKey(line.sku) === skuKey(product.sku)).reduce((sum, line) => sum + line.quantity, 0);
-      if (!reserved && !restore) return product;
-      return { ...product, availableQuantity: availableStock(product) + restore, reservedStock: Math.max(0, (product.reservedStock || 0) - reserved) };
+      // Physical stock was restored above by the SKU ledger.  Only a still
+      // confirmed order has a reservation left to release locally.
+      if (!reserved) return product;
+      return { ...product, reservedStock: Math.max(0, (product.reservedStock || 0) - reserved) };
     }));
     setOrders((current) => current
       .filter((item) => !removedIds.has(item.id))

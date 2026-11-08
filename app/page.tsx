@@ -103,6 +103,7 @@ type InventoryLedgerEntry = {
   new_available: number;
   actor_email: string;
 };
+type StageTransitionJob = { id: string; direction: "CtoD" | "DtoC"; state: "running" | "success" | "error"; message: string; startedAt: number };
 type ConfirmedOrderProductChange = { sku: string; product: string; change: "Confirmed" | "Added" | "Removed" | "Quantity increased" | "Quantity reduced"; before: number; after: number };
 type Order = {
   id: string;
@@ -1065,6 +1066,7 @@ export default function Home() {
     [modal, setModal] = useState<"order" | "orderView" | "orderDetails" | "client" | "invoice" | "catalogue" | "lead" | "quote" | "task" | "transporter" | "supplier" | "purchase" | "purchaseView" | "purchaseReceive" | null>(null),
     [editing, setEditing] = useState<any>(null),
     [toast, setToast] = useState("");
+  const [stageTransitionJobs, setStageTransitionJobs] = useState<StageTransitionJob[]>([]);
   const [productPoLoading, setProductPoLoading] = useState(false);
   const [dashboardClock, setDashboardClock] = useState<number | null>(null);
   useEffect(() => {
@@ -1110,6 +1112,14 @@ export default function Home() {
     return true;
   };
   const endOrderTransition = (stage: "confirm" | "dispatch" | "reverse", orderId: string) => orderTransitionLocks.current.delete(`${stage}:${orderId}`);
+  const updateStageTransitionJob = (id: string, direction: StageTransitionJob["direction"], state: StageTransitionJob["state"], message: string) => {
+    setStageTransitionJobs((current) => {
+      const next = [{ id, direction, state, message, startedAt: current.find((job) => job.id === id && job.direction === direction)?.startedAt || Date.now() }, ...current.filter((job) => !(job.id === id && job.direction === direction))];
+      const cToD = next.filter((job) => job.direction === "CtoD").slice(0, 5);
+      const dToC = next.filter((job) => job.direction === "DtoC").slice(0, 5);
+      return [...cToD, ...dToC].sort((a, b) => b.startedAt - a.startedAt);
+    });
+  };
   const flash = (m: string) => {
       setToast(m);
       setTimeout(() => setToast(""), 2600);
@@ -1749,6 +1759,7 @@ export default function Home() {
       return;
     }
     if (!beginOrderTransition("reverse", order.id)) { flash(`${order.id} is already returning to Confirmed Orders. Please wait.`); return; }
+    updateStageTransitionJob(order.id, "DtoC", "running", "Returning from Dispatch Plan to Confirmed Orders");
     flash(`${order.id}: reversing inventory and updating Stock Master…`);
     const reversalTransactionId = order.inventoryReversalTransactionId || `reversal:${dispatchTransactionId}`;
     try {
@@ -1761,6 +1772,7 @@ export default function Home() {
       });
     } catch (error) {
       endOrderTransition("reverse", order.id);
+      updateStageTransitionJob(order.id, "DtoC", "error", error instanceof Error ? error.message : "Could not return order. It remains in Dispatch Plan.");
       flash(error instanceof Error ? error.message : "Dispatch reversal could not be saved.");
       return;
     }
@@ -1768,6 +1780,7 @@ export default function Home() {
     setOrders((current) => current.map((item) => item.id === order.id ? { ...item, ...first, products: lines, approvedProducts: lines, status: "Confirmed", inventoryCommitted: false, inventoryReversalTransactionId: reversalTransactionId, dispatchReversedAt: new Date().toISOString() } : item));
     logActivity("Returned dispatch order to Confirmed Orders", "Dispatch Plan", `${order.id} · restored ${restoredQuantity.toLocaleString("en-IN")} unit(s) from saved dispatch quantity`);
     endOrderTransition("reverse", order.id);
+    updateStageTransitionJob(order.id, "DtoC", "success", "Returned to Confirmed Orders");
     flash(`${order.id} returned to Confirmed Orders. Exactly ${restoredQuantity.toLocaleString("en-IN")} dispatched unit(s) were added back through the SKU ledger.`);
   };
   const markOrderSentToCustomer = (order: Order) => {
@@ -1871,6 +1884,7 @@ export default function Home() {
     };
     if (!window.confirm(`Send ${order.id} to Dispatch Plan? Any quantity reduced by Operations will be released from CRM reservation.`)) return;
     if (!beginOrderTransition("dispatch", order.id)) { flash(`${order.id} is already being sent to Dispatch Plan. Please wait.`); return; }
+    updateStageTransitionJob(order.id, "CtoD", "running", "Moving from Confirmed to Dispatch Plan");
     flash(`${order.id}: recording inventory and updating Stock Master…`);
     const dispatchedBySku = summariseBySku(dispatchLines);
     const nextDispatchCycle = (order.inventoryDispatchCycle || 0) + 1;
@@ -1889,6 +1903,7 @@ export default function Home() {
       });
     } catch (error) {
       endOrderTransition("dispatch", order.id);
+      updateStageTransitionJob(order.id, "CtoD", "error", error instanceof Error ? error.message : "Could not move order. It remains in Confirmed Orders.");
       flash(error instanceof Error ? error.message : "Dispatch stock movement could not be saved.");
       return;
     }
@@ -1902,6 +1917,7 @@ export default function Home() {
     setOrders((current) => current.map((item) => item.id === order.id ? { ...item, product: first.product, sku: first.sku, quantity: first.quantity, unitPrice: first.unitPrice, products: dispatchLines, dispatchStockLines: dispatchLines.map((line) => ({ ...line })), inventoryDispatchTransactionId: dispatchTransactionId, inventoryDispatchCycle: nextDispatchCycle, inventoryReversalTransactionId: undefined, dispatchedAt: new Date().toISOString(), dispatchReversedAt: undefined, status: "Dispatch plan", inventoryCommitted: true } : item));
     logActivity("Sent confirmed order to Dispatch Plan", "Dispatch Plan", releasedLines.length ? `${order.id} · reduced CRM reservation released` : order.id);
     endOrderTransition("dispatch", order.id);
+    updateStageTransitionJob(order.id, "CtoD", "success", "Sent to Dispatch Plan");
     flash(releasedLines.length ? `${order.id} sent to Dispatch Plan; reduced quantities were released from CRM reservation.` : `${order.id} sent to Dispatch Plan for Operations.`);
   };
   const navigationGroups = [
@@ -1994,6 +2010,23 @@ export default function Home() {
           <button className="shortcut-trigger" type="button" aria-label="Open keyboard shortcuts" onClick={() => setShortcutsOpen((current) => !current)}>
             <Keyboard size={17}/><span>Shortcuts</span>
           </button>
+          {(["Confirmed Orders", "Dispatch Plan"] as string[]).includes(section) && (() => {
+            const direction: StageTransitionJob["direction"] = section === "Confirmed Orders" ? "CtoD" : "DtoC";
+            const jobs = stageTransitionJobs.filter((job) => job.direction === direction).slice(0, 5);
+            if (!jobs.length) return null;
+            return <section className="stage-transition-status" aria-live="polite" aria-label="Order transfer status">
+              <b>{direction === "CtoD" ? "Confirmed → Dispatch" : "Dispatch → Confirmed"}</b>
+              {jobs.map((job) => {
+                const completed = job.state !== "running";
+                const colour = job.state === "error" ? "#c44755" : job.state === "success" ? "#24865f" : "#9b263f";
+                return <div className="stage-transition-job" key={`${job.direction}-${job.id}`}>
+                  <div><strong>{job.id}</strong><span>{job.state === "success" ? "Success" : job.state === "error" ? "Needs attention" : "Processing…"}</span></div>
+                  <small title={job.message}>{job.message}</small>
+                  <i><em style={{ width: completed ? "100%" : "62%", background: colour }} /></i>
+                </div>;
+              })}
+            </section>;
+          })()}
           <button className="icon-btn" type="button" aria-label="Refresh panel" title="Refresh panel" onClick={refreshPanel}>
             <RotateCcw size={18} />
           </button>
@@ -2047,8 +2080,8 @@ export default function Home() {
         </div>
         {section === "Overview" && (cloudReady ? <Overview orders={orders} clients={clients} invoices={invoices} edit={(o) => show("order", o)} all={() => setSection("Orders")} flash={flash} /> : <section className="panel empty"><b>{cloudError ? "Live CRM data could not be loaded." : "Loading live CRM data…"}</b><p>{cloudError ? "Refresh the panel after resolving the cloud connection warning above." : "Dashboard figures will appear only after the real workspace records are loaded."}</p></section>)}{" "}
         {section === "Orders" && <Orders orders={shown.filter((order) => order.status === "Draft")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Draft")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} confirm={confirmOrder} />}{" "}
-        {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed")} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToOrders={returnConfirmedToOrders} pushToDispatch={pushToDispatchPlan} sendWhatsApp={(order) => { const client = clients.find((item) => item.name.trim().toLowerCase() === order.client.trim().toLowerCase()); const groupLink = client?.whatsappGroupLink?.trim(); if (groupLink) { try { const url = new URL(groupLink); if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "chat.whatsapp.com") throw new Error("invalid"); window.open(url.toString(), "_blank", "noopener,noreferrer"); logActivity("Opened customer WhatsApp group", "Confirmed Orders", `${order.id} · ${client?.name || order.client}`); return; } catch { window.alert("The saved WhatsApp group link is not valid. Use a link beginning with https://chat.whatsapp.com/ in the customer profile."); return; } } window.open(`https://wa.me/?text=${encodeURIComponent(dispatchWhatsAppText(order))}`, "_blank", "noopener,noreferrer"); logActivity("Opened WhatsApp approval", "Confirmed Orders", `${order.id} · no customer group link saved`); }} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Confirmed Orders", `${id} · ${clientApproval}`); }} confirmed />}{" "}
-        {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => order.status === "Dispatch plan" || (order.status === "Cancelled" && order.cancelledFromDispatch))} view={(o) => show("orderView", o)} cancel={cancelOrder} returnToConfirmed={returnDispatchToConfirmed} markSent={markOrderSentToCustomer} />}{" "}
+        {section === "Confirmed Orders" && <Orders orders={shown.filter((order) => order.status === "Confirmed" && !stageTransitionJobs.some((job) => job.id === order.id && job.direction === "CtoD" && job.state === "running"))} cancelledOrders={shown.filter((order) => order.status === "Cancelled" && order.cancelledFromStage === "Confirmed")} clients={clients} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} returnToOrders={returnConfirmedToOrders} pushToDispatch={pushToDispatchPlan} sendWhatsApp={(order) => { const client = clients.find((item) => item.name.trim().toLowerCase() === order.client.trim().toLowerCase()); const groupLink = client?.whatsappGroupLink?.trim(); if (groupLink) { try { const url = new URL(groupLink); if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "chat.whatsapp.com") throw new Error("invalid"); window.open(url.toString(), "_blank", "noopener,noreferrer"); logActivity("Opened customer WhatsApp group", "Confirmed Orders", `${order.id} · ${client?.name || order.client}`); return; } catch { window.alert("The saved WhatsApp group link is not valid. Use a link beginning with https://chat.whatsapp.com/ in the customer profile."); return; } } window.open(`https://wa.me/?text=${encodeURIComponent(dispatchWhatsAppText(order))}`, "_blank", "noopener,noreferrer"); logActivity("Opened WhatsApp approval", "Confirmed Orders", `${order.id} · no customer group link saved`); }} updateApproval={(id, clientApproval) => { setOrders((current) => current.map((order) => order.id === id ? { ...order, clientApproval } : order)); logActivity("Updated client approval", "Confirmed Orders", `${id} · ${clientApproval}`); }} confirmed />}{" "}
+        {section === "Dispatch Plan" && <DispatchPlanPanel orders={orders.filter((order) => (order.status === "Dispatch plan" && !stageTransitionJobs.some((job) => job.id === order.id && job.direction === "DtoC" && job.state === "running")) || (order.status === "Cancelled" && order.cancelledFromDispatch))} view={(o) => show("orderView", o)} cancel={cancelOrder} returnToConfirmed={returnDispatchToConfirmed} markSent={markOrderSentToCustomer} />}{" "}
         {section === "Sent to Customer" && <FulfilmentPanel title="Sent to customer" description="These dispatched orders have been sent to the customer. This is the final fulfilment stage in the CRM." orders={orders.filter((order) => order.status === "Sent to customer" || order.status === "Received by customer")} edit={(o) => show("order", o)} cancel={cancelOrder} remove={isAdmin ? removeOrders : undefined} />}{" "}
         {section === "Clients" && (
           <Clients

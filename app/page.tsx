@@ -1067,6 +1067,7 @@ export default function Home() {
     [editing, setEditing] = useState<any>(null),
     [toast, setToast] = useState("");
   const [stageTransitionJobs, setStageTransitionJobs] = useState<StageTransitionJob[]>([]);
+  const [transitionStatusOpen, setTransitionStatusOpen] = useState(false);
   const [productPoLoading, setProductPoLoading] = useState(false);
   const [dashboardClock, setDashboardClock] = useState<number | null>(null);
   useEffect(() => {
@@ -2010,7 +2011,10 @@ export default function Home() {
           <button className="shortcut-trigger" type="button" aria-label="Open keyboard shortcuts" onClick={() => setShortcutsOpen((current) => !current)}>
             <Keyboard size={17}/><span>Shortcuts</span>
           </button>
-          {(["Confirmed Orders", "Dispatch Plan"] as string[]).includes(section) && (() => {
+          {(["Confirmed Orders", "Dispatch Plan"] as string[]).includes(section) && stageTransitionJobs.some((job) => job.direction === (section === "Confirmed Orders" ? "CtoD" : "DtoC")) && <button className="transfer-status-trigger" type="button" onClick={() => setTransitionStatusOpen((current) => !current)} aria-expanded={transitionStatusOpen}>
+            Transfers <em>{stageTransitionJobs.filter((job) => job.direction === (section === "Confirmed Orders" ? "CtoD" : "DtoC")).length}</em>
+          </button>}
+          {transitionStatusOpen && (["Confirmed Orders", "Dispatch Plan"] as string[]).includes(section) && (() => {
             const direction: StageTransitionJob["direction"] = section === "Confirmed Orders" ? "CtoD" : "DtoC";
             const jobs = stageTransitionJobs.filter((job) => job.direction === direction).slice(0, 5);
             if (!jobs.length) return null;

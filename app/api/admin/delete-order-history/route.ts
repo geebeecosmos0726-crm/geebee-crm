@@ -25,7 +25,7 @@ export async function POST(request: Request) {
   const rawOrderIds: unknown[] = Array.isArray(body.orderIds) ? body.orderIds : [];
   const orderIds: string[] = [...new Set(rawOrderIds.map((id: unknown) => String(id || "").trim()).filter(Boolean))];
   if (!url || !serviceKey || !token) return Response.json({ error: "Sign in again before deleting order history." }, { status: 401 });
-  if (!orderIds.length) return Response.json({ ok: true, deletedAuditIds: [] });
+  if (!orderIds.length) return Response.json({ ok: true, deletedAuditIds: [], deletedLedgerIds: [] });
 
   const db = createClient(url, serviceKey, { auth: { persistSession: false } });
   const { data: userData, error: userError } = await db.auth.getUser(token);
@@ -53,5 +53,21 @@ export async function POST(request: Request) {
     const { error: deleteError } = await db.from("crm_audit_events").delete().eq("workspace_owner_id", workspaceOwnerId).in("id", idsToDelete);
     if (deleteError) return Response.json({ error: deleteError.message }, { status: 500 });
   }
-  return Response.json({ ok: true, deletedAuditIds: idsToDelete });
+  // Stock-movement history is the inventory ledger, not only the activity
+  // feed. A hard-deleted order must disappear from both views. The delete
+  // caller has already restored its exact dispatched stock before arriving
+  // here, so removing these net-zero historical rows is safe.
+  const { data: ledgerRows, error: ledgerReadError } = await db
+    .from("crm_inventory_ledger")
+    .select("id")
+    .eq("workspace_owner_id", workspaceOwnerId)
+    .in("order_id", orderIds)
+    .limit(50000);
+  if (ledgerReadError && !/does not exist|relation/i.test(ledgerReadError.message)) return Response.json({ error: ledgerReadError.message }, { status: 500 });
+  const deletedLedgerIds = (ledgerRows || []).map((row: { id: number }) => row.id);
+  if (deletedLedgerIds.length) {
+    const { error: ledgerDeleteError } = await db.from("crm_inventory_ledger").delete().eq("workspace_owner_id", workspaceOwnerId).in("id", deletedLedgerIds);
+    if (ledgerDeleteError) return Response.json({ error: ledgerDeleteError.message }, { status: 500 });
+  }
+  return Response.json({ ok: true, deletedAuditIds: idsToDelete, deletedLedgerIds });
 }

@@ -419,10 +419,28 @@ export async function PATCH(request: Request) {
     // in this CRM testing card.
     const data: ProductData = { ...prior, sku: display(item.sku).toUpperCase(), name: display(item.name), category: display(item.category) || "Uncategorised", unit: display(item.unit) || "Piece", innerQty: display(item.innerQty), outerQty: display(item.outerQty), cartonQty: display(item.outerQty), unitPrice: number(item.unitPrice), reorderThreshold: number(item.reorderThreshold), image: display(item.image) };
     if (!data.sku || !data.name) throw new Error("SKU ID and Product Name are required.");
-    const { error: updateError } = await db.from("crm_stock_inventory").update({ data, search_key: `${data.sku} ${data.name} ${data.category}`.toLowerCase(), updated_at: new Date().toISOString() }).eq("workspace_owner_id", ownerId).eq("record_id", String(item.id));
+    // Saving an existing card must never make a second card. If a historical
+    // duplicate already exists, keep the ledger-linked record as canonical,
+    // copy the edited fields onto it, and remove the redundant record.
+    const { data: sameIdentityRows, error: sameIdentityError } = await db.from("crm_stock_inventory").select("record_id, data").eq("workspace_owner_id", ownerId).limit(50000);
+    if (sameIdentityError) throw sameIdentityError;
+    const matchingRows = (sameIdentityRows || []).filter((row: any) => inventoryKey(row.data || {}) === inventoryKey(data));
+    const matchingIds = matchingRows.map((row: any) => String(row.record_id));
+    const { data: openingRows } = matchingIds.length ? await db.from("crm_inventory_opening_balances").select("product_record_id").eq("workspace_owner_id", ownerId).in("product_record_id", matchingIds) : { data: [] as any[] };
+    const ledgerBackedIds = new Set((openingRows || []).map((row: any) => String(row.product_record_id)));
+    const canonicalRow = matchingRows.find((row: any) => ledgerBackedIds.has(String(row.record_id))) || matchingRows.find((row: any) => String(row.record_id) === String(item.id)) || matchingRows[0] || existing;
+    const canonicalPrior = canonicalRow.data as ProductData;
+    const canonicalData: ProductData = { ...canonicalPrior, ...data, id: canonicalPrior.id ?? data.id, sourceRow: canonicalPrior.sourceRow ?? data.sourceRow, availableQuantity: canonicalPrior.availableQuantity };
+    const canonicalId = String(canonicalRow.record_id);
+    const { error: updateError } = await db.from("crm_stock_inventory").update({ data: canonicalData, search_key: `${canonicalData.sku} ${canonicalData.name} ${canonicalData.category}`.toLowerCase(), updated_at: new Date().toISOString() }).eq("workspace_owner_id", ownerId).eq("record_id", canonicalId);
     if (updateError) throw updateError;
-    await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Edited test Product Stock Inventory item", module: "Products", details: `${data.sku} · ${data.name}` });
-    return Response.json({ item: data });
+    const removedIds = matchingRows.filter((row: any) => String(row.record_id) !== canonicalId && !ledgerBackedIds.has(String(row.record_id))).map((row: any) => String(row.record_id));
+    if (removedIds.length) {
+      const { error: duplicateDeleteError } = await db.from("crm_stock_inventory").delete().eq("workspace_owner_id", ownerId).in("record_id", removedIds);
+      if (duplicateDeleteError) throw duplicateDeleteError;
+    }
+    await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Edited test Product Stock Inventory item", module: "Products", details: `${canonicalData.sku} · ${canonicalData.name}${removedIds.length ? ` · removed ${removedIds.length} duplicate card(s)` : ""}` });
+    return Response.json({ item: canonicalData, removedIds });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "Could not update this testing product." }, { status: 400 });
   }

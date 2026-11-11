@@ -1237,13 +1237,15 @@ export default function Home() {
         headers: { Authorization: `Bearer ${session.access_token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ orderIds }),
       });
-      const result = await response.json().catch(() => ({})) as { ok?: boolean; deletedAuditIds?: number[]; error?: string };
+      const result = await response.json().catch(() => ({})) as { ok?: boolean; deletedAuditIds?: number[]; deletedLedgerIds?: number[]; error?: string };
       if (!response.ok || !result.ok) {
         flash(result.error || "The order was deleted, but its history could not be cleared from the activity log.");
         return;
       }
       const deleted = new Set((result.deletedAuditIds || []).map(Number));
       if (deleted.size) setAuditEvents((current) => current.filter((event) => !deleted.has(Number(event.id))));
+      const deletedLedger = new Set((result.deletedLedgerIds || []).map(Number));
+      if (deletedLedger.size) setInventoryLedger((current) => current.filter((entry) => !deletedLedger.has(Number(entry.id))));
     } catch {
       flash("The order was deleted, but its history could not be cleared from the activity log.");
     }
@@ -3284,11 +3286,12 @@ function ProductStockInventoryPanel({ session, canApply, auditEvents, inventoryL
       const response = await fetch("/api/import/google-product-master", { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ item }) });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Product could not be updated.");
+      const removedIds = new Set((Array.isArray(result.removedIds) ? result.removedIds : []).map(String));
       setItems((current) => {
-        const next = current.map((entry) => entry.id === result.item.id ? result.item : entry);
+        const next = current.filter((entry) => !removedIds.has(String(entry.id))).map((entry) => entry.id === result.item.id ? result.item : entry);
         saveProductStockCache(session.user.id, next);
         return next;
-      }); onProductsSynced((current) => current.map((entry) => entry.id === result.item.id ? result.item : entry)); onLiveBackup(); setEditing(null); setMessage(`${result.item.sku} updated. Available Stock remains controlled by the Google Sheet.`);
+      }); onProductsSynced((current) => current.filter((entry) => !removedIds.has(String(entry.id))).map((entry) => entry.id === result.item.id ? result.item : entry)); onLiveBackup(); setEditing(null); setMessage(`${result.item.sku} updated.${removedIds.size ? ` ${removedIds.size} duplicate card${removedIds.size === 1 ? " was" : "s were"} removed.` : ""} Available Stock remains controlled by the Google Sheet.`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Product could not be updated."); }
     finally { setLoading(false); }
   };

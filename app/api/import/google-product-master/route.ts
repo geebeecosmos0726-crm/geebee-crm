@@ -152,6 +152,18 @@ export async function POST(request: Request) {
     const parsed = readProducts((result.data.values || []) as unknown[][]);
     if (parsed.error) return Response.json({ error: parsed.error, needsSetup: !(result.data.values || []).length, sheetTitle: title }, { status: 400 });
     if (typeof parsed.stockColumn !== "number") throw new Error("Google Stock Master needs an Available Stock column before it can be synced safely.");
+    // A repeated Sheet row must never manufacture another Product / SKU card.
+    // Variants remain valid because the key includes both SKU and product name.
+    const seenSheetProducts = new Set<string>();
+    const sheetProducts = parsed.products.filter((product) => {
+      const key = inventoryKey(product);
+      if (seenSheetProducts.has(key)) {
+        parsed.skippedRows.push({ row: product.row, reason: "Duplicate SKU ID and Product Name" });
+        return false;
+      }
+      seenSheetProducts.add(key);
+      return true;
+    });
     // This is deliberately separate from crm_products. It is a safe testing
     // inventory master and never alters the live Product / SKU catalogue.
     const { data: existingRows, error: existingError } = await db.from("crm_stock_inventory").select("record_id, data").eq("workspace_owner_id", ownerId).limit(100000);
@@ -187,7 +199,7 @@ export async function POST(request: Request) {
     })).filter((line) => line.sku && line.quantity > 0);
     const sourceCountBySku = new Map<string, number>();
     const sourceCountByIdentity = new Map<string, number>();
-    parsed.products.forEach((source) => {
+    sheetProducts.forEach((source) => {
       const sku = compact(source.sku); const identity = inventoryKey(source);
       sourceCountBySku.set(sku, (sourceCountBySku.get(sku) || 0) + 1);
       sourceCountByIdentity.set(identity, (sourceCountByIdentity.get(identity) || 0) + 1);
@@ -221,13 +233,20 @@ export async function POST(request: Request) {
     const existingByIdentity = new Map<string, Array<{ recordId: string; product: ProductData }>>();
     existing.forEach((record) => { const key = inventoryKey(record.product); existingByIdentity.set(key, [...(existingByIdentity.get(key) || []), record]); });
     const consumedRecords = new Set<string>();
-    const sheetKeys = new Set(parsed.products.map(rowKey));
+    const sheetKeys = new Set(sheetProducts.map(rowKey));
+    const sheetIdentityKeys = new Set(sheetProducts.map(inventoryKey));
     const now = new Date().toISOString();
     let added = 0; let updated = 0;
-    const records = parsed.products.map((source, index) => {
+    const records = sheetProducts.map((source, index) => {
       const matchedByRow = existingByRow.get(rowKey(source));
-      const matchedByIdentity = (existingByIdentity.get(inventoryKey(source)) || []).find((record) => !consumedRecords.has(record.recordId));
-      const currentRecord = matchedByRow || matchedByIdentity;
+      const identityMatches = existingByIdentity.get(inventoryKey(source)) || [];
+      // If an older duplicate has ledger history, retain it as the canonical
+      // record. Otherwise a later cleanup could leave movements pointing at a
+      // deleted card. For normal non-duplicate records this remains the row
+      // match first, preserving row metadata.
+      const ledgerBackedMatch = identityMatches.find((record) => ledgerManagedRecordIds.has(String(record.recordId)) && !consumedRecords.has(record.recordId));
+      const matchedByIdentity = identityMatches.find((record) => !consumedRecords.has(record.recordId));
+      const currentRecord = ledgerBackedMatch || matchedByRow || matchedByIdentity;
       if (currentRecord) consumedRecords.add(currentRecord.recordId);
       const current = currentRecord?.product || {};
       if (currentRecord) updated += 1; else added += 1;
@@ -247,7 +266,15 @@ export async function POST(request: Request) {
       const { error: upsertError } = await db.from("crm_stock_inventory").upsert(records, { onConflict: "workspace_owner_id,record_id" });
       if (upsertError) throw upsertError;
     }
-    const correctedSheetRows = !sheetIncludesActiveDispatch ? parsed.products.map((source) => ({ source, quantity: dispatchForSource(source) })).filter((entry) => entry.quantity > 0) : [];
+    // Delete only stale, true duplicates that are represented by the current
+    // Sheet row and have no inventory-ledger history. SKU variants with a
+    // different product name are never included in this set.
+    const staleDuplicateIds = existing.filter((record) => sheetIdentityKeys.has(inventoryKey(record.product)) && !consumedRecords.has(record.recordId) && !ledgerManagedRecordIds.has(String(record.recordId))).map((record) => record.recordId);
+    if (staleDuplicateIds.length) {
+      const { error: duplicateCleanupError } = await db.from("crm_stock_inventory").delete().eq("workspace_owner_id", ownerId).in("record_id", staleDuplicateIds);
+      if (duplicateCleanupError) throw duplicateCleanupError;
+    }
+    const correctedSheetRows = !sheetIncludesActiveDispatch ? sheetProducts.map((source) => ({ source, quantity: dispatchForSource(source) })).filter((entry) => entry.quantity > 0) : [];
     if (correctedSheetRows.length) {
       await sheets.spreadsheets.values.batchUpdate({
         spreadsheetId: sheetId,
@@ -259,7 +286,7 @@ export async function POST(request: Request) {
     }
     const crmOnly = existing.map((record) => record.product).filter((product) => product.sku && (!rowKey(product) || !sheetKeys.has(rowKey(product)))).map((product) => ({ sku: product.sku || "", name: product.name || "" }));
     await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Synced Product Stock Inventory", module: "Products", details: `${updated} updated · ${added} added · ${placeholderIds.length} incomplete placeholder(s) removed · ${crmOnly.length} CRM-only SKU(s)${correctedSheetRows.length ? ` · ${correctedSheetRows.length} active Dispatch balance(s) applied` : ""}` });
-    return Response.json({ sheetTitle: title, products: records.map((record) => record.data), updated, added, cleanedPlaceholders: placeholderIds.length, crmOnly, skippedRows: parsed.skippedRows || [], scanned: parsed.products.length, activeDispatchBalancesApplied: correctedSheetRows.length });
+    return Response.json({ sheetTitle: title, products: records.map((record) => record.data), updated, added, cleanedPlaceholders: placeholderIds.length + staleDuplicateIds.length, crmOnly, skippedRows: parsed.skippedRows || [], scanned: sheetProducts.length, activeDispatchBalancesApplied: correctedSheetRows.length });
   } catch (error) {
     console.error("Google product master sync failed:", error instanceof Error ? error.message : error);
     return Response.json({ error: error instanceof Error ? error.message : "Could not sync the Product Stock Inventory sheet." }, { status: 400 });

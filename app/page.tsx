@@ -1105,6 +1105,7 @@ export default function Home() {
   // Dispatch and reversal wait for both the inventory ledger and Stock Master.
   // Keep the lock until the complete action finishes, not merely until render.
   const orderTransitionLocks = useRef<Set<string>>(new Set());
+  const activeDispatchReconciliationAttempts = useRef<Set<string>>(new Set());
   const beginOrderTransition = (stage: "confirm" | "dispatch" | "reverse", orderId: string) => {
     const key = `${stage}:${orderId}`;
     if (orderTransitionLocks.current.has(key)) return false;
@@ -1113,6 +1114,12 @@ export default function Home() {
     return true;
   };
   const endOrderTransition = (stage: "confirm" | "dispatch" | "reverse", orderId: string) => orderTransitionLocks.current.delete(`${stage}:${orderId}`);
+  const activeDispatchTransactionIdFor = (order: Order) => {
+    const original = order.inventoryDispatchTransactionId;
+    if (!original) return "";
+    const reconciled = `reconcile:${original}`;
+    return inventoryLedger.some((entry) => entry.transaction_id === reconciled && entry.transaction_type === "Dispatch") ? reconciled : original;
+  };
   const updateStageTransitionJob = (id: string, direction: StageTransitionJob["direction"], state: StageTransitionJob["state"], message: string) => {
     setStageTransitionJobs((current) => {
       const next = [{ id, direction, state, message, startedAt: current.find((job) => job.id === id && job.direction === direction)?.startedAt || Date.now() }, ...current.filter((job) => !(job.id === id && job.direction === direction))];
@@ -1582,7 +1589,7 @@ export default function Home() {
     const confirmedLines = !isAdvance && primaryOrder?.status === "Confirmed" ? (primaryOrder.approvedProducts || linesFor(primaryOrder)) : [];
     const committedLines = !isAdvance && primaryOrder?.inventoryCommitted ? (primaryOrder.dispatchStockLines?.length ? primaryOrder.dispatchStockLines : linesFor(primaryOrder)) : [];
     if (!isAdvance && primaryOrder?.inventoryCommitted) {
-      const dispatchTransactionId = primaryOrder.inventoryDispatchTransactionId;
+      const dispatchTransactionId = activeDispatchTransactionIdFor(primaryOrder);
       if (!dispatchTransactionId) { flash(`${primaryOrder.id} was dispatched before the inventory ledger was installed, so it cannot be safely cancelled automatically.`); return; }
       try {
         await applyInventoryLedgerTransaction({
@@ -1611,7 +1618,8 @@ export default function Home() {
       }
       if (!cancelledIds.includes(item.id)) return item;
       const cancelledFromStage = ["Draft", "Confirmed", "Dispatch plan", "Sent to customer", "Received by customer"].includes(item.status) ? item.status as NonNullable<Order["cancelledFromStage"]> : item.cancelledFromStage;
-      return { ...item, status: "Cancelled", cancelledFromDispatch: ["Dispatch plan", "Sent to customer", "Received by customer"].includes(item.status), cancelledFromStage, inventoryCommitted: item.id === primaryId && item.inventoryCommitted ? false : item.inventoryCommitted, inventoryReversalTransactionId: item.id === primaryId && item.inventoryDispatchTransactionId ? `cancel-reversal:${item.inventoryDispatchTransactionId}` : item.inventoryReversalTransactionId, dispatchReversedAt: item.id === primaryId && item.inventoryCommitted ? new Date().toISOString() : item.dispatchReversedAt };
+      const activeDispatchTransactionId = item.id === primaryId ? activeDispatchTransactionIdFor(item) : "";
+      return { ...item, status: "Cancelled", cancelledFromDispatch: ["Dispatch plan", "Sent to customer", "Received by customer"].includes(item.status), cancelledFromStage, inventoryCommitted: item.id === primaryId && item.inventoryCommitted ? false : item.inventoryCommitted, inventoryReversalTransactionId: activeDispatchTransactionId ? `cancel-reversal:${activeDispatchTransactionId}` : item.inventoryReversalTransactionId, dispatchReversedAt: item.id === primaryId && item.inventoryCommitted ? new Date().toISOString() : item.dispatchReversedAt };
     }));
     setInvoices((current) => current.map((invoice) => cancelledIds.includes(invoice.order) ? { ...invoice, status: "Cancelled" } : invoice));
     logActivity("Cancelled order and released stock", "Orders", cancelledIds.join(", "));
@@ -1642,7 +1650,7 @@ export default function Home() {
       .filter((order): order is Order => Boolean(order?.inventoryCommitted));
     try {
       for (const order of dispatchedOrders) {
-        const dispatchTransactionId = order.inventoryDispatchTransactionId;
+        const dispatchTransactionId = activeDispatchTransactionIdFor(order);
         if (!dispatchTransactionId) throw new Error(`${order.id} was dispatched before the inventory ledger was installed, so it cannot be safely deleted automatically.`);
         const dispatchedLines = order.dispatchStockLines?.length ? order.dispatchStockLines : linesFor(order);
         if (!dispatchedLines.length) throw new Error(`${order.id} has no saved dispatch quantities to restore.`);
@@ -1794,7 +1802,7 @@ export default function Home() {
     const first = lines[0] || { product: "", sku: "", quantity: 0, unitPrice: 0 };
     const restoredBySku = new Map<string, ProductLine>();
     dispatchedSnapshot.forEach((line) => { const key = skuKey(line.sku); const prior = restoredBySku.get(key); restoredBySku.set(key, prior ? { ...prior, quantity: prior.quantity + line.quantity } : { ...line }); });
-    const dispatchTransactionId = order.inventoryDispatchTransactionId;
+    const dispatchTransactionId = activeDispatchTransactionIdFor(order);
     if (order.inventoryCommitted && !dispatchTransactionId) {
       flash(`${order.id} was dispatched before the new SKU ledger started. Its current balance is the opening balance, so it cannot be automatically reversed. Review it once and create a new confirmed order if stock must be moved.`);
       return;
@@ -1802,7 +1810,7 @@ export default function Home() {
     if (!beginOrderTransition("reverse", order.id)) { flash(`${order.id} is already returning to Confirmed Orders. Please wait.`); return; }
     updateStageTransitionJob(order.id, "DtoC", "running", "Returning from Dispatch Plan to Confirmed Orders");
     flash(`${order.id}: reversing inventory and updating Stock Master…`);
-    const reversalTransactionId = order.inventoryReversalTransactionId || `reversal:${dispatchTransactionId}`;
+    const reversalTransactionId = `reversal:${dispatchTransactionId}`;
     try {
       if (order.inventoryCommitted) await applyInventoryLedgerTransaction({
         transactionId: reversalTransactionId,
@@ -1961,6 +1969,43 @@ export default function Home() {
     updateStageTransitionJob(order.id, "CtoD", "success", "Sent to Dispatch Plan");
     flash(releasedLines.length ? `${order.id} sent to Dispatch Plan; reduced quantities were released from CRM reservation.` : `${order.id} sent to Dispatch Plan for Operations.`);
   };
+  useEffect(() => {
+    if (!cloudReady || !session?.access_token || !inventoryLedger.length) return;
+    // A status in Dispatch Plan / Fulfilment is the business truth: its saved
+    // dispatch must be reflected in stock. Reconcile only records that already
+    // have a ledger transaction, so legacy orders are never guessed at.
+    const activeOrders = orders.filter((order) => order.inventoryCommitted && ["Dispatch plan", "Sent to customer", "Received by customer"].includes(order.status) && order.inventoryDispatchTransactionId);
+    activeOrders.forEach((order) => {
+      const dispatchTransactionId = order.inventoryDispatchTransactionId!;
+      const retryKey = `verify:${dispatchTransactionId}`;
+      if (activeDispatchReconciliationAttempts.current.has(retryKey)) return;
+      const originalEntries = inventoryLedger.filter((entry) => entry.transaction_id === dispatchTransactionId && entry.transaction_type === "Dispatch");
+      if (!originalEntries.length) return;
+      const reversedBySku = new Map<string, number>();
+      inventoryLedger.filter((entry) => entry.reference_transaction_id === dispatchTransactionId && entry.transaction_type === "Reversal").forEach((entry) => reversedBySku.set(entry.sku_id, (reversedBySku.get(entry.sku_id) || 0) + Number(entry.quantity || 0)));
+      const fullyReversed = originalEntries.every((entry) => (reversedBySku.get(entry.sku_id) || 0) >= Number(entry.quantity || 0));
+      const transactionId = fullyReversed ? `reconcile:${dispatchTransactionId}` : dispatchTransactionId;
+      if (fullyReversed && inventoryLedger.some((entry) => entry.transaction_id === transactionId)) return;
+      activeDispatchReconciliationAttempts.current.add(retryKey);
+      const savedLines = order.dispatchStockLines?.length ? order.dispatchStockLines : linesFor(order);
+      void applyInventoryLedgerTransaction({
+        transactionId,
+        order,
+        transactionType: "Dispatch",
+        lines: savedLines,
+        // This repairs an active historical dispatch exactly as its order says;
+        // it must not silently fail merely because newer orders were processed.
+        allowNegativeSkus: fullyReversed ? savedLines.map((line) => line.sku) : [],
+      }).then(() => {
+        if (fullyReversed) logActivity("Reconciled active dispatch stock", "Products", `${order.id} · restored its active dispatch ledger movement`);
+      }).catch(() => {
+        activeDispatchReconciliationAttempts.current.delete(retryKey);
+      });
+    });
+  // Ledger data, order status and the authenticated workspace are the only
+  // inputs. The operation itself is idempotent by transaction ID.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orders, inventoryLedger, cloudReady, session?.access_token]);
   const navigationGroups = [
     { label: "Dashboard", module: "Dashboard" as CrmModule, icon: LayoutDashboard, items: [{ label: "Dashboard", section: "Overview" }] },
     { label: "Customers", module: "Customers" as CrmModule, icon: Users, items: [{ label: "All Customers", section: "Clients", count: String(clients.length) }, { label: "New Customers", section: "New Customers" }, { label: "Customer Groups", section: "Customer Groups" }, { label: "Customer Activity", section: "Customer Activity" }] },

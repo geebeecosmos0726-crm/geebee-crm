@@ -120,24 +120,59 @@ export async function POST(request: Request) {
     const allowNegativeSkus = [...new Set((Array.isArray(body?.allowNegativeSkus) ? body.allowNegativeSkus : []).map(exactSku).filter(Boolean))];
     if (!transactionId || !orderId || !transactionType || !safeLines.length) throw new Error("Inventory transaction needs an ID, order, type and at least one valid SKU line.");
     if (transactionType === "Reversal" && !referenceTransactionId) throw new Error("A reversal must reference its original dispatch.");
+    // A prior browser session can occasionally complete the ledger reversal
+    // but fail before it saves the order's visual status. Treat an attempt to
+    // reverse an already-fully-reversed SKU as a safe no-op, not an error.
+    // Partial reversals still go to PostgreSQL and retain its strict check.
+    let effectiveLines = safeLines;
+    if (transactionType === "Reversal") {
+      const [originalResult, reversalResult] = await Promise.all([
+        db.from("crm_inventory_ledger").select("sku_id, transaction_type, transaction_id, reference_transaction_id, quantity").eq("workspace_owner_id", ownerId).eq("transaction_id", referenceTransactionId),
+        db.from("crm_inventory_ledger").select("sku_id, transaction_type, transaction_id, reference_transaction_id, quantity").eq("workspace_owner_id", ownerId).eq("reference_transaction_id", referenceTransactionId),
+      ]);
+      if (originalResult.error) throw originalResult.error;
+      if (reversalResult.error) throw reversalResult.error;
+      const referenceRows = [...(originalResult.data || []), ...(reversalResult.data || [])];
+      effectiveLines = safeLines.filter((line) => {
+        const original = (referenceRows || []).find((row: any) => row.transaction_id === referenceTransactionId && row.transaction_type === "Dispatch" && exactSku(row.sku_id) === line.sku);
+        const reversed = (referenceRows || []).filter((row: any) => row.reference_transaction_id === referenceTransactionId && row.transaction_type === "Reversal" && exactSku(row.sku_id) === line.sku).reduce((sum: number, row: any) => sum + Number(row.quantity || 0), 0);
+        return !original || reversed < Number(original.quantity || 0);
+      });
+    }
+    if (!effectiveLines.length) return Response.json({ movements: [], products: [], skuIds: safeLines.map((line) => line.sku), alreadyReversed: true, sheetSyncPending: false });
     const { data: movements, error } = await db.rpc("apply_crm_inventory_transaction", {
       p_workspace_owner_id: ownerId,
       p_transaction_id: transactionId,
       p_reference_transaction_id: referenceTransactionId,
       p_order_id: orderId,
       p_transaction_type: transactionType,
-      p_lines: safeLines,
+      p_lines: effectiveLines,
       p_allow_negative_skus: allowNegativeSkus,
       p_actor_email: email,
       p_occurred_at: body?.occurredAt || new Date().toISOString(),
     });
     if (error) throw error;
-    const skuIds = safeLines.map((line) => line.sku);
+    const skuIds = effectiveLines.map((line) => line.sku);
     const { data: inventory, error: inventoryError } = await db.from("crm_stock_inventory").select("record_id, data").eq("workspace_owner_id", ownerId).in("record_id", (movements || []).map((movement: any) => String(movement.product_record_id)));
     if (inventoryError) throw inventoryError;
+    // An identical transaction ID is intentionally idempotent.  Still repair
+    // its Product / SKU record from the latest ledger balance in case a Sheet
+    // sync or interrupted browser session had overwritten the visible stock.
+    const { data: skuLedgerRows, error: skuLedgerError } = await db.from("crm_inventory_ledger")
+      .select("sku_id, new_available, occurred_at, id")
+      .eq("workspace_owner_id", ownerId)
+      .in("sku_id", skuIds)
+      .order("occurred_at", { ascending: false })
+      .order("id", { ascending: false });
+    if (skuLedgerError) throw skuLedgerError;
+    const latestBalanceBySku = new Map<string, number>();
+    (skuLedgerRows || []).forEach((row: any) => {
+      const sku = exactSku(row.sku_id);
+      if (!latestBalanceBySku.has(sku)) latestBalanceBySku.set(sku, Number(row.new_available));
+    });
     const syncRequestedAt = new Date().toISOString();
     const pendingRecords = (inventory || []).map((row: any) => {
-      const data = { ...(row.data || {}), sheetSyncPending: true, sheetSyncError: "", sheetSyncToken: transactionId, sheetSyncUpdatedAt: syncRequestedAt };
+      const data = { ...(row.data || {}), availableQuantity: latestBalanceBySku.get(exactSku(row.data?.sku)) ?? Number(row.data?.availableQuantity || 0), sheetSyncPending: true, sheetSyncError: "", sheetSyncToken: transactionId, sheetSyncUpdatedAt: syncRequestedAt };
       return { workspace_owner_id: ownerId, record_id: row.record_id, search_key: inventorySearchKey(data), data, updated_at: syncRequestedAt };
     });
     if (pendingRecords.length) {

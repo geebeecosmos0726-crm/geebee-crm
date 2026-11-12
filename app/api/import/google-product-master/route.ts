@@ -468,3 +468,57 @@ export async function PATCH(request: Request) {
     return Response.json({ error: error instanceof Error ? error.message : "Could not update this testing product." }, { status: 400 });
   }
 }
+
+export async function DELETE(request: Request) {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  const sheetId = process.env.GOOGLE_PRODUCT_MASTER_SHEET_ID || DEFAULT_PRODUCT_MASTER_SHEET_ID;
+  if (!url || !serviceKey || !keyJson) return Response.json({ error: "Product Stock Inventory is not configured yet." }, { status: 500 });
+  try {
+    const { db, ownerId, email } = await administrator(request, url, serviceKey);
+    const body = await request.json().catch(() => ({}));
+    const recordId = String(body?.id || "");
+    if (!recordId) throw new Error("Choose a saved Product / SKU to delete.");
+    const { data: existing, error: readError } = await db.from("crm_stock_inventory").select("record_id, data").eq("workspace_owner_id", ownerId).eq("record_id", recordId).maybeSingle();
+    if (readError || !existing) throw new Error("This Product / SKU could not be found.");
+    // A ledger-backed SKU is part of the inventory audit trail. Deleting it
+    // would make historical dispatches impossible to explain or reverse.
+    const [{ data: ledgerRows, error: ledgerError }, { data: openingRows, error: openingError }] = await Promise.all([
+      db.from("crm_inventory_ledger").select("id").eq("workspace_owner_id", ownerId).eq("product_record_id", recordId).limit(1),
+      db.from("crm_inventory_opening_balances").select("product_record_id").eq("workspace_owner_id", ownerId).eq("product_record_id", recordId).limit(1),
+    ]);
+    if (ledgerError || openingError) throw ledgerError || openingError;
+    if ((ledgerRows || []).length || (openingRows || []).length) throw new Error("This Product / SKU has inventory history and cannot be deleted. Keep it for audit accuracy, or mark it inactive instead.");
+    const product = existing.data as ProductData;
+    const credentials = JSON.parse(keyJson);
+    if (typeof credentials.private_key === "string") credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
+    const auth = new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
+    const sheets = google.sheets({ version: "v4", auth });
+    let title = likelyMasterTabTitle(sheetId);
+    let values;
+    try {
+      values = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
+    } catch {
+      title = await getMasterTabTitle(sheets, sheetId);
+      values = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: quoteRange(title) });
+    }
+    const rows = (values.data.values || []).map((row) => Array.isArray(row) ? row.map(display) : []);
+    const head = rows.findIndex((row) => headerIndex(row, ["skuid", "sku"]) >= 0 && headerIndex(row, ["productname", "product"]) >= 0);
+    if (head < 0) throw new Error("Google Stock Master needs SKU ID and Product Name columns before a product can be deleted safely.");
+    const skuColumn = headerIndex(rows[head], ["skuid", "sku"]);
+    const nameColumn = headerIndex(rows[head], ["productname", "product"]);
+    const matches = rows.slice(head + 1).map((row, index) => ({ row: head + index + 2, sku: display(row[skuColumn]), name: display(row[nameColumn]) }))
+      .filter((row) => compact(row.sku) === compact(product.sku) && compact(row.name) === compact(product.name));
+    if (matches.length !== 1) throw new Error(`${display(product.sku)} · ${display(product.name)} could not be found exactly once in Google Stock Master. Nothing was deleted.`);
+    // Clear the full row instead of deleting its row number: users can safely
+    // keep inserted rows and formulas below their product master.
+    await sheets.spreadsheets.values.clear({ spreadsheetId: sheetId, range: `'${title.replace(/'/g, "''")}'!A${matches[0].row}:Z${matches[0].row}` });
+    const { error: deleteError } = await db.from("crm_stock_inventory").delete().eq("workspace_owner_id", ownerId).eq("record_id", recordId);
+    if (deleteError) throw deleteError;
+    await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Deleted Product / SKU", module: "Products", details: `${display(product.sku)} · ${display(product.name)} removed from CRM and Google Stock Master` });
+    return Response.json({ ok: true, id: recordId, sku: product.sku, name: product.name });
+  } catch (error) {
+    return Response.json({ error: error instanceof Error ? error.message : "Could not delete this Product / SKU." }, { status: 400 });
+  }
+}

@@ -510,14 +510,20 @@ export async function DELETE(request: Request) {
     const nameColumn = headerIndex(rows[head], ["productname", "product"]);
     const matches = rows.slice(head + 1).map((row, index) => ({ row: head + index + 2, sku: display(row[skuColumn]), name: display(row[nameColumn]) }))
       .filter((row) => compact(row.sku) === compact(product.sku) && compact(row.name) === compact(product.name));
-    if (matches.length !== 1) throw new Error(`${display(product.sku)} · ${display(product.name)} could not be found exactly once in Google Stock Master. Nothing was deleted.`);
-    // Clear the full row instead of deleting its row number: users can safely
-    // keep inserted rows and formulas below their product master.
-    await sheets.spreadsheets.values.clear({ spreadsheetId: sheetId, range: `'${title.replace(/'/g, "''")}'!A${matches[0].row}:Z${matches[0].row}` });
+    if (matches.length > 1) throw new Error(`${display(product.sku)} · ${display(product.name)} appears more than once in Google Stock Master. Nothing was deleted because the exact row is unclear.`);
+    const sheetRemoved = matches.length === 1;
+    // A CRM-only, non-ledger card is normally an old duplicate. It has no
+    // Stock Master row to clear, so deleting it from CRM is safe and is the
+    // intended cleanup path. A matched Sheet row is cleared as before.
+    if (sheetRemoved) {
+      // Clear the full row instead of deleting its row number: users can
+      // safely keep inserted rows and formulas below their product master.
+      await sheets.spreadsheets.values.clear({ spreadsheetId: sheetId, range: `'${title.replace(/'/g, "''")}'!A${matches[0].row}:Z${matches[0].row}` });
+    }
     const { error: deleteError } = await db.from("crm_stock_inventory").delete().eq("workspace_owner_id", ownerId).eq("record_id", recordId);
     if (deleteError) throw deleteError;
-    await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Deleted Product / SKU", module: "Products", details: `${display(product.sku)} · ${display(product.name)} removed from CRM and Google Stock Master` });
-    return Response.json({ ok: true, id: recordId, sku: product.sku, name: product.name });
+    await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Deleted Product / SKU", module: "Products", details: `${display(product.sku)} · ${display(product.name)} removed from CRM${sheetRemoved ? " and Google Stock Master" : " (CRM-only duplicate; no Stock Master row existed)"}` });
+    return Response.json({ ok: true, id: recordId, sku: product.sku, name: product.name, sheetRemoved });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "Could not delete this Product / SKU." }, { status: 400 });
   }

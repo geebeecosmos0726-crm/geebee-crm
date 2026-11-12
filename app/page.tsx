@@ -3313,7 +3313,7 @@ function ProductStockInventoryPanel({ session, canApply, auditEvents, inventoryL
       });
       onProductsSynced((current) => current.filter((entry) => String(entry.id) !== String(item.id)));
       onLiveBackup();
-      setMessage(`${item.sku} was deleted from CRM and Google Stock Master.`);
+      setMessage(`${item.sku} was deleted from CRM${result.sheetRemoved ? " and Google Stock Master." : ". It was a CRM-only duplicate, so no Stock Master row was changed."}`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Product could not be deleted."); }
     finally { setLoading(false); }
   };

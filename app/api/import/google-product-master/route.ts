@@ -177,6 +177,24 @@ export async function POST(request: Request) {
       if (cleanupError) throw cleanupError;
     }
     const existing = allExisting.filter((record) => !placeholderIds.includes(record.recordId));
+    // A SKU which already exists with a different name is not safe to import
+    // automatically. It is usually an unread/partial name from the Sheet.
+    // Do not turn that uncertainty into a second Product / SKU card.
+    const existingBySku = new Map<string, Array<{ recordId: string; product: ProductData }>>();
+    existing.forEach((record) => {
+      const key = compact(record.product.sku);
+      if (key) existingBySku.set(key, [...(existingBySku.get(key) || []), record]);
+    });
+    const reviewRows: Array<{ row: number; sku: string; name: string; reason: string }> = [];
+    const safeSheetProducts = sheetProducts.filter((source) => {
+      const sameSku = existingBySku.get(compact(source.sku)) || [];
+      const hasExactIdentity = sameSku.some((record) => inventoryKey(record.product) === inventoryKey(source));
+      if (sameSku.length && !hasExactIdentity) {
+        reviewRows.push({ row: source.row, sku: source.sku, name: source.name, reason: "SKU already exists, but this Product Name does not match the saved Product / SKU. Verify the Sheet name before syncing." });
+        return false;
+      }
+      return true;
+    });
     // Once a SKU has entered the transaction ledger, its saved Available
     // Quantity is the opening balance plus ledger movements. A later Sheet
     // metadata sync must not overwrite that balance and replay old stock.
@@ -199,7 +217,7 @@ export async function POST(request: Request) {
     })).filter((line) => line.sku && line.quantity > 0);
     const sourceCountBySku = new Map<string, number>();
     const sourceCountByIdentity = new Map<string, number>();
-    sheetProducts.forEach((source) => {
+    safeSheetProducts.forEach((source) => {
       const sku = compact(source.sku); const identity = inventoryKey(source);
       sourceCountBySku.set(sku, (sourceCountBySku.get(sku) || 0) + 1);
       sourceCountByIdentity.set(identity, (sourceCountByIdentity.get(identity) || 0) + 1);
@@ -233,11 +251,11 @@ export async function POST(request: Request) {
     const existingByIdentity = new Map<string, Array<{ recordId: string; product: ProductData }>>();
     existing.forEach((record) => { const key = inventoryKey(record.product); existingByIdentity.set(key, [...(existingByIdentity.get(key) || []), record]); });
     const consumedRecords = new Set<string>();
-    const sheetKeys = new Set(sheetProducts.map(rowKey));
-    const sheetIdentityKeys = new Set(sheetProducts.map(inventoryKey));
+    const sheetKeys = new Set(safeSheetProducts.map(rowKey));
+    const sheetIdentityKeys = new Set(safeSheetProducts.map(inventoryKey));
     const now = new Date().toISOString();
     let added = 0; let updated = 0;
-    const records = sheetProducts.map((source, index) => {
+    const records = safeSheetProducts.map((source, index) => {
       const matchedByRow = existingByRow.get(rowKey(source));
       const identityMatches = existingByIdentity.get(inventoryKey(source)) || [];
       // If an older duplicate has ledger history, retain it as the canonical
@@ -274,7 +292,7 @@ export async function POST(request: Request) {
       const { error: duplicateCleanupError } = await db.from("crm_stock_inventory").delete().eq("workspace_owner_id", ownerId).in("record_id", staleDuplicateIds);
       if (duplicateCleanupError) throw duplicateCleanupError;
     }
-    const correctedSheetRows = !sheetIncludesActiveDispatch ? sheetProducts.map((source) => ({ source, quantity: dispatchForSource(source) })).filter((entry) => entry.quantity > 0) : [];
+    const correctedSheetRows = !sheetIncludesActiveDispatch ? safeSheetProducts.map((source) => ({ source, quantity: dispatchForSource(source) })).filter((entry) => entry.quantity > 0) : [];
     if (correctedSheetRows.length) {
       await sheets.spreadsheets.values.batchUpdate({
         spreadsheetId: sheetId,
@@ -286,7 +304,12 @@ export async function POST(request: Request) {
     }
     const crmOnly = existing.map((record) => record.product).filter((product) => product.sku && (!rowKey(product) || !sheetKeys.has(rowKey(product)))).map((product) => ({ sku: product.sku || "", name: product.name || "" }));
     await db.from("crm_audit_events").insert({ workspace_owner_id: ownerId, actor_email: email, action: "Synced Product Stock Inventory", module: "Products", details: `${updated} updated · ${added} added · ${placeholderIds.length} incomplete placeholder(s) removed · ${crmOnly.length} CRM-only SKU(s)${correctedSheetRows.length ? ` · ${correctedSheetRows.length} active Dispatch balance(s) applied` : ""}` });
-    return Response.json({ sheetTitle: title, products: records.map((record) => record.data), updated, added, cleanedPlaceholders: placeholderIds.length + staleDuplicateIds.length, crmOnly, skippedRows: parsed.skippedRows || [], scanned: sheetProducts.length, activeDispatchBalancesApplied: correctedSheetRows.length });
+    // Return every saved CRM product, not only the rows processed in this
+    // request. A review-required Sheet row must never make its existing card
+    // disappear from the panel.
+    const { data: savedRows, error: savedRowsError } = await db.from("crm_stock_inventory").select("data").eq("workspace_owner_id", ownerId).order("updated_at", { ascending: false }).limit(50000);
+    if (savedRowsError) throw savedRowsError;
+    return Response.json({ sheetTitle: title, products: (savedRows || []).map((row: any) => row.data), updated, added, cleanedPlaceholders: placeholderIds.length + staleDuplicateIds.length, crmOnly, skippedRows: [...(parsed.skippedRows || []), ...reviewRows], reviewRows, scanned: safeSheetProducts.length, activeDispatchBalancesApplied: correctedSheetRows.length });
   } catch (error) {
     console.error("Google product master sync failed:", error instanceof Error ? error.message : error);
     return Response.json({ error: error instanceof Error ? error.message : "Could not sync the Product Stock Inventory sheet." }, { status: 400 });

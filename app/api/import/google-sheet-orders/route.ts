@@ -3,7 +3,7 @@ import { google } from "googleapis";
 
 export const runtime = "nodejs";
 
-type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; remarks?: string };
+type ProductLine = { product: string; sku: string; quantity: number; unitPrice: number; remarks?: string; review?: { product?: boolean } };
 type ImportedOrder = { id: string; sourceSheetOrderId: string; client: string; city: string; product: string; sku: string; quantity: number; unitPrice: number; products: ProductLine[]; eta: string; status: "Draft"; payment: "Partial"; avatar: string; remarks: string; transporter?: string; requestedProducts?: ProductLine[]; draftEditedQuantityKeys?: string[] };
 type CustomerIdentity = { name: string; city: string };
 
@@ -105,11 +105,14 @@ function readLines(values: unknown[][], products: Map<string, { name?: string }>
     const matched = products.get(key(item));
     lines.push({
       sku: item.toUpperCase(),
-      product: matched?.name?.trim() || item.toUpperCase(),
+      // Never turn an unrecognised order item into a product. Keep the SKU
+      // visible for correction, leave the product name empty, and flag it.
+      product: matched?.name?.trim() || "",
       quantity,
       unitPrice: priceIndex >= 0 ? number(row[priceIndex]) : 0,
       // Remarks belong to the specific product row, not to the whole order.
       remarks: remarksIndex >= 0 ? String(row[remarksIndex] || "").trim() : "",
+      review: matched?.name?.trim() ? undefined : { product: true },
     });
   }
   return lines;
@@ -183,6 +186,7 @@ export async function POST(request: Request) {
     const reusedCustomers: string[] = [];
     const pendingCustomers: string[] = [];
     const skipped: string[] = [];
+    const unmatchedProducts: string[] = [];
     const obsoleteGeneratedDraftIds: string[] = [];
     for (const sheet of metadata.data.sheets || []) {
       const title = sheet.properties?.title || "";
@@ -192,6 +196,7 @@ export async function POST(request: Request) {
       const values = (result.data.values || []) as unknown[][];
       const lines = readLines(values, productMap);
       if (!lines.length) { skipped.push(`${details.id}: no ITEM and QUANTITY rows found`); continue; }
+      lines.filter((line) => line.review?.product).forEach((line) => unmatchedProducts.push(`${details.id}: ${line.sku || "missing SKU"}`));
       const matchingHistory = (existingOrders || []).filter((row: any) => key(row.record_id) === key(details.id) || key(row.data?.sourceSheetOrderId) === key(details.id));
       // The linked ADV record is a backorder for a still-Draft sheet order,
       // not proof that the main order has progressed. It must not prevent the
@@ -290,7 +295,7 @@ export async function POST(request: Request) {
     }
     for (const order of [...updatedDrafts, ...imported]) draftById.set(key(order.id), order);
     const draftOrders = [...draftById.values()];
-    return Response.json({ orders: imported, updated: updatedDrafts, draftOrders, clients: [], reusedCustomers, pendingCustomers, skipped, scanned: metadata.data.sheets?.length || 0 });
+    return Response.json({ orders: imported, updated: updatedDrafts, draftOrders, clients: [], reusedCustomers, pendingCustomers, skipped, unmatchedProducts: [...new Set(unmatchedProducts)], scanned: metadata.data.sheets?.length || 0 });
   } catch (error) {
     console.error("Google order import failed:", error instanceof Error ? error.message : error);
     return Response.json({ error: error instanceof Error ? error.message : "Could not fetch the connected Google Sheet." }, { status: 400 });

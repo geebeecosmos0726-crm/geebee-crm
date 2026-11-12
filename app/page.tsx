@@ -3143,8 +3143,9 @@ function GoogleSheetOrderFetch({ existingOrders, addOrders, onAudit, showDraftOr
         return [...merged, ...cloudDrafts.filter((order) => !known.has(order.id.trim().toLowerCase()))];
       });
       onAudit("Fetched connected Google Sheet orders", "Orders", `${importedOrders.length} new; ${updatedOrders.length} draft order(s) refreshed`);
-      setMessage(importedOrders.length || updatedOrders.length ? `${importedOrders.length ? `${importedOrders.length} new draft order${importedOrders.length === 1 ? "" : "s"} imported` : ""}${importedOrders.length && updatedOrders.length ? "; " : ""}${updatedOrders.length ? `${updatedOrders.length} existing draft order${updatedOrders.length === 1 ? " was" : "s were"} refreshed from the Sheet` : ""}. New customer names remain only on the draft order and become customer profiles after Save order.` : cloudDrafts.length ? `No new orders were added. ${cloudDrafts.length} existing Draft order${cloudDrafts.length === 1 ? " was" : "s were"} reloaded from the CRM cloud.` : "No new orders found. Existing order IDs were skipped; your customer list was unchanged.");
-      setDetails((result.skipped || []).slice(0, 12));
+      const unmatchedProducts = Array.isArray(result.unmatchedProducts) ? result.unmatchedProducts : [];
+      setMessage(importedOrders.length || updatedOrders.length ? `${importedOrders.length ? `${importedOrders.length} new draft order${importedOrders.length === 1 ? "" : "s"} imported` : ""}${importedOrders.length && updatedOrders.length ? "; " : ""}${updatedOrders.length ? `${updatedOrders.length} existing draft order${updatedOrders.length === 1 ? " was" : "s were"} refreshed from the Sheet` : ""}. New customer names remain only on the draft order and become customer profiles after Save order.${unmatchedProducts.length ? ` ${unmatchedProducts.length} product line${unmatchedProducts.length === 1 ? " needs" : "s need"} Product/SKU mapping; no product was created.` : ""}` : cloudDrafts.length ? `No new orders were added. ${cloudDrafts.length} existing Draft order${cloudDrafts.length === 1 ? " was" : "s were"} reloaded from the CRM cloud.` : "No new orders found. Existing order IDs were skipped; your customer list was unchanged.");
+      setDetails([...(result.skipped || []), ...unmatchedProducts.map((line: string) => `${line}: Product/SKU not found — add or correct it in Stock Master`)].slice(0, 12));
       if (cloudDrafts.length) window.setTimeout(showDraftOrders, 350);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Connected Sheet could not be fetched."); }
     finally { setLoading(false); }
@@ -3905,29 +3906,6 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
     textarea.placeholder = "Packing instructions (optional)";
   }, []);
   useEffect(() => {
-    const productInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[aria-label="Product name"]'));
-    const controls: HTMLButtonElement[] = [];
-    productInputs.forEach((input, index) => {
-      const field = input.parentElement; if (!field) return;
-      const button = document.createElement("button"); button.type = "button"; button.className = "new-product-option";
-      const refresh = () => {
-        const line = products[index]; const typed = line?.product.trim() || "";
-        const matched = typed && catalogue.some((product) => [`${product.sku} · ${catalogueName(product)}`, `${catalogueName(product)} · ${product.sku}`, catalogueName(product)].some((label) => label.toLowerCase() === typed.toLowerCase()));
-        button.textContent = matched ? "Selected from catalogue" : typed ? `Create “${typed}” as new product` : "+ Create new product";
-        button.disabled = Boolean(matched);
-      };
-      refresh(); input.addEventListener("input", refresh);
-      button.onclick = () => {
-        const current = products[index]; const name = window.prompt("New product name", current?.product || "")?.trim(); if (!name) return;
-        const sku = window.prompt("SKU for this new product", current?.sku || "")?.trim(); if (!sku) return;
-        if (catalogue.some((product) => skuKey(product.sku) === skuKey(sku))) { window.alert("This SKU already exists in the catalogue. Select it from the product list instead, or use a different SKU."); return; }
-        setProducts((currentLines) => currentLines.map((line, lineIndex) => lineIndex === index ? { ...line, product: name, sku: sku.toUpperCase(), unitPrice: line.unitPrice || 0, review: { ...line.review, product: true } } : line));
-      };
-      field.append(button); controls.push(button);
-    });
-    return () => controls.forEach((button) => button.remove());
-  }, [catalogue, products]);
-  useEffect(() => {
     const applyReview = (selector: string, reviewKey: "product" | "quantity" | "price", message: string) => Array.from(document.querySelectorAll<HTMLInputElement>(selector)).forEach((input, index) => {
       const needsReview = Boolean(products[index]?.review?.[reviewKey]);
       input.classList.toggle("import-review", needsReview);
@@ -3987,7 +3965,8 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
           };
         });
         setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), ...importedLines] : importedLines);
-        setScanState("ready"); setScanNote(`GeeBee internal order sheet recognised: ${internalSheet.products.length} product line${internalSheet.products.length === 1 ? "" : "s"} added${clientName ? ` for ${clientName}` : ""}${transporterName ? ` with transporter ${transporterName}` : ""}. Please review the customer and transporter, then save the order. New names are created only when you save.${internalSheet.note ? ` Note: ${internalSheet.note}` : ""}`);
+        const unmatchedCount = importedLines.filter((line) => line.review?.product).length;
+        setScanState("ready"); setScanNote(`GeeBee internal order sheet recognised: ${internalSheet.products.length} product line${internalSheet.products.length === 1 ? "" : "s"} added${clientName ? ` for ${clientName}` : ""}${transporterName ? ` with transporter ${transporterName}` : ""}.${unmatchedCount ? ` ${unmatchedCount} line${unmatchedCount === 1 ? " is" : "s are"} highlighted because no Product/SKU was found; correct the SKU or add it in Stock Master. No product was created.` : " Please review before saving."}${internalSheet.note ? ` Note: ${internalSheet.note}` : ""}`);
         return;
       }
       const text = rawText.replace(/\s+/g, " ");
@@ -3998,9 +3977,9 @@ function OrderModal({ order, clients, catalogue, transporters, createClient, cre
       if (!sku || !quantity) throw new Error("This image did not contain a readable order row. Please use a sharp screenshot of the item, quantity and price columns.");
       const name = text.match(/(?:product|description|item)\s*[:#-]?\s*([A-Za-z][A-Za-z0-9 /&.-]{2,50})/i)?.[1]?.trim() || file.name.replace(/\.[^.]+$/, "").replaceAll(/[-_]/g, " ");
       const catalogueMatch = catalogue.find((item) => item.sku.replaceAll("-", "").toLowerCase() === sku.replaceAll("-", "").toLowerCase());
-      const importedLine = { product: catalogueMatch ? `${catalogueMatch.sku} · ${catalogueName(catalogueMatch)}` : name, sku: catalogueMatch?.sku || sku, quantity, unitPrice: catalogueMatch ? specialRate(matchedClient?.name || f.client, catalogueMatch.sku) ?? catalogueMatch.unitPrice : 0, review: { product: !catalogueMatch, price: !catalogueMatch } };
+      const importedLine = { product: catalogueMatch ? `${catalogueMatch.sku} · ${catalogueName(catalogueMatch)}` : "", sku: catalogueMatch?.sku || sku, quantity, unitPrice: catalogueMatch ? specialRate(matchedClient?.name || f.client, catalogueMatch.sku) ?? catalogueMatch.unitPrice : 0, review: { product: !catalogueMatch, price: !catalogueMatch } };
       setProducts((current) => append ? [...current.filter((line) => line.sku || line.product || line.quantity), importedLine] : [importedLine]);
-      setScanState("ready"); setScanNote(catalogueMatch ? `Matched ${catalogueMatch.sku} from your catalogue. Please confirm quantity.` : "Details were extracted. Please check the fields below before saving.");
+      setScanState("ready"); setScanNote(catalogueMatch ? `Matched ${catalogueMatch.sku} from your catalogue. Please confirm quantity.` : `SKU ${sku} was not found in Product/SKUs. This line is highlighted and cannot be saved until you correct it or add it in Stock Master. No product was created.`);
     } catch { setScanState("error"); setScanNote("We could not read this image. You can still enter the order manually."); }
   };
   const scanDocuments = async (files: FileList | null) => {
